@@ -1,236 +1,218 @@
-# Issuer Credit Screening Model - Streamlit App
+# Issuer Credit Screening Model
 
-## 🚀 Deployment Instructions
+## Overview
 
-### Prerequisites
-- GitHub account
-- Streamlit Cloud account (free at share.streamlit.io)
-- OpenAI API key
+ML-driven credit screening model for analyzing S&P issuer data, providing Investment Grade (IG) and High Yield (HY) analysis with automated scoring, ranking, and visualization.
 
-### Step 1: Push to GitHub
+## Features
 
-1. Create a new repository on GitHub (e.g., `issuer-screening-app`)
+### Core Functionality
+- **Automated Credit Scoring**: 5-factor composite scoring system
+- **IG/HY Segmentation**: Separate analysis for Investment Grade and High Yield issuers
+- **Risk Categorization**: Strong Buy, Buy, Hold, Avoid recommendations
+- **Visual Analytics**: PCA-based positioning maps for pattern recognition
+- **AI Insights**: GPT-4 powered analysis and recommendations
 
-2. Upload these files to your repository:
-   - `issuer_screening_app.py` (the main application)
-   - `requirements.txt` (dependencies)
-   - `README.md` (this file)
+### Scoring Methodology
 
-3. Optionally, add a logo:
-   - Create an `assets/` folder
-   - Add `rubrics_logo.png` or `rubrics_logo.svg` to this folder
+The model uses a weighted composite score across five dimensions:
 
-### Step 2: Configure Streamlit Cloud
+| Factor | Weight | Description |
+|--------|--------|-------------|
+| Credit Score | 25% | S&P credit rating converted to numeric scale |
+| Leverage Score | 20% | Debt/EBITDA ratio (inverse scoring, lower is better) |
+| Profitability Score | 25% | Combined ROE and EBITDA margin |
+| Liquidity Score | 15% | Current ratio assessment |
+| Growth Score | 15% | Revenue growth rate |
 
-1. Go to [share.streamlit.io](https://share.streamlit.io)
-2. Sign in with GitHub
-3. Click "New app"
-4. Select your repository and branch
-5. Set main file path: `issuer_screening_app.py`
-6. Click "Advanced settings"
+### Categorization Thresholds
 
-### Step 3: Add Secrets
+**Investment Grade:**
+- Strong Buy: ≥70
+- Buy: 55-70
+- Hold: 40-55
+- Avoid: <40
 
-In the Advanced settings, add your OpenAI API key to secrets:
+**High Yield:**
+- Strong Buy: ≥65
+- Buy: 50-65
+- Hold: 35-50
+- Avoid: <35
 
-```toml
-api_key = "sk-your-openai-api-key-here"
+## Installation
+
+### Requirements
+```bash
+pip install streamlit pandas numpy plotly scikit-learn openai xlsxwriter openpyxl
 ```
 
-### Step 4: Deploy
+### Required Python Version
+- Python 3.8 or higher
 
-1. Click "Deploy!"
-2. Wait for deployment (usually 2-3 minutes)
-3. Your app will be live at: `https://[your-app-name].streamlit.app`
+## Usage
 
----
-
-## 📊 Using the App
-
-### Upload Data
-
-The app requires an Excel file with the S&P issuer data in the format:
-- Sheet name: "Pasted Values"
-- Required columns:
-  - Company ID
-  - Company Name
-  - Ticker
-  - S&P Credit Rating
-  - Sector
-  - Industry
-  - Market Capitalization
-  - Total Debt / EBITDA (x)
-  - Return on Equity
-  - EBITDA Margin
-  - Current Ratio (x)
-  - Total Revenues, 1 Year Growth
-
-### Features
-
-**Tab 1: Overview & Positioning**
-- Investment Grade positioning map (PCA visualization)
-- High Yield positioning map
-- Category distributions
-
-**Tab 2: Top Rankings**
-- Top 20 IG and HY issuers
-- Side-by-side comparison
-- Interactive bar charts
-
-**Tab 3: Rating Group Analysis**
-- Distribution by rating group (AAA, AA, A, BBB, BB, B)
-- Top performers within each rating tier
-- Peer group comparison
-
-**Tab 4: Detailed Data**
-- Filterable issuer database
-- Export to CSV
-- All component scores visible
-
-**Tab 5: AI Analysis**
-- Executive summary (GPT-4)
-- Investment recommendations
-- Market insights & trends
-- Methodology assessment
-
----
-
-## 🔧 Customization
-
-### Colors
-
-The app uses Rubrics brand colors defined in CSS:
-- `--rb-blue: #001E4F` (primary)
-- `--rb-mblue: #2C5697` (medium blue)
-- `--rb-lblue: #7BA4DB` (light blue)
-- `--rb-grey: #D8D7DF` (grey)
-- `--rb-orange: #CF4520` (accent)
-
-Category colors:
-- Strong Buy: `#00C851` (green)
-- Buy: `#33b5e5` (blue)
-- Hold: `#ffbb33` (orange)
-- Avoid: `#ff4444` (red)
-
-### Scoring Weights
-
-To adjust the composite score weights, modify lines 180-186:
-
-```python
-weights = {
-    'credit_score': 0.25,        # Credit rating weight
-    'leverage_score': 0.20,      # Debt/EBITDA weight
-    'profitability_score': 0.25, # ROE & margins weight
-    'liquidity_score': 0.15,     # Current ratio weight
-    'growth_score': 0.15         # Revenue growth weight
-}
+### Running the Application
+```bash
+streamlit run issuer_screening_app.py
 ```
 
-### Category Thresholds
+### Data Input Requirements
 
-To adjust what qualifies as Strong Buy/Buy/Hold:
+The model expects an Excel file (.xlsx) or CSV file with the following columns:
+- `Company ID`
+- `Company Name`
+- `Ticker`
+- `S&P Credit Rating`
+- `Sector`
+- `Industry`
+- `Market Capitalization`
+- `Total Debt / EBITDA (x)`
+- `Return on Equity`
+- `EBITDA Margin`
+- `Current Ratio (x)`
+- `Total Revenues, 1 Year Growth`
 
-**Investment Grade (lines 279-283):**
-```python
-ig_results['Category'] = pd.cut(
-    ig_results['Composite_Score'],
-    bins=[0, 40, 55, 70, 100],  # Adjust these thresholds
-    labels=['Avoid', 'Hold', 'Buy', 'Strong Buy']
-)
-```
+### Configuration
 
-**High Yield (lines 285-289):**
-```python
-hy_results['Category'] = pd.cut(
-    hy_results['Composite_Score'],
-    bins=[0, 35, 50, 65, 100],  # Adjust these thresholds
-    labels=['Avoid', 'Hold', 'Buy', 'Strong Buy']
-)
-```
+1. **OpenAI API Key**: 
+   - Add to Streamlit secrets as `api_key`
+   - Or enter manually in the sidebar
+
+2. **File Upload**:
+   - Use the sidebar file uploader
+   - Accepts .xlsx or .csv formats
+   - Excel files can use any sheet (defaults to first if "Pasted Values" not found)
+
+## Key Features Explained
+
+### 1. Overview & Positioning Tab
+- **Positioning Maps**: Visual representation of issuers in 2D space
+- **Category Distributions**: Bar charts showing Strong Buy/Buy/Hold/Avoid breakdown
+- **Color Coding**: Green (Strong Buy), Blue (Buy), Yellow (Hold), Red (Avoid)
+
+### 2. Top Rankings Tab
+- **Top 20 Lists**: Best performers in IG and HY categories
+- **Composite Scores**: Overall quality metrics
+- **Industry Context**: Sector and industry information
+
+### 3. Rating Group Analysis Tab
+- **Group Distribution**: Breakdown by rating categories (AAA, AA, A, BBB, etc.)
+- **Peer Comparison**: Rankings within rating groups
+- **Top Performers**: Best issuers in each rating category
+
+### 4. Detailed Data Tab
+- **Filterable Tables**: Full dataset with all metrics
+- **Export Functionality**: Download filtered results as CSV
+- **Custom Filters**: By IG/HY, category, minimum score
+
+### 5. AI Analysis Tab
+- **Executive Summary**: GPT-4 generated market overview
+- **Investment Recommendations**: Specific opportunities identified
+- **Market Insights**: Trends and patterns analysis
+- **Methodology Assessment**: Model validation and suggestions
+
+## Data Processing Details
+
+### Rating Normalization
+The model handles various rating formats:
+- Removes outlook indicators (NEG, POS, WATCH)
+- Maps aliases (BBBM→BBB, BMNS→B, CCCC→CCC)
+- Handles NR, N/A, WD as Unknown
+
+### Percent Parsing
+Automatically detects and converts:
+- Percentage strings ("12.5%" → 12.5)
+- Fractional values (0.125 → 12.5)
+- Mixed formats within same column
+
+### Missing Data Handling
+Three-tier imputation strategy:
+1. Sector × IG/HY medians
+2. Overall sector medians
+3. Global medians or default values
+
+### Special Cases
+- **Negative EBITDA**: Treated as very high leverage (score=0)
+- **Extreme Values**: Capped to prevent outlier distortion
+- **Missing Growth**: Uses sector/global medians
+
+## Visualization Details
+
+### PCA Positioning Maps
+- **X-axis**: Overall credit quality (better →)
+- **Y-axis**: Financial strength vs leverage balance
+- **Size**: Bubble size reflects composite score
+- **Jitter**: Small random offset prevents overlap
+
+### Interpretation Guide
+- Companies close together have similar credit profiles
+- Green clusters indicate high-quality opportunities
+- Red areas suggest higher risk or distressed situations
+
+## Version History
+
+### v2.2 (Current)
+- Fixed rating classification consistency
+- Corrected PCA axis orientation
+- Added business-friendly labels
+- Improved percent parsing
+- Fixed leverage scoring for negative EBITDA
+
+### v2.1
+- Added CSV support
+- Enhanced error handling
+- Improved diagnostics
+
+### v2.0
+- Initial production release
+- Core scoring engine
+- Visualization framework
+
+## Troubleshooting
+
+### Common Issues
+
+1. **"Missing required columns" error**
+   - Verify all required columns are present
+   - Check for spelling/spacing variations
+   - Ensure column headers are in first row
+
+2. **No data processed**
+   - Check credit ratings are in standard S&P format
+   - Verify numeric columns contain valid numbers
+   - Look for "None" or "N/A" text in numeric fields
+
+3. **Unexpected rankings**
+   - Review sidebar diagnostics for data quality
+   - Check for high percentage of missing values
+   - Verify leverage values (negative = distressed)
+
+### Debug Information
+
+The sidebar displays:
+- Rows loaded and processed
+- Unique credit ratings found
+- Missing data percentages
+- Duplicate vector warnings
+- PCA variance explained
+
+## Support
+
+For issues or questions:
+1. Check sidebar diagnostics
+2. Review data quality metrics
+3. Verify input format matches requirements
+4. Ensure all dependencies are installed
+
+## License
+
+Proprietary - Rubrics Asset Management
+
+## Authors
+
+Developed by Rubrics Asset Management
+ML-Driven Investment Grade & High Yield Analysis
 
 ---
 
-## 🤖 AI Analysis Notes
-
-The AI analysis requires an OpenAI API key with GPT-4 access. The app makes 4 API calls:
-
-1. **Executive Summary** (~1,500 tokens)
-2. **Investment Recommendations** (~2,000 tokens)
-3. **Market Insights** (~2,000 tokens)
-4. **Methodology Assessment** (~1,500 tokens)
-
-**Total estimated cost per analysis:** ~$0.15-0.25 USD
-
-To reduce costs:
-- Change model from `gpt-4` to `gpt-3.5-turbo` (90% cost reduction)
-- Reduce `max_tokens` parameters
-- Cache results using `@st.cache_data`
-
----
-
-## 📈 Model Methodology
-
-### Composite Score Calculation
-
-Each issuer receives a score from 0-100 based on 5 components:
-
-1. **Credit Score (25%)**: S&P rating converted to numeric (AAA=21, D=0)
-2. **Leverage Score (20%)**: Inverse of Debt/EBITDA ratio
-3. **Profitability Score (25%)**: Average of ROE and EBITDA margin
-4. **Liquidity Score (15%)**: Based on current ratio
-5. **Growth Score (15%)**: Revenue growth rate
-
-### Investment Grade vs High Yield
-
-- **IG**: BBB- and above (separate ranking)
-- **HY**: BB+ and below (separate ranking)
-- Different category thresholds reflect different risk profiles
-
-### Rating Groups
-
-Issuers are grouped into 6 tiers for peer comparison:
-- Group 1: AAA
-- Group 2: AA+/AA/AA-
-- Group 3: A+/A/A-
-- Group 4: BBB+/BBB/BBB-
-- Group 5: BB+/BB/BB-
-- Group 6: B+/B/B-
-
-### PCA Visualization
-
-- 2-component PCA on normalized scores
-- Captures ~60-70% of variance
-- Enables visual relative positioning
-- Bubble size = composite score
-
----
-
-## 🔒 Security Notes
-
-- Never commit your OpenAI API key to GitHub
-- Always use Streamlit secrets for API keys
-- Keep your secrets.toml file in .gitignore
-- Rotate API keys periodically
-
----
-
-## 📞 Support
-
-For issues or questions about the model:
-1. Check this README
-2. Review the code comments
-3. Test with sample data first
-
-For Streamlit deployment issues:
-- [Streamlit Documentation](https://docs.streamlit.io)
-- [Streamlit Community Forum](https://discuss.streamlit.io)
-
----
-
-## 📝 License
-
-This application is proprietary to Rubrics Asset Management.
-
----
-
-*Last Updated: October 2025*
+*Note: This model is for investment research purposes. Always perform additional due diligence before making investment decisions.*
