@@ -208,7 +208,11 @@ def load_and_process_data(uploaded_file):
     required = [
         'Company ID','Company Name','Ticker','S&P Credit Rating','Sector','Industry',
         'Market Capitalization','Total Debt / EBITDA (x)','Return on Equity','EBITDA Margin',
-        'Current Ratio (x)','Total Revenues, 1 Year Growth'
+        'Current Ratio (x)','Total Revenues, 1 Year Growth',
+        'Levered Free Cash Flow','Levered Free Cash Flow Margin','Cash from Ops. to Curr. Liab. (x)',
+        'Net Debt / EBITDA','Total Debt','Total Debt / Total Capital (%)',
+        'Total Revenues, 3 Yr. CAGR','EBITDA, 3 Years CAGR',
+        'Return on Assets','EBIT Margin','Quick Ratio (x)'
     ]
     
     # Normalize column names to handle spacing variations and unicode
@@ -322,47 +326,116 @@ def load_and_process_data(uploaded_file):
         #         total_vals = len(df[metric])
         #         st.sidebar.write(f"- {metric[:20]}: {unique_vals}/{total_vals} unique")
         
-        # Leverage (lower is better)
+        # Leverage (lower is better) - Multi-metric approach
+        # Net Debt/EBITDA (40% weight)
+        net_debt_ebitda_raw = df['Net Debt / EBITDA']
+        if isinstance(net_debt_ebitda_raw, pd.Series):
+            net_debt_ebitda_raw = net_debt_ebitda_raw.replace(['None', 'none', 'N/A', 'n/a', '#N/A'], np.nan)
+        net_debt_ebitda = pd.to_numeric(net_debt_ebitda_raw, errors='coerce')
+        net_debt_ebitda = net_debt_ebitda.where(net_debt_ebitda >= 0, other=20.0).fillna(20.0).clip(upper=20.0)
+        part1 = (np.minimum(net_debt_ebitda, 3.0)/3.0)*60.0
+        part2 = (np.maximum(net_debt_ebitda-3.0, 0.0)/5.0)*40.0
+        raw_penalty = np.minimum(part1+part2, 100.0)
+        net_debt_score = np.clip(100.0 - raw_penalty, 0.0, 100.0)
+
+        # Total Debt/EBITDA (30% weight)
         debt_ebitda_raw = df['Total Debt / EBITDA (x)']
-        # Handle "None" text values
         if isinstance(debt_ebitda_raw, pd.Series):
             debt_ebitda_raw = debt_ebitda_raw.replace(['None', 'none', 'N/A', 'n/a', '#N/A'], np.nan)
         debt_ebitda = pd.to_numeric(debt_ebitda_raw, errors='coerce')
-        # Bad/negative or zero EBITDA proxies: treat as very high leverage
-        debt_ebitda = debt_ebitda.where(debt_ebitda >= 0, other=20.0).fillna(20.0)
-        # Cap extreme tail to 20x to stabilize scoring
-        debt_ebitda = debt_ebitda.clip(upper=20.0)
-        # Piecewise: 0-3x (60 pts), 3-8x (40 pts), >8x no additional
-        part1 = (np.minimum(debt_ebitda, 3.0)/3.0)*60.0
-        part2 = (np.maximum(debt_ebitda-3.0, 0.0)/5.0)*40.0
-        raw_penalty = np.minimum(part1+part2, 100.0)
-        scores['leverage_score'] = np.clip(100.0 - raw_penalty, 0.0, 100.0)
+        debt_ebitda = debt_ebitda.where(debt_ebitda >= 0, other=20.0).fillna(20.0).clip(upper=20.0)
+        part1_td = (np.minimum(debt_ebitda, 3.0)/3.0)*60.0
+        part2_td = (np.maximum(debt_ebitda-3.0, 0.0)/5.0)*40.0
+        raw_penalty_td = np.minimum(part1_td+part2_td, 100.0)
+        debt_ebitda_score = np.clip(100.0 - raw_penalty_td, 0.0, 100.0)
+
+        # Debt/Capital (30% weight) - inverse scoring
+        debt_capital_raw = df['Total Debt / Total Capital (%)']
+        if isinstance(debt_capital_raw, pd.Series):
+            debt_capital_raw = debt_capital_raw.replace(['None', 'none', 'N/A', 'n/a', '#N/A'], np.nan)
+        debt_capital = pd.to_numeric(debt_capital_raw, errors='coerce').fillna(50).clip(0, 100)
+        debt_cap_score = np.clip(100 - debt_capital, 0, 100)
+
+        # Combined leverage score
+        scores['leverage_score'] = net_debt_score * 0.4 + debt_ebitda_score * 0.3 + debt_cap_score * 0.3
         
-        # Profitability
+        # Profitability - Enhanced with efficiency metrics
         roe = _pct_to_100(df['Return on Equity'])
-        margin = _pct_to_100(df['EBITDA Margin'])
-        # Symmetric cap +/-50pp to tame outliers, then shift to 0-100
-        prof = np.clip(roe, -50, 50) + np.clip(margin, -50, 50)
-        scores['profitability_score'] = np.clip((prof + 100) / 2, 0, 100)
+        ebitda_margin = _pct_to_100(df['EBITDA Margin'])
+        roa = _pct_to_100(df['Return on Assets'])
+        ebit_margin = _pct_to_100(df['EBIT Margin'])
+
+        # Each metric capped at reasonable ranges
+        roe_score = np.clip(roe, -50, 50) + 50  # Convert to 0-100
+        margin_score = np.clip(ebitda_margin, -50, 50) + 50
+        roa_score = np.clip(roa * 5, 0, 100)  # ROA typically lower, scale up
+        ebit_score = np.clip(ebit_margin * 2, 0, 100)
+
+        scores['profitability_score'] = (roe_score * 0.3 + margin_score * 0.3 +
+                                         roa_score * 0.2 + ebit_score * 0.2)
         
-        # Liquidity
+        # Liquidity - Dual-metric approach
         current_raw = df['Current Ratio (x)']
-        # Handle "None" text values
         if isinstance(current_raw, pd.Series):
             current_raw = current_raw.replace(['None', 'none', 'N/A', 'n/a', '#N/A'], np.nan)
-        current = pd.to_numeric(current_raw, errors='coerce').clip(lower=0)
-        # linear up to 3x -> 100; above 3x hold at 100
-        scores['liquidity_score'] = np.clip((current/3.0)*100.0, 0, 100)
+        current_ratio = pd.to_numeric(current_raw, errors='coerce').clip(lower=0)
+
+        quick_raw = df['Quick Ratio (x)']
+        if isinstance(quick_raw, pd.Series):
+            quick_raw = quick_raw.replace(['None', 'none', 'N/A', 'n/a', '#N/A'], np.nan)
+        quick_ratio = pd.to_numeric(quick_raw, errors='coerce').clip(lower=0)
+
+        # Current ratio: linear up to 3x -> 100
+        current_score = np.clip((current_ratio/3.0)*100.0, 0, 100)
+        # Quick ratio: linear up to 2x -> 100 (typically lower)
+        quick_score = np.clip((quick_ratio/2.0)*100.0, 0, 100)
+
+        scores['liquidity_score'] = current_score * 0.6 + quick_score * 0.4
         
-        # Growth
-        rg = _pct_to_100(df['Total Revenues, 1 Year Growth'])
-        # Reward moderate growth; keep shrinkage informative, avoid huge rewards for volatile growth
-        scores['growth_score'] = np.clip((rg + 10) * 2, 0, 100)
-        
+        # Growth - Multi-period approach
+        rev_growth_1y = _pct_to_100(df['Total Revenues, 1 Year Growth'])
+        rev_cagr_3y = _pct_to_100(df['Total Revenues, 3 Yr. CAGR'])
+        ebitda_cagr_3y = _pct_to_100(df['EBITDA, 3 Years CAGR'])
+
+        # Score each component (moderate growth preferred)
+        rev_1y_score = np.clip((rev_growth_1y + 10) * 2, 0, 100)
+        rev_3y_score = np.clip((rev_cagr_3y + 10) * 2, 0, 100)
+        ebitda_3y_score = np.clip((ebitda_cagr_3y + 10) * 2, 0, 100)
+
+        scores['growth_score'] = rev_3y_score * 0.4 + rev_1y_score * 0.3 + ebitda_3y_score * 0.3
+
+        # Cash Flow Score (new 6th factor)
+        fcf_raw = df['Levered Free Cash Flow']
+        if isinstance(fcf_raw, pd.Series):
+            fcf_raw = fcf_raw.replace(['None', 'none', 'N/A', 'n/a', '#N/A'], np.nan)
+        fcf = pd.to_numeric(fcf_raw, errors='coerce')
+
+        total_debt_raw = df['Total Debt']
+        if isinstance(total_debt_raw, pd.Series):
+            total_debt_raw = total_debt_raw.replace(['None', 'none', 'N/A', 'n/a', '#N/A'], np.nan)
+        total_debt = pd.to_numeric(total_debt_raw, errors='coerce')
+
+        fcf_margin = _pct_to_100(df['Levered Free Cash Flow Margin'])
+
+        cash_ops_ratio_raw = df['Cash from Ops. to Curr. Liab. (x)']
+        if isinstance(cash_ops_ratio_raw, pd.Series):
+            cash_ops_ratio_raw = cash_ops_ratio_raw.replace(['None', 'none', 'N/A', 'n/a', '#N/A'], np.nan)
+        cash_ops_ratio = pd.to_numeric(cash_ops_ratio_raw, errors='coerce')
+
+        # FCF/Debt ratio (0-100 scale, cap at 50% = 100 score)
+        fcf_debt_ratio = (fcf / total_debt).clip(upper=0.5) * 200
+        fcf_debt_score = fcf_debt_ratio.fillna(0).clip(0, 100)
+
+        # Cash ops coverage (0-100 scale, 1.0x = 100 score)
+        cash_ops_score = (cash_ops_ratio * 100).clip(0, 100)
+
+        # Combine: 50% FCF/Debt, 30% FCF Margin, 20% Cash Ops Coverage
+        scores['cash_flow_score'] = (fcf_debt_score * 0.5 + fcf_margin * 0.3 + cash_ops_score * 0.2)
+
         # Debug: Show count of valid scores
         # if scores['growth_score'].isna().all():
         #     st.sidebar.warning("WARNING: All growth scores are missing - using defaults")
-        
+
         return scores
     
     quality_scores = calculate_quality_scores(df)
@@ -375,13 +448,14 @@ def load_and_process_data(uploaded_file):
         return {'BBBM':'BBB','BMNS':'B','CCCC':'CCC'}.get(x, x)
     df['_Credit_Rating_Clean'] = df['S&P Credit Rating'].map(_clean_rating_outer)
     
-    # Calculate composite score
+    # Calculate composite score (6-factor model)
     weights = {
-        'credit_score': 0.25,
+        'credit_score': 0.20,
         'leverage_score': 0.20,
-        'profitability_score': 0.25,
-        'liquidity_score': 0.15,
-        'growth_score': 0.15
+        'profitability_score': 0.20,
+        'liquidity_score': 0.10,
+        'growth_score': 0.15,
+        'cash_flow_score': 0.15
     }
     
     qs = quality_scores.copy()
@@ -401,7 +475,8 @@ def load_and_process_data(uploaded_file):
         'leverage_score': 50.0,
         'profitability_score': 50.0,
         'liquidity_score': 50.0,
-        'growth_score': 50.0
+        'growth_score': 50.0,
+        'cash_flow_score': 50.0
     }
     for col, default_val in default_scores.items():
         if col in qs.columns:
@@ -424,7 +499,8 @@ def load_and_process_data(uploaded_file):
         'Leverage_Score': quality_scores['leverage_score'],
         'Profitability_Score': quality_scores['profitability_score'],
         'Liquidity_Score': quality_scores['liquidity_score'],
-        'Growth_Score': quality_scores['growth_score']
+        'Growth_Score': quality_scores['growth_score'],
+        'Cash_Flow_Score': quality_scores['cash_flow_score']
     })
     
     # Clean data
@@ -442,7 +518,7 @@ def load_and_process_data(uploaded_file):
         
         # Show which scores are missing
         st.subheader("Score Calculation Issues:")
-        score_cols = ['credit_score', 'leverage_score', 'profitability_score', 'liquidity_score', 'growth_score']
+        score_cols = ['credit_score', 'leverage_score', 'profitability_score', 'liquidity_score', 'growth_score', 'cash_flow_score']
         for col in score_cols:
             if col in quality_scores.columns:
                 null_count = quality_scores[col].isna().sum()
@@ -501,17 +577,17 @@ def load_and_process_data(uploaded_file):
     ig_results['IG_Percentile'] = ig_results['Composite_Score'].rank(pct=True) * 100
     hy_results['HY_Percentile'] = hy_results['Composite_Score'].rank(pct=True) * 100
     
-    # Categories for each group
+    # Categories for each group (updated thresholds for 6-factor model)
     ig_results['Category'] = pd.cut(
         ig_results['Composite_Score'],
-        bins=[0, 40, 55, 70, 100],
+        bins=[0, 42, 57, 72, 100],
         include_lowest=True,
         labels=['Avoid', 'Hold', 'Buy', 'Strong Buy']
     )
-    
+
     hy_results['Category'] = pd.cut(
         hy_results['Composite_Score'],
-        bins=[0, 35, 50, 65, 100],
+        bins=[0, 37, 52, 67, 100],
         include_lowest=True,
         labels=['Avoid', 'Hold', 'Buy', 'Strong Buy']
     )
@@ -521,7 +597,7 @@ def load_and_process_data(uploaded_file):
     results_final = pd.concat([ig_results, hy_results, unknown_results], ignore_index=True)
     
     # PCA for visualization
-    quality_cols = ['Credit_Score', 'Leverage_Score', 'Profitability_Score', 'Liquidity_Score', 'Growth_Score']
+    quality_cols = ['Credit_Score', 'Leverage_Score', 'Profitability_Score', 'Liquidity_Score', 'Growth_Score', 'Cash_Flow_Score']
 
     # IG PCA (only if we have enough data)
     if len(ig_results) > 10:
@@ -532,11 +608,12 @@ def load_and_process_data(uploaded_file):
         pca_ig = PCA(n_components=2)
         ig_pca = pca_ig.fit_transform(ig_scaled)
 
-        # Stabilize orientation: enforce positive correlation of PC1 with Credit_Score
+        # Stabilize orientation: ensure higher composite scores are on the right
         pc1 = ig_pca[:, 0]
-        if 'Credit_Score' in ig_features.columns:
-            if np.corrcoef(pc1, ig_features['Credit_Score'])[0,1] < 0:
-                pc1 = -pc1
+        # Use Composite_Score for correlation check (more reliable with 6 factors)
+        if np.corrcoef(pc1, ig_results['Composite_Score'])[0,1] < 0:
+            pc1 = -pc1
+            ig_pca[:, 0] = -ig_pca[:, 0]  # Also flip the original array
         ig_results['PC1'] = pc1
         ig_results['PC2'] = ig_pca[:, 1]
 
@@ -558,11 +635,12 @@ def load_and_process_data(uploaded_file):
         pca_hy = PCA(n_components=2)
         hy_pca = pca_hy.fit_transform(hy_scaled)
 
-        # Stabilize orientation: enforce positive correlation of PC1 with Credit_Score
+        # Stabilize orientation: ensure higher composite scores are on the right
         pc1 = hy_pca[:, 0]
-        if 'Credit_Score' in hy_features.columns:
-            if np.corrcoef(pc1, hy_features['Credit_Score'])[0,1] < 0:
-                pc1 = -pc1
+        # Use Composite_Score for correlation check (more reliable with 6 factors)
+        if np.corrcoef(pc1, hy_results['Composite_Score'])[0,1] < 0:
+            pc1 = -pc1
+            hy_pca[:, 0] = -hy_pca[:, 0]  # Also flip the original array
         hy_results['PC1'] = pc1
         hy_results['PC2'] = hy_pca[:, 1]
 
@@ -1406,24 +1484,32 @@ with tab2:
     """)
 
     # Section 1: Composite Scoring Engine
-    st.subheader("1. Five-Factor Composite Scoring Engine")
+    st.subheader("1. Six-Factor Composite Scoring Engine")
 
     st.markdown("""
-    The model calculates a composite score (0-100) for each issuer by combining five financial dimensions.
+    The model calculates a composite score (0-100) for each issuer by combining six financial dimensions.
     Each factor is normalized to a 0-100 scale, then weighted to create the final composite score.
     """)
 
     # Create a visual table for the weights
     weights_df = pd.DataFrame({
-        'Factor': ['Credit Score', 'Leverage Score', 'Profitability Score', 'Liquidity Score', 'Growth Score'],
-        'Weight': ['25%', '20%', '25%', '15%', '15%'],
-        'Input Metric': ['S&P Credit Rating', 'Total Debt / EBITDA', 'ROE + EBITDA Margin', 'Current Ratio', 'Revenue Growth'],
+        'Factor': ['Credit Score', 'Leverage Score', 'Profitability Score', 'Liquidity Score', 'Growth Score', 'Cash Flow Score'],
+        'Weight': ['20%', '20%', '20%', '10%', '15%', '15%'],
+        'Input Metrics': [
+            'S&P Credit Rating',
+            'Net Debt/EBITDA, Debt/EBITDA, Debt/Capital',
+            'ROE, EBITDA Margin, ROA, EBIT Margin',
+            'Current Ratio, Quick Ratio',
+            'Revenue 1Y/3Y CAGR, EBITDA 3Y CAGR',
+            'FCF/Debt, FCF Margin, Cash Ops Coverage'
+        ],
         'Interpretation': [
             'Higher credit rating = higher score',
             'Lower leverage = higher score',
             'Higher profitability = higher score',
             'Higher liquidity = higher score',
-            'Moderate growth = higher score'
+            'Moderate growth = higher score',
+            'Stronger cash generation = higher score'
         ]
     })
 
@@ -1432,16 +1518,16 @@ with tab2:
     st.markdown("""
     **Composite Score Formula:**
     ```
-    Composite Score = (Credit Score x 0.25) + (Leverage Score x 0.20) +
-                      (Profitability Score x 0.25) + (Liquidity Score x 0.15) +
-                      (Growth Score x 0.15)
+    Composite Score = (Credit Score x 0.20) + (Leverage Score x 0.20) +
+                      (Profitability Score x 0.20) + (Liquidity Score x 0.10) +
+                      (Growth Score x 0.15) + (Cash Flow Score x 0.15)
     ```
     """)
 
     # Section 2: Individual Factor Calculations
     st.subheader("2. Individual Factor Calculations")
 
-    with st.expander("Credit Score (25% weight)"):
+    with st.expander("Credit Score (20% weight)"):
         st.markdown("""
         **Input:** S&P Credit Rating
 
@@ -1459,67 +1545,76 @@ with tab2:
 
     with st.expander("Leverage Score (20% weight)"):
         st.markdown("""
-        **Input:** Total Debt / EBITDA ratio
+        **Inputs:** Net Debt/EBITDA (40%), Total Debt/EBITDA (30%), Debt/Total Capital % (30%)
 
         **Calculation (inverse scoring - lower leverage is better):**
-        - Piecewise penalty function:
-          - 0-3x: Linear penalty (0-60 points)
-          - 3-8x: Additional penalty (0-40 points)
-          - >8x: Capped at 100 penalty
-        - Final score: `100 - penalty`
-        - Negative or zero EBITDA treated as very high risk (score = 0)
+        - **Net Debt/EBITDA:** Piecewise penalty (0-3x: 60pts, 3-8x: 40pts), Score = 100 - penalty
+        - **Total Debt/EBITDA:** Same penalty structure as Net Debt/EBITDA
+        - **Debt/Capital %:** Inverse linear, Score = 100 - Debt%
+        - Combined: `0.4 x NetDebt + 0.3 x TotalDebt + 0.3 x DebtCap`
 
         **Example:**
-        - 1.5x Debt/EBITDA -> Penalty approx 30 -> Score = **70.0**
-        - 5.0x Debt/EBITDA -> Penalty approx 76 -> Score = **24.0**
-        - Negative EBITDA -> Score = **0.0**
+        - Net Debt 2x, Total Debt 2.5x, Debt/Cap 40% -> **62.5**
+        - Net Debt 4x, Total Debt 5x, Debt/Cap 60% -> **30.0**
         """)
 
-    with st.expander("Profitability Score (25% weight)"):
+    with st.expander("Profitability Score (20% weight)"):
         st.markdown("""
-        **Input:** Return on Equity (ROE) + EBITDA Margin
+        **Inputs:** ROE (30%), EBITDA Margin (30%), ROA (20%), EBIT Margin (20%)
 
         **Calculation:**
-        - Both metrics converted to percentage scale (handles % strings and decimals)
-        - Each capped at +/-50 percentage points to limit outliers
-        - Combined: `(Clipped_ROE + Clipped_Margin + 100) / 2`
-        - Result scaled to 0-100
+        - **ROE:** Clipped to +/-50%, converted to 0-100 scale: `(ROE + 50)`
+        - **EBITDA Margin:** Same as ROE
+        - **ROA:** Scaled up 5x (typically lower), clipped to 0-100
+        - **EBIT Margin:** Scaled up 2x, clipped to 0-100
+        - Combined: `0.3xROE + 0.3xMargin + 0.2xROA + 0.2xEBIT`
 
         **Example:**
-        - ROE=15%, Margin=20% -> (15+20+100)/2 = **67.5**
-        - ROE=30%, Margin=40% -> (30+40+100)/2 = **85.0**
-        - ROE=-10%, Margin=5% -> (-10+5+100)/2 = **47.5**
+        - ROE=20%, EBITDA=25%, ROA=8%, EBIT=15% -> **71.0**
+        - ROE=10%, EBITDA=15%, ROA=5%, EBIT=10% -> **57.5**
         """)
 
-    with st.expander("Liquidity Score (15% weight)"):
+    with st.expander("Liquidity Score (10% weight)"):
         st.markdown("""
-        **Input:** Current Ratio
+        **Inputs:** Current Ratio (60%), Quick Ratio (40%)
 
         **Calculation:**
-        - Linear scaling up to 3.0x: `(Current Ratio / 3.0) x 100`
-        - Ratios above 3.0x capped at 100
-        - Minimum value: 0
+        - **Current Ratio:** Linear scaling up to 3.0x: `(Current / 3.0) x 100`, capped at 100
+        - **Quick Ratio:** Linear scaling up to 2.0x: `(Quick / 2.0) x 100`, capped at 100
+        - Combined: `0.6 x Current + 0.4 x Quick`
 
         **Example:**
-        - Current Ratio = 1.5x -> (1.5/3.0)x100 = **50.0**
-        - Current Ratio = 2.5x -> (2.5/3.0)x100 = **83.3**
-        - Current Ratio = 4.0x -> Capped at **100.0**
+        - Current=2.0x, Quick=1.2x -> (66.7 x 0.6 + 60 x 0.4) = **64.0**
+        - Current=3.0x, Quick=2.0x -> **100.0**
         """)
 
     with st.expander("Growth Score (15% weight)"):
         st.markdown("""
-        **Input:** Total Revenues, 1 Year Growth
+        **Inputs:** Revenue 3Y CAGR (40%), Revenue 1Y Growth (30%), EBITDA 3Y CAGR (30%)
 
         **Calculation:**
-        - Revenue growth converted to percentage scale
-        - Formula: `(Growth% + 10) x 2`
-        - Capped at 0-100 range
-        - Rewards moderate growth, avoids over-rewarding volatile spikes
+        - Each metric: `(Growth% + 10) x 2`, capped at 0-100
+        - Rewards moderate sustained growth over short-term volatility
+        - Combined: `0.4 x Rev3Y + 0.3 x Rev1Y + 0.3 x EBITDA3Y`
 
         **Example:**
-        - Growth = 5% -> (5+10)x2 = **30.0**
-        - Growth = 20% -> (20+10)x2 = **60.0**
-        - Growth = -5% -> (-5+10)x2 = **10.0**
+        - Rev3Y=8%, Rev1Y=10%, EBITDA3Y=12% -> **48.0**
+        - Rev3Y=15%, Rev1Y=20%, EBITDA3Y=18% -> **66.0**
+        """)
+
+    with st.expander("Cash Flow Score (15% weight)"):
+        st.markdown("""
+        **Inputs:** FCF/Debt Ratio (50%), FCF Margin % (30%), Cash Ops to Current Liab (20%)
+
+        **Calculation:**
+        - **FCF/Debt:** `(FCF / Total Debt)`, capped at 50% = 100 score, scaled by 200
+        - **FCF Margin:** Percentage, scaled to 0-100
+        - **Cash Ops Coverage:** `(Cash from Ops / Current Liabilities) x 100`, capped at 100
+        - Combined: `0.5 x FCF/Debt + 0.3 x Margin + 0.2 x CashOps`
+
+        **Example:**
+        - FCF/Debt=20%, Margin=15%, CashOps=80% -> **71.0**
+        - FCF/Debt=5%, Margin=8%, CashOps=50% -> **30.4**
         """)
 
     # Section 3: IG vs HY Segmentation
@@ -1563,7 +1658,7 @@ with tab2:
         st.markdown("**Investment Grade Thresholds:**")
         ig_thresholds = pd.DataFrame({
             'Category': ['Strong Buy', 'Buy', 'Hold', 'Avoid'],
-            'Score Range': ['>= 70', '55 - 69', '40 - 54', '< 40'],
+            'Score Range': ['>= 72', '57 - 71', '42 - 56', '< 42'],
             'Color': ['Green', 'Blue', 'Yellow', 'Red'],
             'Interpretation': [
                 'Top-tier quality, highest conviction',
@@ -1587,7 +1682,7 @@ with tab2:
         st.markdown("**High Yield Thresholds:**")
         hy_thresholds = pd.DataFrame({
             'Category': ['Strong Buy', 'Buy', 'Hold', 'Avoid'],
-            'Score Range': ['>= 65', '50 - 64', '35 - 49', '< 35'],
+            'Score Range': ['>= 67', '52 - 66', '37 - 51', '< 37'],
             'Color': ['Green', 'Blue', 'Yellow', 'Red'],
             'Interpretation': [
                 'Best-in-class HY, strong fundamentals',
@@ -1678,7 +1773,7 @@ with tab2:
     - **Color:** Investment category (Strong Buy, Buy, Hold, Avoid)
 
     **How to interpret:**
-    - Companies close together have similar credit profiles across all five factors
+    - Companies close together have similar credit profiles across all six factors
     - Green clusters indicate high-quality opportunities
     - Red areas suggest higher risk or distressed situations
     - Top 10 issuers highlighted with gold borders
@@ -1863,7 +1958,7 @@ Data:
                             {"role": "user", "content": f"""Evaluate this credit screening methodology:
 
 METHODOLOGY:
-- 5-factor composite score: Credit Rating (25%), Leverage (20%), Profitability (25%), Liquidity (15%), Growth (15%)
+- 6-factor composite score: Credit Rating (20%), Leverage (20%), Profitability (20%), Liquidity (10%), Growth (15%), Cash Flow (15%)
 - Separate IG and HY analysis with different thresholds
 - Unsupervised ML approach using PCA for visualization
 - Rating group peer comparison
@@ -1889,6 +1984,6 @@ st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #4c566a;'>
     <p><strong>Issuer Credit Screening Model</strong> | Powered by Machine Learning</p>
-    <p style='font-size: 0.9em;'>Methodology: 5-factor composite scoring with separate IG/HY analysis and rating group rankings</p>
+    <p style='font-size: 0.9em;'>Methodology: 6-factor composite scoring with separate IG/HY analysis and rating group rankings</p>
 </div>
 """, unsafe_allow_html=True)
