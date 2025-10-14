@@ -53,7 +53,7 @@ pip install streamlit pandas numpy plotly scikit-learn openai xlsxwriter openpyx
 
 ### Running the Application
 ```bash
-streamlit run issuer_screening_app.py
+streamlit run issuer_screening_app_final.py
 ```
 
 ### Data Input Requirements
