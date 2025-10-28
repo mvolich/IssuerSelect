@@ -1763,14 +1763,21 @@ def get_most_recent_column(df, base_metric, data_period_setting):
 
     return pd.Series(result, index=df.index)
 
-def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: bool) -> pd.DataFrame:
+def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: bool, pe_data_cached=None, fy_cq_cached=None) -> pd.DataFrame:
     """
-    Return a per-row numeric Series for `base_metric` indexed by actual Period Ended dates (ascending),
-    with FY/CQ overlaps de-duplicated by date. In quarterly mode, prefer CQ over FY for the same date.
-    In annual mode, use only FY.
+    OPTIMIZED: Vectorized time series construction with FY/CQ de-duplication.
+    Returns DataFrame where each row is an issuer's time series (columns = ISO dates).
+
+    Args:
+        pe_data_cached: Pre-parsed period columns to avoid re-parsing (performance optimization)
+        fy_cq_cached: Pre-computed (fy_suffixes, cq_suffixes) tuple
     """
     # 1) Parse period-ended columns -> [(suffix, series_of_dates), ...]
-    pe_data = parse_period_ended_cols(df.copy())
+    if pe_data_cached is not None:
+        pe_data = pe_data_cached
+    else:
+        pe_data = parse_period_ended_cols(df.copy())
+
     if not pe_data:
         # Fallback: just the base and suffixed columns in suffix order (maintain current behavior)
         ts_cols = [base_metric] + [f"{base_metric}.{i}" for i in range(1, (12 if use_quarterly else 4) + 1)]
@@ -1780,73 +1787,80 @@ def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: 
         return out
 
     # 2) Determine FY vs CQ suffix sets using existing classifier
-    fy_suffixes, cq_suffixes = period_cols_by_kind(pe_data, df)
+    if fy_cq_cached is not None:
+        fy_suffixes, cq_suffixes = fy_cq_cached
+    else:
+        fy_suffixes, cq_suffixes = period_cols_by_kind(pe_data, df)
 
-    # 3) Build a row-wise map of suffix -> date using the parsed dates
-    suffix_to_dates = {sfx: ser for sfx, ser in pe_data}
-
-    # 4) Choose candidate suffix list by mode
+    # 3) Choose candidate suffix list by mode
     if use_quarterly:
-        # Include both FY and CQ, but we will de-duplicate by date preferring CQ over FY
         candidate_suffixes = [s for s, _ in pe_data]
     else:
-        # Annual-only window: base + .1.. .4 and/or all suffixes classified FY
         candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data]
 
-    # 5) For each row, assemble (date -> value) dict with de-duplication
-    records = []
-    for i in range(len(df)):
-        date_to_value = {}
-        fy_dates = {}  # keep track for preference logic
-        cq_dates = {}
-        for sfx in candidate_suffixes:
-            # Resolve metric column for suffix
-            col = f"{base_metric}{sfx}" if sfx else base_metric
-            if col not in df.columns:
-                continue
-            # Date for this row+suffix
-            dt = suffix_to_dates.get(sfx, pd.Series([pd.NaT]*len(df))).iloc[i]
-            try:
-                dt = pd.to_datetime(dt, errors="coerce")
-            except Exception:
-                dt = pd.NaT
-            if pd.isna(dt) or (hasattr(dt, "year") and dt.year == 1900):
-                continue
-            val = pd.to_numeric(df[col].iloc[i], errors="coerce")
-            if pd.isna(val):
-                continue
-            # Stash in FY/CQ buckets for overlap resolution
-            if use_quarterly and sfx in cq_suffixes:
-                cq_dates[dt] = val
-            elif sfx in fy_suffixes or not use_quarterly:
-                fy_dates[dt] = val
+    # 4) VECTORIZED: Build long-format DataFrame with (row_idx, date, value, is_cq)
+    long_data = []
+    cq_set = set(cq_suffixes)
 
-        if use_quarterly:
-            # Prefer CQ over FY if both have the same dt
-            all_dates = set(fy_dates) | set(cq_dates)
-            for dt in all_dates:
-                if dt in cq_dates:
-                    date_to_value[dt] = cq_dates[dt]
-                else:
-                    date_to_value[dt] = fy_dates[dt]
-        else:
-            date_to_value = fy_dates
+    for sfx in candidate_suffixes:
+        col = f"{base_metric}{sfx}" if sfx else base_metric
+        if col not in df.columns:
+            continue
 
-        # Sort by date ascending and emit numeric row series
-        if date_to_value:
-            dates_sorted = sorted(date_to_value.keys())
-            row_series = pd.Series([date_to_value[d] for d in dates_sorted], index=[d.date().isoformat() for d in dates_sorted])
-        else:
-            row_series = pd.Series(dtype=float)
-        records.append(row_series)
+        # Get date series for this suffix
+        date_series = dict(pe_data).get(sfx)
+        if date_series is None:
+            continue
 
-    # Align into a DataFrame (rows aligned, columns = ISO date strings)
-    out = pd.DataFrame(records).apply(pd.to_numeric, errors="coerce")
-    return out
+        # Build DataFrame chunk for this suffix
+        chunk = pd.DataFrame({
+            'row_idx': df.index,
+            'date': pd.to_datetime(date_series.values, errors='coerce'),
+            'value': pd.to_numeric(df[col], errors='coerce'),
+            'is_cq': sfx in cq_set
+        })
+        long_data.append(chunk)
+
+    if not long_data:
+        return pd.DataFrame(index=df.index)
+
+    # Concatenate all chunks
+    long_df = pd.concat(long_data, ignore_index=True)
+
+    # 5) Filter out invalid dates and values
+    long_df = long_df[long_df['date'].notna() & long_df['value'].notna()]
+    long_df = long_df[long_df['date'].dt.year != 1900]  # Remove 1900 sentinels
+
+    # 6) De-duplicate: For same (row_idx, date), prefer CQ over FY
+    if use_quarterly:
+        # Sort so CQ comes first, then drop duplicates keeping first (CQ preferred)
+        long_df = long_df.sort_values(['row_idx', 'date', 'is_cq'], ascending=[True, True, False])
+        long_df = long_df.drop_duplicates(subset=['row_idx', 'date'], keep='first')
+    else:
+        # Annual mode: already filtered to FY only by candidate_suffixes
+        long_df = long_df.drop_duplicates(subset=['row_idx', 'date'], keep='first')
+
+    # 7) Convert dates to ISO strings for column names
+    long_df['date_str'] = long_df['date'].dt.date.astype(str)
+
+    # 8) Pivot to wide format: rows = issuers, columns = dates
+    wide_df = long_df.pivot_table(
+        index='row_idx',
+        columns='date_str',
+        values='value',
+        aggfunc='first'  # Should be unnecessary after de-dup, but safe
+    )
+
+    # 9) Sort columns by date (ascending) and reindex to match original df
+    wide_df = wide_df[sorted(wide_df.columns)]
+    wide_df = wide_df.reindex(df.index, fill_value=np.nan)
+
+    return wide_df
 
 def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
     """
     SOLUTION TO ISSUE #2: MISSING CYCLICALITY & TREND ANALYSIS
+    OPTIMIZED: Caches period parsing and uses vectorized calculations.
 
     Calculate trend, momentum, and volatility indicators using historical time series.
 
@@ -1867,37 +1881,60 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
     if os.environ.get("RG_TESTS") == "1":
         print("  [DEV] Trend indicators use true Period Ended dates; FY/CQ overlaps deduplicated (CQ preferred in quarterly mode)")
 
+    # OPTIMIZATION: Cache period parsing - parse once, use for all metrics
+    pe_data_cached = parse_period_ended_cols(df.copy())
+    if pe_data_cached:
+        fy_cq_cached = period_cols_by_kind(pe_data_cached, df)
+    else:
+        fy_cq_cached = None
+
+    # Helper function for vectorized calculations
+    def _calc_row_stats(row_series):
+        """Calculate trend, volatility, momentum for a single row's time series."""
+        values = row_series.dropna()
+        n = len(values)
+
+        # Trend (slope)
+        if n >= 3:
+            x = np.arange(n)
+            y = values.values
+            slope = np.polyfit(x, y, 1)[0] if np.std(y) > 0 else 0.0
+            trend = float(np.clip(slope * 10, -1, 1))
+        else:
+            trend = 0.0
+
+        # Volatility (coefficient of variation, inverted)
+        if n >= 3 and values.mean() != 0:
+            cv = values.std() / abs(values.mean())
+            vol = float(100 - np.clip(cv * 100, 0, 100))
+        else:
+            vol = 50.0
+
+        # Momentum (recent 4 vs prior 4)
+        if n >= 8:
+            recent_avg = float(values.iloc[-4:].mean())
+            prior_avg = float(values.iloc[-8:-4].mean())
+            if prior_avg != 0:
+                mom = 50.0 + 50.0 * ((recent_avg - prior_avg) / abs(prior_avg))
+            else:
+                mom = 50.0
+            mom = float(np.clip(mom, 0, 100))
+        else:
+            mom = 50.0
+
+        return pd.Series({'trend': trend, 'vol': vol, 'mom': mom})
+
+    # Process each metric with cached data
     for base_metric in base_metrics:
-        ts = _build_metric_timeseries(df, base_metric, use_quarterly=use_quarterly)
-        # Compute per-row metrics using the row-wise date series
-        trend_vals, vol_vals, mom_vals = [], [], []
-        for idx in ts.index:
-            values = ts.loc[idx].dropna().astype(float)
-            if len(values) >= 3:
-                x = np.arange(len(values))
-                y = values.values
-                slope = np.polyfit(x, y, 1)[0] if np.std(y) > 0 else 0.0
-                trend_vals.append(float(np.clip(slope * 10, -1, 1)))
-            else:
-                trend_vals.append(0.0)
+        ts = _build_metric_timeseries(df, base_metric, use_quarterly=use_quarterly,
+                                      pe_data_cached=pe_data_cached, fy_cq_cached=fy_cq_cached)
 
-            if len(values) >= 3 and values.mean() != 0:
-                cv = float(values.std() / abs(values.mean()))
-                vol_vals.append(float(100 - np.clip(cv * 100, 0, 100)))
-            else:
-                vol_vals.append(50.0)
+        # Vectorized calculation using apply
+        stats = ts.apply(_calc_row_stats, axis=1)
 
-            if len(values) >= 8:
-                recent_avg = float(values.iloc[-4:].mean())
-                prior_avg = float(values.iloc[-8:-4].mean())
-                mom = 50.0 if prior_avg == 0 else 50.0 + 50.0 * ((recent_avg - prior_avg) / (abs(prior_avg) + 1e-9))
-                mom_vals.append(float(np.clip(mom, 0, 100)))
-            else:
-                mom_vals.append(50.0)
-
-        trend_scores[f'{base_metric}_trend'] = trend_vals
-        trend_scores[f'{base_metric}_volatility'] = vol_vals
-        trend_scores[f'{base_metric}_momentum'] = mom_vals
+        trend_scores[f'{base_metric}_trend'] = stats['trend']
+        trend_scores[f'{base_metric}_volatility'] = stats['vol']
+        trend_scores[f'{base_metric}_momentum'] = stats['mom']
 
     return trend_scores
 
