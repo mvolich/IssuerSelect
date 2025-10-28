@@ -3588,41 +3588,80 @@ if os.environ.get("RG_TESTS") != "1":
                     trend_data = trend_data[trend_data['Rating_Band'] == trend_rating]
                 
                 # Cycle Position Analysis
-                st.subheader("Business Cycle Position Distribution")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Cycle score histogram
-                    fig = go.Figure(data=[go.Histogram(
-                        x=trend_data['Cycle_Position_Score'],
-                        nbinsx=20,
-                        marker_color='#2C5697'
-                    )])
+                st.subheader("Business Cycle Position by Sector/Classification")
+                st.caption("Shows which sectors are improving (green) vs deteriorating (red). Higher cycle scores = improving trends.")
+
+                # Build sector/classification heatmap
+                if 'Rubrics_Custom_Classification' in trend_data.columns:
+                    # Group by classification
+                    sector_stats = trend_data.groupby('Rubrics_Custom_Classification').agg({
+                        'Cycle_Position_Score': 'mean',
+                        'Combined_Signal': lambda x: (x.str.contains('Improving', na=False)).sum() / len(x) * 100,
+                        'Composite_Score': 'mean'
+                    }).reset_index()
+
+                    # Rename columns for clarity
+                    sector_stats.columns = ['Classification', 'Avg Cycle Position', '% Improving', 'Avg Composite Score']
+
+                    # Add trend metrics if available
+                    if 'Total Debt / EBITDA (x)_trend' in trend_data.columns:
+                        leverage_trend = trend_data.groupby('Rubrics_Custom_Classification')['Total Debt / EBITDA (x)_trend'].mean()
+                        sector_stats['Avg Leverage Trend'] = sector_stats['Classification'].map(leverage_trend)
+
+                    if 'EBITDA Margin_trend' in trend_data.columns:
+                        margin_trend = trend_data.groupby('Rubrics_Custom_Classification')['EBITDA Margin_trend'].mean()
+                        sector_stats['Avg Profitability Trend'] = sector_stats['Classification'].map(margin_trend)
+
+                    # Sort by cycle position
+                    sector_stats = sector_stats.sort_values('Avg Cycle Position', ascending=False)
+
+                    # Create heatmap using plotly
+                    # Prepare data for heatmap (transpose for better visualization)
+                    heatmap_data = sector_stats.set_index('Classification').T
+
+                    # Create color scale: red (bad) -> yellow (neutral) -> green (good)
+                    fig = go.Figure(data=go.Heatmap(
+                        z=heatmap_data.values,
+                        x=heatmap_data.columns,
+                        y=heatmap_data.index,
+                        colorscale='RdYlGn',  # Red-Yellow-Green
+                        text=[[f'{val:.1f}' for val in row] for row in heatmap_data.values],
+                        texttemplate='%{text}',
+                        textfont={"size": 10},
+                        hoverongaps=False,
+                        colorbar=dict(title="Score")
+                    ))
+
                     fig.update_layout(
-                        xaxis_title='Cycle Position Score',
-                        yaxis_title='Count',
-                        title='Distribution of Cycle Position Scores',
-                        height=350
+                        title='Sector/Classification Trend Heatmap',
+                        xaxis_title='',
+                        yaxis_title='Metric',
+                        height=400,
+                        xaxis={'side': 'bottom'},
+                        margin=dict(l=150, r=50, t=80, b=150)
                     )
+
+                    # Rotate x-axis labels for readability
+                    fig.update_xaxes(tickangle=-45)
+
                     st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    # Cycle vs. Composite Score
-                    fig2 = go.Figure(data=[go.Scatter(
-                        x=trend_data['Cycle_Position_Score'],
-                        y=trend_data['Composite_Score'],
-                        mode='markers',
-                        marker=dict(size=6, opacity=0.6, color='#2C5697'),
-                        text=trend_data['Company_Name']
-                    )])
-                    fig2.update_layout(
-                        xaxis_title='Cycle Position Score',
-                        yaxis_title='Composite Score',
-                        title='Cycle vs. Composite Score',
-                        height=350
-                    )
-                    st.plotly_chart(fig2, use_container_width=True)
+
+                    # Summary metrics
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        best_sector = sector_stats.iloc[0]['Classification']
+                        best_score = sector_stats.iloc[0]['Avg Cycle Position']
+                        st.metric("🟢 Most Improving Sector", best_sector, f"{best_score:.1f}")
+                    with col2:
+                        worst_sector = sector_stats.iloc[-1]['Classification']
+                        worst_score = sector_stats.iloc[-1]['Avg Cycle Position']
+                        st.metric("🔴 Most Deteriorating Sector", worst_sector, f"{worst_score:.1f}")
+                    with col3:
+                        overall_improving = (trend_data['Combined_Signal'].str.contains('Improving', na=False)).sum() / len(trend_data) * 100
+                        st.metric("Overall % Improving", f"{overall_improving:.1f}%")
+
+                else:
+                    st.info("Classification data not available - unable to show sector breakdown")
                 
                 # Improving vs. Deteriorating
                 st.subheader("Trend Classification")
