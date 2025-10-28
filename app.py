@@ -6,6 +6,7 @@ import plotly.express as px
 import io
 import json
 import os
+import time
 import unicodedata
 from urllib.parse import urlencode
 from sklearn.preprocessing import RobustScaler
@@ -1940,6 +1941,15 @@ def calculate_cycle_position_score(trend_scores, key_metrics_trends):
 def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjusted, use_quarterly_beta=False):
     """Load data and calculate issuer scores with v2.3 enhancements"""
 
+    # ===== TIMING DIAGNOSTICS =====
+    _start_time = time.time()
+    _checkpoints = {}
+
+    def _log_timing(label):
+        elapsed = time.time() - _start_time
+        _checkpoints[label] = elapsed
+        print(f"[TIMING] {label}: {elapsed:.2f}s (cumulative)")
+
     # Initialize row audit tracking
     audits = []
 
@@ -1967,6 +1977,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # Handles NBSP, extra spaces, and ensures clean column names
     df.columns = [' '.join(str(c).replace('\u00a0', ' ').split()) for c in df.columns]
 
+    _log_timing("01_File_Loaded")
     _audit_count("Raw input", df, audits)
 
     # [v2.3] TIERED VALIDATION - minimal identifiers with flexible column matching
@@ -2039,11 +2050,12 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         pe_cols = []
 
     _audit_count("After period alignment", df, audits)
+    _log_timing("02_Column_Validation_Complete")
 
     # ========================================================================
     # CALCULATE TREND INDICATORS (ISSUE #2 SOLUTION)
     # ========================================================================
-    
+
     key_metrics_for_trends = [
         'Total Debt / EBITDA (x)',
         'EBITDA Margin',
@@ -2054,6 +2066,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # Thread use_quarterly_beta into trend calculation
     trend_scores = calculate_trend_indicators(df, key_metrics_for_trends, use_quarterly=use_quarterly_beta)
     cycle_score = calculate_cycle_position_score(trend_scores, key_metrics_for_trends)
+    _log_timing("03_Trend_Indicators_Complete")
     
     # ========================================================================
     # CALCULATE QUALITY SCORES ([v2.3] ANNUAL-ONLY DEFAULT)
@@ -2223,6 +2236,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         return scores
 
     quality_scores = calculate_quality_scores(df, data_period_setting, has_period_alignment)
+    _log_timing("04_Quality_Scores_Complete")
 
     _audit_count("After factor construction", df, audits)
 
@@ -2289,7 +2303,8 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         qs['growth_score'] * weight_matrix['growth_score'] +
         qs['cash_flow_score'] * weight_matrix['cash_flow_score']
     )
-    
+    _log_timing("05_Composite_Score_Complete")
+
     # ========================================================================
     # CREATE RESULTS DATAFRAME ([v2.3] WITH OPTIONAL COLUMNS)
     # ========================================================================
@@ -2431,11 +2446,25 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     results['Recommendation'] = draft_rec
     results.loc[is_weak_det & is_buy_or_sb, 'Recommendation'] = WEAK_DET_CAP
     results['Rec'] = results['Recommendation']
+    _log_timing("06_Recommendations_Complete")
 
     # Dev-only assertion: verify no Weak & Deteriorating issuers get Buy/Strong Buy
     if os.environ.get("RG_TESTS") == "1":
         _bad = results.query("Recommendation in ['Buy','Strong Buy'] and Signal == 'Weak & Deteriorating'")
         assert len(_bad) == 0, f"{len(_bad)} Weak & Deteriorating issuers still rated Buy/SB"
+
+    _log_timing("07_FINAL_COMPLETE")
+
+    # Print timing summary
+    print("\n" + "="*60)
+    print("TIMING SUMMARY (load_and_process_data)")
+    print("="*60)
+    prev_time = 0
+    for label, elapsed in _checkpoints.items():
+        delta = elapsed - prev_time
+        print(f"{label:40s}: {delta:6.2f}s  (cumulative: {elapsed:6.2f}s)")
+        prev_time = elapsed
+    print("="*60 + "\n")
 
     return results, df, audits
 
