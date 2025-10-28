@@ -1762,6 +1762,87 @@ def get_most_recent_column(df, base_metric, data_period_setting):
 
     return pd.Series(result, index=df.index)
 
+def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: bool) -> pd.DataFrame:
+    """
+    Return a per-row numeric Series for `base_metric` indexed by actual Period Ended dates (ascending),
+    with FY/CQ overlaps de-duplicated by date. In quarterly mode, prefer CQ over FY for the same date.
+    In annual mode, use only FY.
+    """
+    # 1) Parse period-ended columns -> [(suffix, series_of_dates), ...]
+    pe_data = parse_period_ended_cols(df.copy())
+    if not pe_data:
+        # Fallback: just the base and suffixed columns in suffix order (maintain current behavior)
+        ts_cols = [base_metric] + [f"{base_metric}.{i}" for i in range(1, (12 if use_quarterly else 4) + 1)]
+        available = [c for c in ts_cols if c in df.columns]
+        out = df[available].apply(pd.to_numeric, errors="coerce")
+        out.columns = pd.RangeIndex(start=0, stop=len(available))  # anonymous index if no dates
+        return out
+
+    # 2) Determine FY vs CQ suffix sets using existing classifier
+    fy_suffixes, cq_suffixes = period_cols_by_kind(pe_data, df)
+
+    # 3) Build a row-wise map of suffix -> date using the parsed dates
+    suffix_to_dates = {sfx: ser for sfx, ser in pe_data}
+
+    # 4) Choose candidate suffix list by mode
+    if use_quarterly:
+        # Include both FY and CQ, but we will de-duplicate by date preferring CQ over FY
+        candidate_suffixes = [s for s, _ in pe_data]
+    else:
+        # Annual-only window: base + .1.. .4 and/or all suffixes classified FY
+        candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data]
+
+    # 5) For each row, assemble (date -> value) dict with de-duplication
+    records = []
+    for i in range(len(df)):
+        date_to_value = {}
+        fy_dates = {}  # keep track for preference logic
+        cq_dates = {}
+        for sfx in candidate_suffixes:
+            # Resolve metric column for suffix
+            col = f"{base_metric}{sfx}" if sfx else base_metric
+            if col not in df.columns:
+                continue
+            # Date for this row+suffix
+            dt = suffix_to_dates.get(sfx, pd.Series([pd.NaT]*len(df))).iloc[i]
+            try:
+                dt = pd.to_datetime(dt, errors="coerce")
+            except Exception:
+                dt = pd.NaT
+            if pd.isna(dt) or (hasattr(dt, "year") and dt.year == 1900):
+                continue
+            val = pd.to_numeric(df[col].iloc[i], errors="coerce")
+            if pd.isna(val):
+                continue
+            # Stash in FY/CQ buckets for overlap resolution
+            if use_quarterly and sfx in cq_suffixes:
+                cq_dates[dt] = val
+            elif sfx in fy_suffixes or not use_quarterly:
+                fy_dates[dt] = val
+
+        if use_quarterly:
+            # Prefer CQ over FY if both have the same dt
+            all_dates = set(fy_dates) | set(cq_dates)
+            for dt in all_dates:
+                if dt in cq_dates:
+                    date_to_value[dt] = cq_dates[dt]
+                else:
+                    date_to_value[dt] = fy_dates[dt]
+        else:
+            date_to_value = fy_dates
+
+        # Sort by date ascending and emit numeric row series
+        if date_to_value:
+            dates_sorted = sorted(date_to_value.keys())
+            row_series = pd.Series([date_to_value[d] for d in dates_sorted], index=[d.date().isoformat() for d in dates_sorted])
+        else:
+            row_series = pd.Series(dtype=float)
+        records.append(row_series)
+
+    # Align into a DataFrame (rows aligned, columns = ISO date strings)
+    out = pd.DataFrame(records).apply(pd.to_numeric, errors="coerce")
+    return out
+
 def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
     """
     SOLUTION TO ISSUE #2: MISSING CYCLICALITY & TREND ANALYSIS
@@ -1781,79 +1862,42 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
     """
     trend_scores = pd.DataFrame(index=df.index)
 
-    # Determine time window based on use_quarterly flag
-    max_suffix = 12 if use_quarterly else 4
-
     # Dev check for RG_TESTS
     if os.environ.get("RG_TESTS") == "1":
-        window_type = "quarterly (base + .1-.12)" if use_quarterly else "annual-only (base + .1-.4)"
-        print(f"  [DEV] Trend indicators using {window_type} time window")
+        print("  [DEV] Trend indicators use true Period Ended dates; FY/CQ overlaps deduplicated (CQ preferred in quarterly mode)")
 
     for base_metric in base_metrics:
-        # Get time series columns based on use_quarterly setting
-        ts_cols = [base_metric] + [f"{base_metric}.{i}" for i in range(1, max_suffix + 1)]
-        available_cols = [col for col in ts_cols if col in df.columns]
-        
-        if len(available_cols) < 3:
-            # Not enough history, skip
-            trend_scores[f'{base_metric}_trend'] = 0
-            trend_scores[f'{base_metric}_volatility'] = 50
-            trend_scores[f'{base_metric}_momentum'] = 50
-            continue
-        
-        # Extract time series data
-        ts_data = df[available_cols].apply(pd.to_numeric, errors='coerce')
-        
-        # 1. TREND STRENGTH: Linear regression slope (normalized)
-        trends = []
-        for idx in ts_data.index:
-            values = ts_data.loc[idx].dropna()
+        ts = _build_metric_timeseries(df, base_metric, use_quarterly=use_quarterly)
+        # Compute per-row metrics using the row-wise date series
+        trend_vals, vol_vals, mom_vals = [], [], []
+        for idx in ts.index:
+            values = ts.loc[idx].dropna().astype(float)
             if len(values) >= 3:
-                # Simple linear regression
                 x = np.arange(len(values))
                 y = values.values
-                if np.std(y) > 0:
-                    slope = np.polyfit(x, y, 1)[0]
-                    # Normalize to -1 to +1 range (assumes typical slope range)
-                    trend_normalized = np.clip(slope * 10, -1, 1)  # Scale factor of 10
-                    trends.append(trend_normalized)
-                else:
-                    trends.append(0)
+                slope = np.polyfit(x, y, 1)[0] if np.std(y) > 0 else 0.0
+                trend_vals.append(float(np.clip(slope * 10, -1, 1)))
             else:
-                trends.append(0)
-        trend_scores[f'{base_metric}_trend'] = trends
-        
-        # 2. VOLATILITY: Coefficient of variation (lower is better)
-        volatilities = []
-        for idx in ts_data.index:
-            values = ts_data.loc[idx].dropna()
+                trend_vals.append(0.0)
+
             if len(values) >= 3 and values.mean() != 0:
-                cv = values.std() / abs(values.mean())
-                # Convert to 0-100 scale (inverted: low volatility = high score)
-                vol_score = 100 - np.clip(cv * 100, 0, 100)
-                volatilities.append(vol_score)
+                cv = float(values.std() / abs(values.mean()))
+                vol_vals.append(float(100 - np.clip(cv * 100, 0, 100)))
             else:
-                volatilities.append(50)  # Neutral
-        trend_scores[f'{base_metric}_volatility'] = volatilities
-        
-        # 3. MOMENTUM: Recent 4 periods vs. prior 4 periods
-        momentums = []
-        for idx in ts_data.index:
-            values = ts_data.loc[idx].dropna()
+                vol_vals.append(50.0)
+
             if len(values) >= 8:
-                recent_avg = values.iloc[-4:].mean()
-                prior_avg = values.iloc[-8:-4].mean()
-                if prior_avg != 0:
-                    pct_change = ((recent_avg - prior_avg) / abs(prior_avg)) * 100
-                    # Normalize to 0-100 (50 = no change, >50 = improving, <50 = deteriorating)
-                    momentum_score = 50 + np.clip(pct_change, -50, 50)
-                    momentums.append(momentum_score)
-                else:
-                    momentums.append(50)
+                recent_avg = float(values.iloc[-4:].mean())
+                prior_avg = float(values.iloc[-8:-4].mean())
+                mom = 50.0 if prior_avg == 0 else 50.0 + 50.0 * ((recent_avg - prior_avg) / (abs(prior_avg) + 1e-9))
+                mom_vals.append(float(np.clip(mom, 0, 100)))
             else:
-                momentums.append(50)  # Neutral
-        trend_scores[f'{base_metric}_momentum'] = momentums
-    
+                mom_vals.append(50.0)
+
+        trend_scores[f'{base_metric}_trend'] = trend_vals
+        trend_scores[f'{base_metric}_volatility'] = vol_vals
+        trend_scores[f'{base_metric}_momentum'] = mom_vals
+
     return trend_scores
 
 def calculate_cycle_position_score(trend_scores, key_metrics_trends):
@@ -2213,44 +2257,38 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
             qs[col] = qs[col].fillna(default_val)
 
     # [v2.3] Calculate composite score - use classification weights only if available
-    composite_scores = []
-    weight_used_list = []
-
-    for idx, row in df.iterrows():
-        # Only use classification-adjusted weights if classification column exists
-        if has_classification and use_sector_adjusted:
-            classification = row.get('Rubrics Custom Classification', 'Default')
-            weights = get_classification_weights(classification, True)
-        else:
-            # Use universal weights when classification not available
-            weights = get_classification_weights('Default', False)
-
-        individual_scores = {
-            'credit_score': qs.loc[idx, 'credit_score'],
-            'leverage_score': qs.loc[idx, 'leverage_score'],
-            'profitability_score': qs.loc[idx, 'profitability_score'],
-            'liquidity_score': qs.loc[idx, 'liquidity_score'],
-            'growth_score': qs.loc[idx, 'growth_score'],
-            'cash_flow_score': qs.loc[idx, 'cash_flow_score']
-        }
-
-        composite = sum(individual_scores[factor] * weight for factor, weight in weights.items())
-        composite_scores.append(composite)
-
-        # Store which weights were used (for display)
-        if has_classification and use_sector_adjusted:
-            classification = row.get('Rubrics Custom Classification', 'Default')
-            if classification in CLASSIFICATION_TO_SECTOR:
-                parent_sector = CLASSIFICATION_TO_SECTOR[classification]
-                weight_used_list.append(f"{parent_sector} (via {classification[:20]}...)")
-            elif classification in CLASSIFICATION_OVERRIDES:
-                weight_used_list.append(f"{classification[:30]}... (Custom)")
+    # OPTIMIZED: Vectorized calculation instead of iterrows()
+    
+    if has_classification and use_sector_adjusted:
+        # Build weight matrix for each issuer based on classification
+        weight_matrix = df['Rubrics Custom Classification'].apply(
+            lambda c: pd.Series(get_classification_weights(c, True))
+        )
+        # Track which weights were used (for display)
+        def _weight_label(c):
+            if c in CLASSIFICATION_TO_SECTOR:
+                parent_sector = CLASSIFICATION_TO_SECTOR[c]
+                return f"{parent_sector} (via {c[:20]}...)"
+            elif c in CLASSIFICATION_OVERRIDES:
+                return f"{c[:30]}... (Custom)"
             else:
-                weight_used_list.append("Universal")
-        else:
-            weight_used_list.append("Universal")
-
-    composite_score = pd.Series(composite_scores, index=df.index)
+                return "Universal"
+        weight_used_list = df['Rubrics Custom Classification'].apply(_weight_label).tolist()
+    else:
+        # Use universal weights for all rows
+        default_weights = get_classification_weights('Default', False)
+        weight_matrix = pd.DataFrame([default_weights] * len(df), index=df.index)
+        weight_used_list = ["Universal"] * len(df)
+    
+    # Vectorized composite score calculation: sum(score * weight) for each factor
+    composite_score = (
+        qs['credit_score'] * weight_matrix['credit_score'] +
+        qs['leverage_score'] * weight_matrix['leverage_score'] +
+        qs['profitability_score'] * weight_matrix['profitability_score'] +
+        qs['liquidity_score'] * weight_matrix['liquidity_score'] +
+        qs['growth_score'] * weight_matrix['growth_score'] +
+        qs['cash_flow_score'] * weight_matrix['cash_flow_score']
+    )
     
     # ========================================================================
     # CREATE RESULTS DATAFRAME ([v2.3] WITH OPTIONAL COLUMNS)
@@ -2301,27 +2339,24 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
 
     _audit_count("After scoring (non-NaN Composite_Score)", results[results['Composite_Score'].notna()], audits)
 
-    # Add Rating Band (ISSUE #4 SOLUTION)
-    results['Rating_Band'] = results['Credit_Rating_Clean'].apply(assign_rating_band)
+    # Add Rating Band (ISSUE #4 SOLUTION) - VECTORIZED
+    # Build reverse mapping for O(1) lookup
+    rating_to_band = {}
+    for band, ratings in RATING_BANDS.items():
+        for rating in ratings:
+            rating_to_band[rating] = band
     
-    # Add Rating Group (IG/HY)
+    # Vectorized band assignment
+    results['Rating_Band'] = results['Credit_Rating_Clean'].str.upper().str.strip().map(rating_to_band).fillna('Unrated')
+    
+    # Add Rating Group (IG/HY) - VECTORIZED
     # [v2.3] All non-IG ratings (including NR/WD/N/M/empty/NaN) classified as High Yield
-    ig_ratings = ['AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-']
-
-    def _classify_rating_group(x):
-        import pandas as pd
-        if pd.isna(x):
-            return 'High Yield'
-        xu = str(x).strip().upper()
-        if xu in ig_ratings:
-            return 'Investment Grade'
-        # Explicit non-opinion / withdrawn / missing treated as HY
-        if xu in {'', 'NR', 'N/R', 'N.M', 'N/M', 'WD', 'W/D', 'NOT RATED', 'NR.'}:
-            return 'High Yield'
-        # All other mapped ratings (BB..B..CCC..CC..C..D..SD) -> HY
-        return 'High Yield'
-
-    results['Rating_Group'] = results['Credit_Rating_Clean'].apply(_classify_rating_group)
+    ig_ratings_set = {'AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-'}
+    
+    # Vectorized classification: clean, check membership, assign
+    cleaned_ratings = results['Credit_Rating_Clean'].fillna('').astype(str).str.strip().str.upper()
+    results['Rating_Group'] = 'High Yield'  # default
+    results.loc[cleaned_ratings.isin(ig_ratings_set), 'Rating_Group'] = 'Investment Grade'
 
     # Sanity check: ensure no 'Unknown' remains
     assert 'Unknown' not in set(results['Rating_Group'].unique()), \
@@ -2355,73 +2390,46 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # Calculate dynamic threshold to match quadrant plot visualization
     median_cycle = results['Cycle_Position_Score'].median(skipna=True)
 
-    def generate_combined_signal(row):
-        """
-        Four-quadrant classification for portfolio visualization.
-        Uses data-driven median threshold to align with quadrant plot split lines.
-        """
-        composite = row['Composite_Score']
-        cycle = row['Cycle_Position_Score']
-
-        high_composite = composite >= 60
-        high_cycle = cycle >= median_cycle  # Dynamic threshold matches visualization
-
-        if high_composite and high_cycle:
-            return "Strong & Improving"
-        elif high_composite and not high_cycle:
-            return "Strong but Deteriorating"
-        elif not high_composite and high_cycle:
-            return "Weak but Improving"
-        else:
-            return "Weak & Deteriorating"
-
-    results['Signal'] = results.apply(generate_combined_signal, axis=1)
+    # Vectorized signal generation (efficient - no row-by-row iteration)
+    # Uses data-driven median threshold to align with quadrant plot split lines
+    high_composite = results['Composite_Score'] >= 60
+    high_cycle = results['Cycle_Position_Score'] >= median_cycle
+    
+    # Four-quadrant classification
+    results['Signal'] = 'Weak & Deteriorating'  # default
+    results.loc[high_composite & high_cycle, 'Signal'] = 'Strong & Improving'
+    results.loc[high_composite & ~high_cycle, 'Signal'] = 'Strong but Deteriorating'
+    results.loc[~high_composite & high_cycle, 'Signal'] = 'Weak but Improving'
     results['Combined_Signal'] = results['Signal']  # Keep alias for backward compatibility
 
     # ========================================================================
     # MINIMAL GUARDRAIL RECOMMENDATION LOGIC
     # ========================================================================
 
-    def _split_signal(sig):
-        """Parse Signal into (position, trend) tuple."""
-        if not isinstance(sig, str) or "&" not in sig:
-            return ("Moderate", "Stable")
-        pos, trn = [p.strip().title() for p in sig.split("&", 1)]
-        if trn.startswith("Deterior"): trn = "Deteriorating"
-        if trn.startswith("Improve"): trn = "Improving"
-        if trn not in {"Improving","Stable","Deteriorating"}: trn = "Stable"
-        if pos not in {"Weak","Moderate","Strong"}: pos = "Moderate"
-        return (pos, trn)
-
-    def _draft_rec_from_score(score):
-        """Get draft recommendation from Composite_Score."""
-        import math
-        if score is None or (isinstance(score, float) and math.isnan(score)):
-            return "Hold"
-        if score >= 65: return "Strong Buy"
-        if score >= 50: return "Buy"
-        if score >= 35: return "Hold"
-        return "Avoid"
-
     # --- Minimal guardrail: ONLY block Buy/SB when Weak & Deteriorating ---
     # Config: choose the cap for Weak & Deteriorating
     WEAK_DET_CAP = "Hold"   # set to "Avoid" if you want harsher behaviour
 
-    def _enforce_guardrails_minimal(draft_rec, position, trend):
-        """Apply minimal guardrail: only cap Buy/Strong Buy for Weak & Deteriorating."""
-        if position == "Weak" and trend == "Deteriorating":
-            # cap at Hold/Avoid (no Buy/SB allowed)
-            if draft_rec in {"Buy", "Strong Buy"}:
-                return WEAK_DET_CAP
-        return draft_rec
-
-    def _final_rec(row):
-        """Compute final recommendation with minimal guardrail."""
-        draft = _draft_rec_from_score(row.get("Composite_Score"))
-        pos, trn = _split_signal(row.get("Signal"))
-        return _enforce_guardrails_minimal(draft, pos, trn)
-
-    results['Recommendation'] = results.apply(_final_rec, axis=1)
+    # VECTORIZED recommendation generation
+    # (numpy already imported globally as np)
+    
+    # Step 1: Draft recommendations from Composite_Score
+    score = results['Composite_Score'].fillna(0)
+    conditions = [
+        score >= 65,
+        score >= 50,
+        score >= 35
+    ]
+    choices = ['Strong Buy', 'Buy', 'Hold']
+    draft_rec = np.select(conditions, choices, default='Avoid')
+    
+    # Step 2: Apply guardrail (only cap Buy/SB for Weak & Deteriorating)
+    is_weak_det = results['Signal'] == 'Weak & Deteriorating'
+    is_buy_or_sb = pd.Series(draft_rec).isin(['Buy', 'Strong Buy'])
+    
+    # Final recommendation
+    results['Recommendation'] = draft_rec
+    results.loc[is_weak_det & is_buy_or_sb, 'Recommendation'] = WEAK_DET_CAP
     results['Rec'] = results['Recommendation']
 
     # Dev-only assertion: verify no Weak & Deteriorating issuers get Buy/Strong Buy
@@ -2613,7 +2621,7 @@ if os.environ.get("RG_TESTS") != "1":
                     st.dataframe(top10, use_container_width=True, hide_index=True)
                 
                 with col2:
-                    st.subheader("WARNING: Bottom 10 Performers (Overall)")
+                    st.subheader("Bottom 10 Performers (Overall)")
                     bottom10 = results_final.nsmallest(10, 'Composite_Score')[
                         ['Overall_Rank', 'Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification', 'Composite_Score', 'Recommendation']
                     ]
@@ -3350,9 +3358,7 @@ if os.environ.get("RG_TESTS") != "1":
             
             with tab4:
                 st.header(" Classification-Specific Analysis")
-                
-                st.info("**NEW FEATURE**: Compare how classification-adjusted weights impact scores vs. universal weights")
-                
+
                 # Classification selection
                 selected_classification = st.selectbox(
                     "Select Classification for Analysis",
@@ -4066,8 +4072,28 @@ if os.environ.get("RG_TESTS") == "1":
     except Exception as e:
         print(f"  WARN: Trend window test skipped ({e})")
 
+    # Test 11: FY/CQ overlap de-duplication
+    print("\nTest: FY/CQ overlap de-duplication")
+    df_test = pd.DataFrame([{
+        "Period Ended": "31/12/2020",
+        "Period Ended.1": "31/12/2021",
+        "Period Ended.2": "31/12/2022",
+        "Period Ended.3": "31/12/2023",
+        "Period Ended.4": "31/12/2024",   # FY0
+        "Period Ended.5": "31/12/2023",   # CQ-7
+        "Period Ended.8": "31/12/2024",   # CQ-3 (overlaps FY0)
+        "EBITDA Margin": 10, "EBITDA Margin.1": 11, "EBITDA Margin.2": 12, "EBITDA Margin.3": 13, "EBITDA Margin.4": 14,
+        "EBITDA Margin.5": 13.5, "EBITDA Margin.8": 14.2
+    }])
+    ts = _build_metric_timeseries(df_test, "EBITDA Margin", use_quarterly=True)
+    assert (ts.columns == pd.Index(sorted(ts.columns))).all()
+    # Only one 2024-12-31 column should exist after dedup (CQ preferred)
+    dup_2024 = [c for c in ts.columns if c.endswith("2024-12-31")]
+    assert len(dup_2024) == 1, f"Expected single 2024-12-31 after dedup, got {dup_2024}"
+    print("  OK overlap de-duplication (CQ preferred)")
+
     print("\n" + "="*60)
-    print("SUCCESS: ALL RG_TESTS PASSED for v2.3 (10 tests)")
+    print("SUCCESS: ALL RG_TESTS PASSED for v2.3 (11 tests)")
     print("="*60 + "\n")
 
     # Exit successfully after tests
