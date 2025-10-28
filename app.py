@@ -3589,11 +3589,11 @@ if os.environ.get("RG_TESTS") != "1":
                 
                 # Cycle Position Analysis
                 st.subheader("Business Cycle Position by Sector/Classification")
-                st.caption("Shows which sectors are improving (green) vs deteriorating (red). Higher cycle scores = improving trends.")
+                st.caption("Shows which sectors are improving (green) vs deteriorating (red). Cycle Position Score is a composite of trend, volatility, and momentum across leverage, profitability, liquidity, and growth metrics.")
 
                 # Build sector/classification heatmap
                 if 'Rubrics_Custom_Classification' in trend_data.columns:
-                    # Group by classification
+                    # Group by classification - use only composite metrics for consistency
                     sector_stats = trend_data.groupby('Rubrics_Custom_Classification').agg({
                         'Cycle_Position_Score': 'mean',
                         'Combined_Signal': lambda x: (x.str.contains('Improving', na=False)).sum() / len(x) * 100,
@@ -3602,15 +3602,6 @@ if os.environ.get("RG_TESTS") != "1":
 
                     # Rename columns for clarity
                     sector_stats.columns = ['Classification', 'Avg Cycle Position', '% Improving', 'Avg Composite Score']
-
-                    # Add trend metrics if available
-                    if 'Total Debt / EBITDA (x)_trend' in trend_data.columns:
-                        leverage_trend = trend_data.groupby('Rubrics_Custom_Classification')['Total Debt / EBITDA (x)_trend'].mean()
-                        sector_stats['Avg Leverage Trend'] = sector_stats['Classification'].map(leverage_trend)
-
-                    if 'EBITDA Margin_trend' in trend_data.columns:
-                        margin_trend = trend_data.groupby('Rubrics_Custom_Classification')['EBITDA Margin_trend'].mean()
-                        sector_stats['Avg Profitability Trend'] = sector_stats['Classification'].map(margin_trend)
 
                     # Sort by cycle position
                     sector_stats = sector_stats.sort_values('Avg Cycle Position', ascending=False)
