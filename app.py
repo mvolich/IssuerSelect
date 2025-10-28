@@ -2109,6 +2109,73 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # CALCULATE QUALITY SCORES ([v2.3] ANNUAL-ONLY DEFAULT)
     # ========================================================================
 
+    def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_setting):
+        """
+        OPTIMIZED: Extract all metrics at once using vectorized operations.
+        Returns dict of {metric_name: Series of values}.
+        """
+        result = {}
+
+        if not has_period_alignment:
+            # Fallback: use get_most_recent_column for each metric
+            for metric in metric_list:
+                result[metric] = get_most_recent_column(df, metric, data_period_setting)
+            return result
+
+        # Parse Period Ended columns once for all metrics
+        pe_data = parse_period_ended_cols(df)
+        if not pe_data:
+            # No period data - fall back to base columns
+            for metric in metric_list:
+                if metric in df.columns:
+                    result[metric] = pd.to_numeric(df[metric], errors='coerce')
+                else:
+                    result[metric] = pd.Series(np.nan, index=df.index)
+            return result
+
+        # Build FY suffix list (annual-only)
+        fy_suffixes, _ = period_cols_by_kind(pe_data, df)
+        candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data[:5]]  # First 5 as fallback
+
+        # For each metric, extract most recent annual value (vectorized)
+        for metric in metric_list:
+            # Collect (date, value) pairs for this metric across all FY suffixes
+            metric_data = []
+            for sfx in candidate_suffixes:
+                col = f"{metric}{sfx}" if sfx else metric
+                if col not in df.columns:
+                    continue
+
+                date_series = dict(pe_data).get(sfx)
+                if date_series is None:
+                    continue
+
+                # Build chunk for this suffix
+                chunk = pd.DataFrame({
+                    'row_idx': df.index,
+                    'date': pd.to_datetime(date_series.values, errors='coerce'),
+                    'value': pd.to_numeric(df[col], errors='coerce')
+                })
+                metric_data.append(chunk)
+
+            if not metric_data:
+                result[metric] = pd.Series(np.nan, index=df.index)
+                continue
+
+            # Concatenate and filter
+            long_df = pd.concat(metric_data, ignore_index=True)
+            long_df = long_df[long_df['date'].notna() & long_df['value'].notna()]
+            long_df = long_df[long_df['date'].dt.year != 1900]
+
+            # Get most recent (latest date) value per issuer
+            long_df = long_df.sort_values(['row_idx', 'date'])
+            most_recent = long_df.groupby('row_idx').last()['value']
+
+            # Reindex to match original df
+            result[metric] = most_recent.reindex(df.index, fill_value=np.nan)
+
+        return result
+
     def calculate_quality_scores(df, data_period_setting, has_period_alignment):
         scores = pd.DataFrame(index=df.index)
 
@@ -2131,25 +2198,27 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
             alias = {'BBBM':'BBB','BMNS':'B','CCCC':'CCC'}
             return alias.get(x, x)
 
-        def _get_metric_value(row_or_df, base):
-            """
-            [v2.3] Get metric value using annual-only if period alignment available,
-            otherwise fall back to old column-based approach.
-            """
-            if has_period_alignment:
-                # Use annual-only series extraction (row-by-row)
-                if isinstance(row_or_df, pd.Series):
-                    return most_recent_annual_value(row_or_df, base)
-                else:
-                    # DataFrame - apply row by row
-                    return row_or_df.apply(lambda r: most_recent_annual_value(r, base), axis=1)
-            else:
-                # Fall back to old column-based approach
-                if isinstance(row_or_df, pd.Series):
-                    # Single row - not supported for old approach, return NaN
-                    return np.nan
-                else:
-                    return get_most_recent_column(row_or_df, base, data_period_setting)
+        # OPTIMIZATION: Pre-extract all needed metrics in one batch
+        needed_metrics = [
+            'EBITDA / Interest Expense (x)',
+            'Net Debt / EBITDA',
+            'Total Debt / EBITDA (x)',
+            'Total Debt / Total Capital (%)',
+            'Return on Equity',
+            'EBITDA Margin',
+            'Return on Assets',
+            'EBIT Margin',
+            'Current Ratio (x)',
+            'Quick Ratio (x)',
+            'Total Revenues, 1 Year Growth',
+            'Total Revenues, 3 Yr. CAGR',
+            'EBITDA, 3 Years CAGR',
+            'Levered Free Cash Flow',
+            'Total Debt',
+            'Levered Free Cash Flow Margin',
+            'Cash from Ops. to Curr. Liab. (x)'
+        ]
+        metrics = _batch_extract_metrics(df, needed_metrics, has_period_alignment, data_period_setting)
 
         # Credit Score - Enhanced with EBITDA/Interest Expense coverage
         # [v2.3] Interest Coverage stays in Credit Score (70% rating + 30% coverage)
@@ -2168,7 +2237,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         rating_score = cr.map(rating_map) * (100.0/21.0)
 
         # Component 2: EBITDA / Interest Expense coverage (30%) - [v2.3] Annual-only
-        ebitda_interest = _get_metric_value(df, 'EBITDA / Interest Expense (x)')
+        ebitda_interest = metrics['EBITDA / Interest Expense (x)']
         
         def score_ebitda_coverage(cov):
             """
@@ -2204,31 +2273,31 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         scores['credit_score'] = rating_score * 0.70 + ebitda_cov_score * 0.30
 
         # Leverage ([v2.3] Annual-only)
-        net_debt_ebitda = _get_metric_value(df, 'Net Debt / EBITDA')
+        net_debt_ebitda = metrics['Net Debt / EBITDA']
         net_debt_ebitda = net_debt_ebitda.where(net_debt_ebitda >= 0, other=20.0).fillna(20.0).clip(upper=20.0)
         part1 = (np.minimum(net_debt_ebitda, 3.0)/3.0)*60.0
         part2 = (np.maximum(net_debt_ebitda-3.0, 0.0)/5.0)*40.0
         raw_penalty = np.minimum(part1+part2, 100.0)
         net_debt_score = np.clip(100.0 - raw_penalty, 0.0, 100.0)
 
-        debt_ebitda = _get_metric_value(df, 'Total Debt / EBITDA (x)')
+        debt_ebitda = metrics['Total Debt / EBITDA (x)']
         debt_ebitda = debt_ebitda.where(debt_ebitda >= 0, other=20.0).fillna(20.0).clip(upper=20.0)
         part1_td = (np.minimum(debt_ebitda, 3.0)/3.0)*60.0
         part2_td = (np.maximum(debt_ebitda-3.0, 0.0)/5.0)*40.0
         raw_penalty_td = np.minimum(part1_td+part2_td, 100.0)
         debt_ebitda_score = np.clip(100.0 - raw_penalty_td, 0.0, 100.0)
 
-        debt_capital = _get_metric_value(df, 'Total Debt / Total Capital (%)')
+        debt_capital = metrics['Total Debt / Total Capital (%)']
         debt_capital = debt_capital.fillna(50).clip(0, 100)
         debt_cap_score = np.clip(100 - debt_capital, 0, 100)
 
         scores['leverage_score'] = net_debt_score * 0.4 + debt_ebitda_score * 0.3 + debt_cap_score * 0.3
 
         # Profitability ([v2.3] Annual-only)
-        roe = _pct_to_100(_get_metric_value(df, 'Return on Equity'))
-        ebitda_margin = _pct_to_100(_get_metric_value(df, 'EBITDA Margin'))
-        roa = _pct_to_100(_get_metric_value(df, 'Return on Assets'))
-        ebit_margin = _pct_to_100(_get_metric_value(df, 'EBIT Margin'))
+        roe = _pct_to_100(metrics['Return on Equity'])
+        ebitda_margin = _pct_to_100(metrics['EBITDA Margin'])
+        roa = _pct_to_100(metrics['Return on Assets'])
+        ebit_margin = _pct_to_100(metrics['EBIT Margin'])
 
         roe_score = np.clip(roe, -50, 50) + 50
         margin_score = np.clip(ebitda_margin, -50, 50) + 50
@@ -2239,8 +2308,8 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
                                          roa_score * 0.2 + ebit_score * 0.2)
 
         # Liquidity ([v2.3] Annual-only)
-        current_ratio = _get_metric_value(df, 'Current Ratio (x)').clip(lower=0)
-        quick_ratio = _get_metric_value(df, 'Quick Ratio (x)').clip(lower=0)
+        current_ratio = metrics['Current Ratio (x)'].clip(lower=0)
+        quick_ratio = metrics['Quick Ratio (x)'].clip(lower=0)
 
         current_score = np.clip((current_ratio/3.0)*100.0, 0, 100)
         quick_score = np.clip((quick_ratio/2.0)*100.0, 0, 100)
@@ -2248,9 +2317,9 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         scores['liquidity_score'] = current_score * 0.6 + quick_score * 0.4
 
         # Growth ([v2.3] Annual-only)
-        rev_growth_1y = _pct_to_100(_get_metric_value(df, 'Total Revenues, 1 Year Growth'))
-        rev_cagr_3y = _pct_to_100(_get_metric_value(df, 'Total Revenues, 3 Yr. CAGR'))
-        ebitda_cagr_3y = _pct_to_100(_get_metric_value(df, 'EBITDA, 3 Years CAGR'))
+        rev_growth_1y = _pct_to_100(metrics['Total Revenues, 1 Year Growth'])
+        rev_cagr_3y = _pct_to_100(metrics['Total Revenues, 3 Yr. CAGR'])
+        ebitda_cagr_3y = _pct_to_100(metrics['EBITDA, 3 Years CAGR'])
 
         rev_1y_score = np.clip((rev_growth_1y + 10) * 2, 0, 100)
         rev_3y_score = np.clip((rev_cagr_3y + 10) * 2, 0, 100)
@@ -2259,10 +2328,10 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         scores['growth_score'] = rev_3y_score * 0.4 + rev_1y_score * 0.3 + ebitda_3y_score * 0.3
 
         # Cash Flow ([v2.3] Annual-only)
-        fcf = _get_metric_value(df, 'Levered Free Cash Flow')
-        total_debt = _get_metric_value(df, 'Total Debt')
-        fcf_margin = _pct_to_100(_get_metric_value(df, 'Levered Free Cash Flow Margin'))
-        cash_ops_ratio = _get_metric_value(df, 'Cash from Ops. to Curr. Liab. (x)')
+        fcf = metrics['Levered Free Cash Flow']
+        total_debt = metrics['Total Debt']
+        fcf_margin = _pct_to_100(metrics['Levered Free Cash Flow Margin'])
+        cash_ops_ratio = metrics['Cash from Ops. to Curr. Liab. (x)']
 
         fcf_debt_ratio = (fcf / total_debt).clip(upper=0.5) * 200
         fcf_debt_score = fcf_debt_ratio.fillna(0).clip(0, 100)
