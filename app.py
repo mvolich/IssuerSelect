@@ -1372,11 +1372,11 @@ def get_classification_weights(classification, use_sector_adjusted=True):
     # Step 3: Fall back to Default
     return SECTOR_WEIGHTS['Default']
 
-# ============================================================================
-# EXPLAINABILITY HELPERS (v2.3) — 2025-10-29: Deduped, single source of truth
-# ============================================================================
+# ================================
+# EXPLAINABILITY HELPERS (v2.3) — canonical
+# ================================
 
-def _resolve_text_field(row, candidates):
+def _resolve_text_field(row: pd.Series, candidates):
     """
     Resolve a text field from multiple column name candidates.
     Returns first non-empty value found, or None.
@@ -1386,13 +1386,13 @@ def _resolve_text_field(row, candidates):
             return str(row[c]).strip()
     return None
 
-def _resolve_model_weights_for_row(row, scoring_method):
+def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
     """
-    Returns (weights_dict, provenance_str) for a given issuer row.
-    Keys are lowercase: credit_score, leverage_score, profitability_score,
-                       liquidity_score, growth_score, cash_flow_score.
-    Priority: classification-specific -> sector -> universal fallback.
-    Respects scoring_method to determine whether to use sector-adjusted weights.
+    Returns (weights_dict, provenance_str).
+    Priority (when scoring_method == 'Classification-Adjusted Weights (Recommended)'):
+        classification-specific -> sector -> classification map -> universal.
+    Keys: lowercase matching SECTOR_WEIGHTS (credit_score, leverage_score, profitability_score,
+          liquidity_score, growth_score, cash_flow_score).
     """
     # Universal default (lowercase keys matching SECTOR_WEIGHTS format)
     UNIVERSAL = {
@@ -1400,46 +1400,43 @@ def _resolve_model_weights_for_row(row, scoring_method):
         'liquidity_score': 0.10, 'growth_score': 0.15, 'cash_flow_score': 0.15
     }
 
-    # Check if user selected Classification-Adjusted mode
-    use_adjusted = (scoring_method == "Classification-Adjusted Weights (Recommended)")
-
-    if not use_adjusted:
+    # If user forces universal, short-circuit
+    if str(scoring_method).lower().startswith("universal"):
         return UNIVERSAL, "Universal weights"
 
-    cls = _resolve_text_field(row, ["Rubrics_Custom_Classification", "Rubrics Custom Classification", "Classification"])
+    cls = _resolve_text_field(row, ["Rubrics_Custom_Classification", "Rubrics Custom Classification", "Classification", "Custom_Classification"])
     sec = _resolve_text_field(row, ["IQ_SECTOR", "Sector", "GICS_Sector"])
 
-    # 1) If app exposes canonical helper, use it
+    # 1) Canonical helper provided by the app
     try:
-        if "get_classification_weights" in globals():
-            w = get_classification_weights(cls, use_sector_adjusted=True)
-            if w and isinstance(w, dict):
-                return w, f"Sector-Adjusted via classification='{cls or 'n/a'}', sector='{sec or 'n/a'}'"
+        w = get_classification_weights(cls, use_sector_adjusted=True)
+        if isinstance(w, dict) and w:
+            return w, f"Sector-Adjusted via classification='{cls or 'n/a'}', sector='{sec or 'n/a'}'"
     except Exception:
         pass
 
-    # 2) Direct sector map lookup
+    # 2) Sector map
     try:
-        if "SECTOR_WEIGHTS" in globals() and sec and sec in SECTOR_WEIGHTS:
+        if sec and sec in SECTOR_WEIGHTS:
             return SECTOR_WEIGHTS[sec], f"Sector-Adjusted via sector='{sec}'"
     except Exception:
         pass
 
-    # 3) Classification override lookup
+    # 3) Classification override
     try:
-        if "CLASSIFICATION_OVERRIDES" in globals() and cls and cls in CLASSIFICATION_OVERRIDES:
+        if cls and cls in CLASSIFICATION_OVERRIDES:
             return CLASSIFICATION_OVERRIDES[cls], f"Classification override for '{cls}'"
     except Exception:
         pass
 
-    # 4) Fallback to universal
-    return UNIVERSAL, "Universal weights (classification not found)"
+    # 4) Fallback
+    return UNIVERSAL, "Universal weights"
 
-def _build_explainability_table(issuer_row, scoring_method):
+def _build_explainability_table(issuer_row: pd.Series, scoring_method: str):
     """
-    Build factor contribution table with provenance.
-    Normalizes weights over present factor columns so sum = 1.0.
-    Returns (df, provenance_str, composite_score, diff_sum_minus_composite).
+    Builds a 4-col table: Factor, Score, Weight %, Contribution.
+    Normalises weights over present factor columns so sum = 1.0.
+    Returns (df, provenance, composite_score, diff_sum_minus_composite)
     """
     # Canonical factor order (lowercase weight keys matching SECTOR_WEIGHTS)
     canonical = ['credit_score', 'leverage_score', 'profitability_score',
@@ -1455,7 +1452,7 @@ def _build_explainability_table(issuer_row, scoring_method):
         'cash_flow_score': 'Cash_Flow_Score'
     }
 
-    # Display names (clean, titlecase)
+    # Display names (clean)
     display_map = {
         'credit_score': 'Credit',
         'leverage_score': 'Leverage',
@@ -1465,35 +1462,32 @@ def _build_explainability_table(issuer_row, scoring_method):
         'cash_flow_score': 'Cash Flow'
     }
 
-    # Get weights and provenance
     weights, provenance = _resolve_model_weights_for_row(issuer_row, scoring_method)
 
     # Filter to present columns only
     present = [k for k in canonical if col_map[k] in issuer_row.index]
 
-    # Defensive normalization: ensure weights sum to 1.0 over present factors
+    # Defensive normalisation over present factors only
     w = {k: float(max(0.0, weights.get(k, 0.0))) for k in present}
     w_sum = sum(w.values()) or 1.0
     w = {k: v / w_sum for k, v in w.items()}
 
-    # Build contribution rows
     rows = []
-    for key in present:
-        col_name = col_map[key]
-        s = float(issuer_row.get(col_name, np.nan))
-        wt = w[key]
+    for fac_key in present:
+        s = float(issuer_row.get(col_map[fac_key], np.nan))
+        wt = w[fac_key]
         rows.append({
-            "Factor": display_map[key],
+            "Factor": display_map[fac_key],
             "Score": s,
             "Weight %": round(100.0 * wt, 2),
             "Contribution": round(s * wt, 4)
         })
 
     df = pd.DataFrame(rows)
-    df["Contribution"] = df["Contribution"].astype(float)
     comp = float(issuer_row.get("Composite_Score", np.nan))
     diff = float(df["Contribution"].sum() - comp) if len(df) else np.nan
     return df, provenance, comp, diff
+# ================================
 
 # ============================================================================
 # RATING BAND MAPPING (SOLUTION TO ISSUE #4: OVERLY BROAD RATING GROUPS)
