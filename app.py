@@ -1377,10 +1377,6 @@ def get_classification_weights(classification, use_sector_adjusted=True):
 # ================================
 
 def _resolve_text_field(row: pd.Series, candidates):
-    """
-    Resolve a text field from multiple column name candidates.
-    Returns first non-empty value found, or None.
-    """
     for c in candidates:
         if c in row.index and pd.notna(row[c]) and str(row[c]).strip():
             return str(row[c]).strip()
@@ -1389,16 +1385,13 @@ def _resolve_text_field(row: pd.Series, candidates):
 def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
     """
     Returns (weights_dict, provenance_str).
-    Priority (when scoring_method == 'Classification-Adjusted Weights (Recommended)'):
+    Priority (when scoring_method == 'Classification-Adjusted (Recommended)'):
         classification-specific -> sector -> classification map -> universal.
-    Keys: lowercase matching SECTOR_WEIGHTS (credit_score, leverage_score, profitability_score,
-          liquidity_score, growth_score, cash_flow_score).
+    Keys expected: lowercase matching SECTOR_WEIGHTS (credit_score, leverage_score,
+                   profitability_score, liquidity_score, growth_score, cash_flow_score)
     """
-    # Universal default (lowercase keys matching SECTOR_WEIGHTS format)
-    UNIVERSAL = {
-        'credit_score': 0.20, 'leverage_score': 0.20, 'profitability_score': 0.20,
-        'liquidity_score': 0.10, 'growth_score': 0.15, 'cash_flow_score': 0.15
-    }
+    UNIVERSAL = {"credit_score": 0.20, "leverage_score": 0.20, "profitability_score": 0.20,
+                 "liquidity_score": 0.10, "growth_score": 0.15, "cash_flow_score": 0.15}
 
     # If user forces universal, short-circuit
     if str(scoring_method).lower().startswith("universal"):
@@ -1407,7 +1400,7 @@ def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
     cls = _resolve_text_field(row, ["Rubrics_Custom_Classification", "Rubrics Custom Classification", "Classification", "Custom_Classification"])
     sec = _resolve_text_field(row, ["IQ_SECTOR", "Sector", "GICS_Sector"])
 
-    # 1) Canonical helper provided by the app
+    # 1) Canonical app helper (preferred)
     try:
         w = get_classification_weights(cls, use_sector_adjusted=True)
         if isinstance(w, dict) and w:
@@ -1422,9 +1415,9 @@ def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
     except Exception:
         pass
 
-    # 3) Classification override
+    # 3) Classification map
     try:
-        if cls and cls in CLASSIFICATION_OVERRIDES:
+        if "CLASSIFICATION_OVERRIDES" in globals() and cls and cls in CLASSIFICATION_OVERRIDES:
             return CLASSIFICATION_OVERRIDES[cls], f"Classification override for '{cls}'"
     except Exception:
         pass
@@ -1438,46 +1431,47 @@ def _build_explainability_table(issuer_row: pd.Series, scoring_method: str):
     Normalises weights over present factor columns so sum = 1.0.
     Returns (df, provenance, composite_score, diff_sum_minus_composite)
     """
-    # Canonical factor order (lowercase weight keys matching SECTOR_WEIGHTS)
-    canonical = ['credit_score', 'leverage_score', 'profitability_score',
-                'liquidity_score', 'growth_score', 'cash_flow_score']
+    # Factor names that map to DataFrame columns (e.g., "Credit" → "Credit_Score")
+    canonical = ["Credit", "Leverage", "Profitability", "Liquidity", "Growth", "Cash_Flow"]
+    present = [f for f in canonical if f"{f}_Score" in issuer_row.index]
 
-    # Map lowercase weight keys to DataFrame column names
-    col_map = {
-        'credit_score': 'Credit_Score',
-        'leverage_score': 'Leverage_Score',
-        'profitability_score': 'Profitability_Score',
-        'liquidity_score': 'Liquidity_Score',
-        'growth_score': 'Growth_Score',
-        'cash_flow_score': 'Cash_Flow_Score'
+    # Get weights (lowercase keys) and provenance
+    weights_lc, provenance = _resolve_model_weights_for_row(issuer_row, scoring_method)
+
+    # Map factor names to lowercase weight keys
+    factor_to_key = {
+        "Credit": "credit_score",
+        "Leverage": "leverage_score",
+        "Profitability": "profitability_score",
+        "Liquidity": "liquidity_score",
+        "Growth": "growth_score",
+        "Cash_Flow": "cash_flow_score"
     }
-
-    # Display names (clean)
-    display_map = {
-        'credit_score': 'Credit',
-        'leverage_score': 'Leverage',
-        'profitability_score': 'Profitability',
-        'liquidity_score': 'Liquidity',
-        'growth_score': 'Growth',
-        'cash_flow_score': 'Cash Flow'
-    }
-
-    weights, provenance = _resolve_model_weights_for_row(issuer_row, scoring_method)
-
-    # Filter to present columns only
-    present = [k for k in canonical if col_map[k] in issuer_row.index]
 
     # Defensive normalisation over present factors only
-    w = {k: float(max(0.0, weights.get(k, 0.0))) for k in present}
+    w = {}
+    for fac in present:
+        key = factor_to_key[fac]
+        w[fac] = float(max(0.0, weights_lc.get(key, 0.0)))
     w_sum = sum(w.values()) or 1.0
     w = {k: v / w_sum for k, v in w.items()}
 
+    # Display names for cleaner output
+    display_names = {
+        "Credit": "Credit",
+        "Leverage": "Leverage",
+        "Profitability": "Profitability",
+        "Liquidity": "Liquidity",
+        "Growth": "Growth",
+        "Cash_Flow": "Cash Flow"
+    }
+
     rows = []
-    for fac_key in present:
-        s = float(issuer_row.get(col_map[fac_key], np.nan))
-        wt = w[fac_key]
+    for fac in present:
+        s = float(issuer_row.get(f"{fac}_Score", np.nan))
+        wt = w[fac]
         rows.append({
-            "Factor": display_map[fac_key],
+            "Factor": display_names[fac],
             "Score": s,
             "Weight %": round(100.0 * wt, 2),
             "Contribution": round(s * wt, 4)
