@@ -1373,6 +1373,129 @@ def get_classification_weights(classification, use_sector_adjusted=True):
     return SECTOR_WEIGHTS['Default']
 
 # ============================================================================
+# EXPLAINABILITY HELPERS (v2.3) — 2025-10-29: Deduped, single source of truth
+# ============================================================================
+
+def _resolve_text_field(row, candidates):
+    """
+    Resolve a text field from multiple column name candidates.
+    Returns first non-empty value found, or None.
+    """
+    for c in candidates:
+        if c in row.index and pd.notna(row[c]) and str(row[c]).strip():
+            return str(row[c]).strip()
+    return None
+
+def _resolve_model_weights_for_row(row, scoring_method):
+    """
+    Returns (weights_dict, provenance_str) for a given issuer row.
+    Keys are lowercase: credit_score, leverage_score, profitability_score,
+                       liquidity_score, growth_score, cash_flow_score.
+    Priority: classification-specific -> sector -> universal fallback.
+    Respects scoring_method to determine whether to use sector-adjusted weights.
+    """
+    # Universal default (lowercase keys matching SECTOR_WEIGHTS format)
+    UNIVERSAL = {
+        'credit_score': 0.20, 'leverage_score': 0.20, 'profitability_score': 0.20,
+        'liquidity_score': 0.10, 'growth_score': 0.15, 'cash_flow_score': 0.15
+    }
+
+    # Check if user selected Classification-Adjusted mode
+    use_adjusted = (scoring_method == "Classification-Adjusted Weights (Recommended)")
+
+    if not use_adjusted:
+        return UNIVERSAL, "Universal weights"
+
+    cls = _resolve_text_field(row, ["Rubrics_Custom_Classification", "Rubrics Custom Classification", "Classification"])
+    sec = _resolve_text_field(row, ["IQ_SECTOR", "Sector", "GICS_Sector"])
+
+    # 1) If app exposes canonical helper, use it
+    try:
+        if "get_classification_weights" in globals():
+            w = get_classification_weights(cls, use_sector_adjusted=True)
+            if w and isinstance(w, dict):
+                return w, f"Sector-Adjusted via classification='{cls or 'n/a'}', sector='{sec or 'n/a'}'"
+    except Exception:
+        pass
+
+    # 2) Direct sector map lookup
+    try:
+        if "SECTOR_WEIGHTS" in globals() and sec and sec in SECTOR_WEIGHTS:
+            return SECTOR_WEIGHTS[sec], f"Sector-Adjusted via sector='{sec}'"
+    except Exception:
+        pass
+
+    # 3) Classification override lookup
+    try:
+        if "CLASSIFICATION_OVERRIDES" in globals() and cls and cls in CLASSIFICATION_OVERRIDES:
+            return CLASSIFICATION_OVERRIDES[cls], f"Classification override for '{cls}'"
+    except Exception:
+        pass
+
+    # 4) Fallback to universal
+    return UNIVERSAL, "Universal weights (classification not found)"
+
+def _build_explainability_table(issuer_row, scoring_method):
+    """
+    Build factor contribution table with provenance.
+    Normalizes weights over present factor columns so sum = 1.0.
+    Returns (df, provenance_str, composite_score, diff_sum_minus_composite).
+    """
+    # Canonical factor order (lowercase weight keys matching SECTOR_WEIGHTS)
+    canonical = ['credit_score', 'leverage_score', 'profitability_score',
+                'liquidity_score', 'growth_score', 'cash_flow_score']
+
+    # Map lowercase weight keys to DataFrame column names
+    col_map = {
+        'credit_score': 'Credit_Score',
+        'leverage_score': 'Leverage_Score',
+        'profitability_score': 'Profitability_Score',
+        'liquidity_score': 'Liquidity_Score',
+        'growth_score': 'Growth_Score',
+        'cash_flow_score': 'Cash_Flow_Score'
+    }
+
+    # Display names (clean, titlecase)
+    display_map = {
+        'credit_score': 'Credit',
+        'leverage_score': 'Leverage',
+        'profitability_score': 'Profitability',
+        'liquidity_score': 'Liquidity',
+        'growth_score': 'Growth',
+        'cash_flow_score': 'Cash Flow'
+    }
+
+    # Get weights and provenance
+    weights, provenance = _resolve_model_weights_for_row(issuer_row, scoring_method)
+
+    # Filter to present columns only
+    present = [k for k in canonical if col_map[k] in issuer_row.index]
+
+    # Defensive normalization: ensure weights sum to 1.0 over present factors
+    w = {k: float(max(0.0, weights.get(k, 0.0))) for k in present}
+    w_sum = sum(w.values()) or 1.0
+    w = {k: v / w_sum for k, v in w.items()}
+
+    # Build contribution rows
+    rows = []
+    for key in present:
+        col_name = col_map[key]
+        s = float(issuer_row.get(col_name, np.nan))
+        wt = w[key]
+        rows.append({
+            "Factor": display_map[key],
+            "Score": s,
+            "Weight %": round(100.0 * wt, 2),
+            "Contribution": round(s * wt, 4)
+        })
+
+    df = pd.DataFrame(rows)
+    df["Contribution"] = df["Contribution"].astype(float)
+    comp = float(issuer_row.get("Composite_Score", np.nan))
+    diff = float(df["Contribution"].sum() - comp) if len(df) else np.nan
+    return df, provenance, comp, diff
+
+# ============================================================================
 # RATING BAND MAPPING (SOLUTION TO ISSUE #4: OVERLY BROAD RATING GROUPS)
 # ============================================================================
 
@@ -3282,7 +3405,7 @@ if os.environ.get("RG_TESTS") != "1":
                 # ========================================================================
                 # ISSUER EXPLAINABILITY (v2.3)
                 # ========================================================================
-                with st.expander(" Issuer Explainability", expanded=False):
+                with st.expander("Issuer Explainability", expanded=False):
                     st.markdown("Select an issuer to see factor contributions and time-series trends.")
         
                     # Issuer selector
@@ -3310,44 +3433,21 @@ if os.environ.get("RG_TESTS") != "1":
         
                         st.markdown("---")
         
-                        # Factor contributions
+                        # Factor contributions with real weights + provenance (v2.3)
                         st.markdown("### Factor Contributions")
-        
-                        # Get weights for this issuer
-                        weight_method = issuer_data.get('Weight_Method', 'Universal')
-        
-                        # Define factor weights (from SECTOR_WEIGHTS or defaults)
-                        # For simplicity, using universal weights here; ideally fetch from issuer's classification
-                        weights = {
-                            'Credit': 0.20,
-                            'Leverage': 0.20,
-                            'Profitability': 0.20,
-                            'Liquidity': 0.10,
-                            'Growth': 0.15,
-                            'Cash_Flow': 0.15
-                        }
-        
-                        # Calculate contributions
-                        factors = ['Credit', 'Leverage', 'Profitability', 'Liquidity', 'Growth', 'Cash_Flow']
-                        contributions = []
-                        for factor in factors:
-                            score_col = f'{factor}_Score'
-                            if score_col in issuer_data.index:
-                                score = issuer_data[score_col]
-                                weight = weights[factor]
-                                contribution = score * weight
-                                contributions.append({
-                                    'Factor': factor,
-                                    'Score': score,
-                                    'Weight': f"{weight*100:.0f}%",
-                                    'Contribution': contribution
-                                })
-        
-                        contrib_df = pd.DataFrame(contributions)
-                        total_contrib = contrib_df['Contribution'].sum()
-        
-                        st.dataframe(contrib_df, use_container_width=True, hide_index=True)
-                        st.caption(f"Sum of contributions: {total_contrib:.2f} ≈ Composite Score: {issuer_data['Composite_Score']:.2f}")
+
+                        # Helpers defined at module scope (see line ~1376)
+                        explain_df, provenance, comp_score, diff = _build_explainability_table(issuer_data, scoring_method)
+
+                        left, right = st.columns([3, 2])
+                        with left:
+                            st.markdown(f"**Weight Method (provenance):** {provenance}")
+                            st.dataframe(explain_df, use_container_width=True, hide_index=True)
+                        with right:
+                            st.metric("Composite (as-at)", f"{comp_score:.2f}" if pd.notna(comp_score) else "n/a")
+                            st.metric("Sum of contributions", f"{explain_df['Contribution'].sum():.2f}" if len(explain_df) else "n/a")
+                            if pd.notna(comp_score) and len(explain_df) and abs(diff) > 0.5:
+                                st.warning(f"Contributions differ from Composite by {diff:+.2f}. Check factor set and weights.")
         
                         # Time-series sparklines (if data available)
                         st.markdown("### Time-Series Trends (FY)")
