@@ -3545,13 +3545,13 @@ if os.environ.get("RG_TESTS") != "1":
             # ============================================================================
             # TAB 3: RATING GROUP ANALYSIS
             # ============================================================================
-            
+
             with tab3:
                 st.header(" Rating Group & Band Analysis")
-                
+
                 # Select rating band
                 col1, col2 = st.columns([1, 3])
-                
+
                 with col1:
                     available_bands = sorted(results_final['Rating_Band'].unique())
                     selected_band = st.selectbox(
@@ -3559,7 +3559,7 @@ if os.environ.get("RG_TESTS") != "1":
                         options=available_bands,
                         index=0
                     )
-                
+
                 with col2:
                     # Show classification filter for the selected band
                     band_classifications = results_final[results_final['Rating_Band'] == selected_band]['Rubrics_Custom_Classification'].unique()
@@ -3567,50 +3567,126 @@ if os.environ.get("RG_TESTS") != "1":
                         "Filter by Classification (optional)",
                         options=['All Classifications'] + sorted(band_classifications.tolist())
                     )
-                
-                # Filter data
-                band_data = results_final[results_final['Rating_Band'] == selected_band].copy()
-                
+
+                # ========================================================================
+                # BUILD STRICTLY FILTERED DATAFRAME (df_band)
+                # ========================================================================
+                # Start from master results and apply all selected filters
+                df_band = results_final[results_final['Rating_Band'] == selected_band].copy()
+
                 if selected_classification_band != 'All Classifications':
-                    band_data = band_data[band_data['Rubrics_Custom_Classification'] == selected_classification_band]
-                
-                # Statistics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Issuers", f"{len(band_data):,}")
-                with col2:
-                    st.metric("Avg Score", f"{band_data['Composite_Score'].mean():.1f}")
-                with col3:
-                    st.metric("Median Score", f"{band_data['Composite_Score'].median():.1f}")
-                with col4:
-                    strong_buy_pct = (band_data['Recommendation'] == 'Strong Buy').sum() / len(band_data) * 100
-                    st.metric("Strong Buy %", f"{strong_buy_pct:.1f}%")
-                
-                # Top performers in band
-                st.subheader(f" Top 20 {selected_band} Issuers" + (f" in {selected_classification_band}" if selected_classification_band != 'All Classifications' else ""))
-                
-                top_band = band_data.nlargest(20, 'Composite_Score')[
-                    ['Band_Rank', 'Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification', 
-                     'Composite_Score', 'Cycle_Position_Score', 'Combined_Signal', 'Recommendation']
-                ]
-                top_band.columns = ['Band Rank', 'Company', 'Rating', 'Classification', 'Score', 'Cycle', 'Signal', 'Rec']
-                st.dataframe(top_band, use_container_width=True, hide_index=True)
-                
-                # Distribution within band
-                st.subheader(f" Score Distribution - {selected_band} Band")
-                
-                fig = go.Figure(data=[go.Histogram(
-                    x=band_data['Composite_Score'],
-                    nbinsx=15,
-                    marker_color='#2C5697'
-                )])
-                fig.update_layout(
-                    xaxis_title='Composite Score',
-                    yaxis_title='Count',
-                    height=350,
-                    showlegend=False
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                    df_band = df_band[df_band['Rubrics_Custom_Classification'] == selected_classification_band]
+
+                # Handle empty selection
+                if df_band.empty:
+                    st.warning("No issuers match the current selection.")
+                else:
+                    # ========================================================================
+                    # HEADLINE METRICS (from df_band only)
+                    # ========================================================================
+                    # Count issuers with valid Composite_Score
+                    valid_scores = df_band['Composite_Score'].notna()
+                    issuers_count = valid_scores.sum()
+
+                    # Average and Median from df_band
+                    avg_score = df_band['Composite_Score'].mean(skipna=True)
+                    median_score = df_band['Composite_Score'].median(skipna=True)
+
+                    # Strong Buy %: count of "Strong Buy" / count of valid scores
+                    strong_buy_count = ((df_band['Recommendation'] == 'Strong Buy') & valid_scores).sum()
+                    strong_buy_pct = (strong_buy_count / issuers_count * 100) if issuers_count > 0 else 0.0
+
+                    # Display metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Issuers", f"{issuers_count:,}")
+                    with col2:
+                        st.metric("Average Composite Score", f"{avg_score:.1f}" if pd.notna(avg_score) else "n/a")
+                    with col3:
+                        st.metric("Median Score", f"{median_score:.1f}" if pd.notna(median_score) else "n/a")
+                    with col4:
+                        st.metric("Strong Buy %", f"{strong_buy_pct:.1f}%")
+
+                    # ========================================================================
+                    # TOP 20 TABLE (from df_band only)
+                    # ========================================================================
+                    st.subheader(f" Top 20 {selected_band} Issuers" + (f" in {selected_classification_band}" if selected_classification_band != 'All Classifications' else ""))
+
+                    top_band = df_band.sort_values('Composite_Score', ascending=False).head(20)[
+                        ['Band_Rank', 'Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification',
+                         'Composite_Score', 'Cycle_Position_Score', 'Combined_Signal', 'Recommendation']
+                    ]
+                    top_band.columns = ['Band Rank', 'Company', 'Rating', 'Classification', 'Score', 'Cycle', 'Signal', 'Rec']
+                    st.dataframe(top_band, use_container_width=True, hide_index=True)
+
+                    # ========================================================================
+                    # HISTOGRAM with Quality Split Line (from df_band only)
+                    # ========================================================================
+                    st.subheader(f" Score Distribution - {selected_band} Band")
+
+                    # Get quality split value using the same logic as the quadrant chart
+                    _, x_split_for_hist, split_label, _ = resolve_quality_metric_and_split(
+                        df_band, split_basis, split_threshold
+                    )
+
+                    # Build histogram from df_band only
+                    hist_data = df_band['Composite_Score'].dropna()
+
+                    fig = go.Figure(data=[go.Histogram(
+                        x=hist_data,
+                        nbinsx=15,
+                        marker_color='#2C5697',
+                        name='Composite Score'
+                    )])
+
+                    # Add vertical line for quality split
+                    if pd.notna(x_split_for_hist):
+                        fig.add_vline(
+                            x=x_split_for_hist,
+                            line_width=2,
+                            line_dash="dash",
+                            line_color="red",
+                            annotation_text=f"Quality Split: {x_split_for_hist:.1f}",
+                            annotation_position="top"
+                        )
+
+                    # Determine annotation based on split basis
+                    if split_basis == "Global Percentile":
+                        subtitle = f"Quality split at p{split_threshold:.0f} (Global Percentile mode)"
+                    elif split_basis == "Percentile within Band (recommended)":
+                        subtitle = f"Quality split at p{split_threshold:.0f} within band (Recommended mode)"
+                    else:
+                        subtitle = f"Quality split at p{split_threshold:.0f} of Composite Score (Absolute mode)"
+
+                    fig.update_layout(
+                        xaxis_title='Composite Score',
+                        yaxis_title='Count',
+                        height=350,
+                        showlegend=False,
+                        title_text=subtitle,
+                        title_font_size=12
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # ========================================================================
+                    # DEBUG SECTION (hidden by default)
+                    # ========================================================================
+                    _ENABLE_DEBUG = False  # Set to True to show debug info
+                    if _ENABLE_DEBUG:
+                        with st.expander("🔍 Debug Info", expanded=False):
+                            st.write(f"**df_band size:** {len(df_band)} rows")
+                            st.write(f"**Valid Composite_Score count:** {issuers_count}")
+                            st.write(f"**Strong Buy count:** {strong_buy_count}")
+                            st.write(f"**Strong Buy %:** {strong_buy_pct:.2f}%")
+                            st.write(f"**Histogram data points:** {len(hist_data)}")
+                            st.write(f"**Quality split value:** {x_split_for_hist:.2f}")
+                            st.write(f"**Split basis:** {split_basis}")
+                            st.write(f"**Split threshold:** {split_threshold}")
+
+                            # Verify histogram count matches df_band
+                            assert len(hist_data) == df_band['Composite_Score'].notna().sum(), \
+                                "Histogram data count mismatch!"
+                            st.success("✓ Histogram count matches df_band non-NaN Composite_Score count")
             
             # ============================================================================
             # TAB 4: SECTOR ANALYSIS (NEW - SOLUTION TO ISSUE #1)
@@ -3680,14 +3756,60 @@ if os.environ.get("RG_TESTS") != "1":
                 st.dataframe(top_classification, use_container_width=True, hide_index=True)
             
             # ============================================================================
-            # TAB 5: TREND ANALYSIS (NEW - SOLUTION TO ISSUE #2)
+            # TAB 5: TREND ANALYSIS
             # ============================================================================
-            
+
             with tab5:
                 st.header(" Cyclicality & Trend Analysis")
-                
-                st.info("**NEW FEATURE**: Identify improving/deteriorating trends and business cycle positioning")
-                
+
+                # --- Normalize trend score column for this tab (idempotent) ---
+                if 'Cycle_Position_Score' not in results_final.columns:
+                    for cand in ['Cycle_Score', 'cycle_pos', 'Cycle Position Score', 'CyclePositionScore']:
+                        if cand in results_final.columns:
+                            results_final = results_final.rename(columns={cand: 'Cycle_Position_Score'})
+                            break
+                # Safety cast
+                if 'Cycle_Position_Score' in results_final.columns:
+                    results_final['Cycle_Position_Score'] = pd.to_numeric(results_final['Cycle_Position_Score'], errors='coerce')
+
+                # ========================================================================
+                # QUALITY/TREND SPLIT CONTROLS (for UI consistency)
+                # ========================================================================
+                st.markdown("#### Quality/Trend Split")
+                col_basis, col_quality, col_trend = st.columns(3)
+
+                with col_basis:
+                    basis_options = ["Global Percentile", "Absolute Composite Score"]
+                    quality_split_basis_trend = st.selectbox(
+                        "Quality split basis",
+                        basis_options,
+                        index=basis_options.index(split_basis) if split_basis in basis_options else 0,
+                        key="trend_tab_quality_split_basis",
+                        help="Defines how 'Strong vs Weak' quality is determined"
+                    )
+
+                with col_quality:
+                    quality_threshold_trend = st.slider(
+                        "Quality threshold",
+                        min_value=0, max_value=100, value=int(split_threshold),
+                        key="trend_tab_quality_threshold",
+                        help="Threshold for quality classification"
+                    )
+
+                with col_trend:
+                    trend_threshold_trend = st.slider(
+                        "Trend threshold (Cycle Position)",
+                        min_value=0, max_value=100, value=int(trend_threshold),
+                        key="trend_tab_trend_threshold",
+                        help="Threshold for improving vs deteriorating"
+                    )
+
+                # Add basis subtitle
+                basis_label = "Global Percentile" if quality_split_basis_trend == "Global Percentile" else "Absolute Composite Score"
+                st.caption(f"**Basis:** {basis_label} | **Trend:** Cycle Position Score (0-100)")
+
+                st.markdown("---")
+
                 # Filters
                 col1, col2 = st.columns(2)
                 
@@ -3714,7 +3836,7 @@ if os.environ.get("RG_TESTS") != "1":
                 
                 # Cycle Position Analysis
                 st.subheader("Business Cycle Position by Sector/Classification")
-                st.caption("Shows which sectors are improving (green) vs deteriorating (red). Cycle Position Score is a composite of trend, volatility, and momentum across leverage, profitability, liquidity, and growth metrics.")
+                st.caption("Shows which sectors are improving (green) vs deteriorating (red). Cycle Position Score (0-100) is a composite of trend, volatility, and momentum across leverage, profitability, liquidity, and growth metrics.")
 
                 # Build sector/classification heatmap
                 if 'Rubrics_Custom_Classification' in trend_data.columns:
@@ -3726,10 +3848,10 @@ if os.environ.get("RG_TESTS") != "1":
                     }).reset_index()
 
                     # Rename columns for clarity
-                    sector_stats.columns = ['Classification', 'Avg Cycle Position', '% Improving', 'Avg Composite Score']
+                    sector_stats.columns = ['Classification', 'Avg Cycle Position Score (0-100)', '% Improving', 'Avg Composite Score']
 
                     # Sort by cycle position
-                    sector_stats = sector_stats.sort_values('Avg Cycle Position', ascending=False)
+                    sector_stats = sector_stats.sort_values('Avg Cycle Position Score (0-100)', ascending=False)
 
                     # Create heatmap using plotly
                     # Prepare data for heatmap (transpose for better visualization)
@@ -3766,11 +3888,11 @@ if os.environ.get("RG_TESTS") != "1":
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         best_sector = sector_stats.iloc[0]['Classification']
-                        best_score = sector_stats.iloc[0]['Avg Cycle Position']
+                        best_score = sector_stats.iloc[0]['Avg Cycle Position Score (0-100)']
                         st.metric("🟢 Most Improving Sector", best_sector, f"{best_score:.1f}")
                     with col2:
                         worst_sector = sector_stats.iloc[-1]['Classification']
-                        worst_score = sector_stats.iloc[-1]['Avg Cycle Position']
+                        worst_score = sector_stats.iloc[-1]['Avg Cycle Position Score (0-100)']
                         st.metric("🔴 Most Deteriorating Sector", worst_sector, f"{worst_score:.1f}")
                     with col3:
                         overall_improving = (trend_data['Combined_Signal'].str.contains('Improving', na=False)).sum() / len(trend_data) * 100
@@ -3801,27 +3923,62 @@ if os.environ.get("RG_TESTS") != "1":
                         deteriorating = trend_counts.get('Deteriorating (Leveraging)', 0)
                         st.metric(" Deteriorating", f"{deteriorating}", f"{deteriorating/len(trend_data)*100:.1f}%")
                 
-                # Top improvers (best cycle + momentum)
-                st.subheader("Top 10 Improving Trend Issuers")
+                # ========================================================================
+                # TOP 10 IMPROVING/DETERIORATING (ranked by Cycle Position Score)
+                # ========================================================================
 
-                # Use unified trend threshold to filter improving issuers
-                mask_improving = (trend_data['Cycle_Position_Score'] >= trend_threshold)
-                top_improving = trend_data[mask_improving].sort_values('Composite_Score', ascending=False).head(10)[
-                    ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification', 'Composite_Score', 'Cycle_Position_Score', 'Combined_Signal', 'Recommendation']
-                ]
-                top_improving.columns = ['Company', 'Rating', 'Classification', 'Score', 'Cycle Score', 'Signal', 'Rec']
-                st.dataframe(top_improving, use_container_width=True, hide_index=True)
+                # Guard: ensure column exists
+                if 'Cycle_Position_Score' not in trend_data.columns:
+                    st.warning("Cycle_Position_Score not found; cannot rank Top 10 trend issuers.")
+                else:
+                    # Top 10 Improving: highest cycle position scores
+                    st.subheader("Top 10 Improving Trend Issuers")
+                    st.caption("Ranked by Cycle Position Score (highest = most improving)")
 
-                # Warning list (deteriorating)
-                st.subheader("Top 10 Deteriorating Trend Issuers")
+                    improving_mask = trend_data['Combined_Signal'].str.contains('Improving', na=False)
+                    top_improving = (trend_data[improving_mask]
+                                    .sort_values('Cycle_Position_Score', ascending=False)
+                                    .head(10))
 
-                # Use unified trend threshold to filter deteriorating issuers
-                mask_deteriorating = (trend_data['Cycle_Position_Score'] < trend_threshold)
-                top_deteriorating = trend_data[mask_deteriorating].sort_values('Composite_Score', ascending=False).head(10)[
-                    ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification', 'Composite_Score', 'Cycle_Position_Score', 'Combined_Signal', 'Recommendation']
-                ]
-                top_deteriorating.columns = ['Company', 'Rating', 'Classification', 'Score', 'Cycle Score', 'Signal', 'Rec']
-                st.dataframe(top_deteriorating, use_container_width=True, hide_index=True)
+                    # Select columns
+                    cols = ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification',
+                            'Composite_Score', 'Cycle_Position_Score', 'Combined_Signal', 'Recommendation']
+                    cols_present = [c for c in cols if c in top_improving.columns]
+
+                    st.dataframe(
+                        top_improving[cols_present].rename(columns={
+                            'Company_Name': 'Company',
+                            'Credit_Rating_Clean': 'Rating',
+                            'Rubrics_Custom_Classification': 'Classification',
+                            'Composite_Score': 'Composite Score',
+                            'Cycle_Position_Score': 'Cycle Position Score (0-100)',
+                            'Combined_Signal': 'Signal',
+                            'Recommendation': 'Rec'
+                        }),
+                        use_container_width=True, hide_index=True
+                    )
+
+                    # Top 10 Deteriorating: lowest cycle position scores
+                    st.subheader("Top 10 Deteriorating Trend Issuers")
+                    st.caption("Ranked by Cycle Position Score (lowest = most deteriorating)")
+
+                    deteriorating_mask = trend_data['Combined_Signal'].str.contains('Deteriorating', na=False)
+                    top_deteriorating = (trend_data[deteriorating_mask]
+                                        .sort_values('Cycle_Position_Score', ascending=True)
+                                        .head(10))
+
+                    st.dataframe(
+                        top_deteriorating[cols_present].rename(columns={
+                            'Company_Name': 'Company',
+                            'Credit_Rating_Clean': 'Rating',
+                            'Rubrics_Custom_Classification': 'Classification',
+                            'Composite_Score': 'Composite Score',
+                            'Cycle_Position_Score': 'Cycle Position Score (0-100)',
+                            'Combined_Signal': 'Signal',
+                            'Recommendation': 'Rec'
+                        }),
+                        use_container_width=True, hide_index=True
+                    )
             
             # ============================================================================
             # TAB 6: METHODOLOGY
