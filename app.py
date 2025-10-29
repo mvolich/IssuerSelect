@@ -1384,23 +1384,21 @@ def _resolve_text_field(row: pd.Series, candidates):
 
 def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
     """
-    Returns (weights_dict, provenance_str).
-    Priority (when scoring_method == 'Classification-Adjusted (Recommended)'):
-        classification-specific -> sector -> classification map -> universal.
-    Keys expected: lowercase matching SECTOR_WEIGHTS (credit_score, leverage_score,
-                   profitability_score, liquidity_score, growth_score, cash_flow_score)
+    Return (weights_dict, provenance_str) with sector/classification precedence.
+    Keys: lowercase matching SECTOR_WEIGHTS (credit_score, leverage_score,
+          profitability_score, liquidity_score, growth_score, cash_flow_score)
     """
     UNIVERSAL = {"credit_score": 0.20, "leverage_score": 0.20, "profitability_score": 0.20,
                  "liquidity_score": 0.10, "growth_score": 0.15, "cash_flow_score": 0.15}
 
-    # If user forces universal, short-circuit
+    # Universal mode short-circuit
     if str(scoring_method).lower().startswith("universal"):
         return UNIVERSAL, "Universal weights"
 
     cls = _resolve_text_field(row, ["Rubrics_Custom_Classification", "Rubrics Custom Classification", "Classification", "Custom_Classification"])
     sec = _resolve_text_field(row, ["IQ_SECTOR", "Sector", "GICS_Sector"])
 
-    # 1) Canonical app helper (preferred)
+    # 1) App-provided resolver (preferred)
     try:
         w = get_classification_weights(cls, use_sector_adjusted=True)
         if isinstance(w, dict) and w:
@@ -1417,8 +1415,8 @@ def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
 
     # 3) Classification map
     try:
-        if "CLASSIFICATION_OVERRIDES" in globals() and cls and cls in CLASSIFICATION_OVERRIDES:
-            return CLASSIFICATION_OVERRIDES[cls], f"Classification override for '{cls}'"
+        if "CLASSIFICATION_WEIGHT_MAP" in globals() and cls in CLASSIFICATION_WEIGHT_MAP:
+            return CLASSIFICATION_WEIGHT_MAP[cls], f"Classification override for '{cls}'"
     except Exception:
         pass
 
@@ -1427,60 +1425,84 @@ def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
 
 def _build_explainability_table(issuer_row: pd.Series, scoring_method: str):
     """
-    Builds a 4-col table: Factor, Score, Weight %, Contribution.
-    Normalises weights over present factor columns so sum = 1.0.
-    Returns (df, provenance, composite_score, diff_sum_minus_composite)
+    Build a 4-col table: Factor, Score, Weight %, Contribution.
+    Normalises weights over present factor columns. Returns
+    (df, provenance, composite_score, diff_sum_minus_composite).
     """
-    # Factor names that map to DataFrame columns (e.g., "Credit" → "Credit_Score")
-    canonical = ["Credit", "Leverage", "Profitability", "Liquidity", "Growth", "Cash_Flow"]
-    present = [f for f in canonical if f"{f}_Score" in issuer_row.index]
-
-    # Get weights (lowercase keys) and provenance
-    weights_lc, provenance = _resolve_model_weights_for_row(issuer_row, scoring_method)
-
-    # Map factor names to lowercase weight keys
-    factor_to_key = {
+    # Map display names to column names and weight keys
+    factor_map = {
         "Credit": "credit_score",
         "Leverage": "leverage_score",
         "Profitability": "profitability_score",
         "Liquidity": "liquidity_score",
         "Growth": "growth_score",
-        "Cash_Flow": "cash_flow_score"
+        "Cash Flow": "cash_flow_score"
     }
 
-    # Defensive normalisation over present factors only
-    w = {}
-    for fac in present:
-        key = factor_to_key[fac]
-        w[fac] = float(max(0.0, weights_lc.get(key, 0.0)))
-    w_sum = sum(w.values()) or 1.0
-    w = {k: v / w_sum for k, v in w.items()}
+    canonical = list(factor_map.keys())
+    # Check for column existence using mapped names
+    present = [f for f in canonical if f.replace(" ", "_") + "_Score" in issuer_row.index]
 
-    # Display names for cleaner output
-    display_names = {
-        "Credit": "Credit",
-        "Leverage": "Leverage",
-        "Profitability": "Profitability",
-        "Liquidity": "Liquidity",
-        "Growth": "Growth",
-        "Cash_Flow": "Cash Flow"
-    }
+    weights_lc, provenance = _resolve_model_weights_for_row(issuer_row, scoring_method)
+
+    w = {f: float(max(0.0, weights_lc.get(factor_map[f], 0.0))) for f in present}
+    s = sum(w.values()) or 1.0
+    w = {k: v / s for k, v in w.items()}
 
     rows = []
     for fac in present:
-        s = float(issuer_row.get(f"{fac}_Score", np.nan))
+        col_name = fac.replace(" ", "_") + "_Score"
+        score = float(issuer_row.get(col_name, np.nan))
         wt = w[fac]
         rows.append({
-            "Factor": display_names[fac],
-            "Score": s,
+            "Factor": fac,
+            "Score": score,
             "Weight %": round(100.0 * wt, 2),
-            "Contribution": round(s * wt, 4)
+            "Contribution": round(score * wt, 4)
         })
-
     df = pd.DataFrame(rows)
     comp = float(issuer_row.get("Composite_Score", np.nan))
     diff = float(df["Contribution"].sum() - comp) if len(df) else np.nan
     return df, provenance, comp, diff
+# ================================
+
+def render_issuer_explainability(filtered: pd.DataFrame, scoring_method: str):
+    """Single source of truth for the Issuer Explainability panel."""
+    with st.expander("Issuer Explainability", expanded=False):
+        if filtered is None or filtered.empty or "Company_Name" not in filtered.columns:
+            st.info("No issuers available for the current filter.")
+            return
+
+        issuer_names = sorted(filtered["Company_Name"].dropna().unique().tolist())
+        if not issuer_names:
+            st.info("No issuers available for the current filter.")
+            return
+
+        selected_issuer = st.selectbox("Select Issuer", options=issuer_names, key="explainability_issuer")
+        issuer_row = filtered[filtered["Company_Name"] == selected_issuer].iloc[0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: st.metric("Company ID", issuer_row.get("Company_ID", "—"))
+        with c2: st.metric("Rating", issuer_row.get("Credit_Rating_Clean", "—"))
+        with c3: st.metric("Rating Band", issuer_row.get("Rating_Band", "—"))
+        with c4:
+            comp = issuer_row.get("Composite_Score", float("nan"))
+            st.metric("Composite Score", f"{comp:.1f}" if pd.notna(comp) else "n/a")
+
+        st.markdown("---")
+        st.markdown("### Factor Contributions")
+
+        explain_df, provenance, comp_score, diff = _build_explainability_table(issuer_row, scoring_method)
+
+        left, right = st.columns([3, 2])
+        with left:
+            st.markdown(f"**Weight Method (provenance):** {provenance}")
+            st.dataframe(explain_df, use_container_width=True, hide_index=True)
+        with right:
+            st.metric("Composite (as-at)", f"{comp_score:.2f}" if pd.notna(comp_score) else "n/a")
+            st.metric("Sum of contributions", f"{explain_df['Contribution'].sum():.2f}" if len(explain_df) else "n/a")
+            if pd.notna(comp_score) and len(explain_df) and abs(diff) > 0.5:
+                st.warning(f"Contributions differ from Composite by {diff:+.2f}. Check factor set and weights.")
 # ================================
 
 # ============================================================================
@@ -3393,95 +3415,7 @@ if os.environ.get("RG_TESTS") != "1":
                 # ========================================================================
                 # ISSUER EXPLAINABILITY (v2.3)
                 # ========================================================================
-                with st.expander("Issuer Explainability", expanded=False):
-                    st.markdown("Select an issuer to see factor contributions and time-series trends.")
-        
-                    # Issuer selector
-                    issuer_names = sorted(filtered['Company_Name'].dropna().unique().tolist())
-                    if issuer_names:
-                        selected_issuer = st.selectbox(
-                            "Select Issuer",
-                            options=issuer_names,
-                            key="explainability_issuer"
-                        )
-        
-                        # Get issuer data
-                        issuer_data = filtered[filtered['Company_Name'] == selected_issuer].iloc[0]
-        
-                        # Display basic info
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("Company ID", issuer_data['Company_ID'])
-                        with col2:
-                            st.metric("Rating", issuer_data['Credit_Rating_Clean'])
-                        with col3:
-                            st.metric("Rating Band", issuer_data['Rating_Band'])
-                        with col4:
-                            st.metric("Composite Score", f"{issuer_data['Composite_Score']:.1f}")
-        
-                        st.markdown("---")
-        
-                        # Factor contributions with real weights + provenance (v2.3)
-                        st.markdown("### Factor Contributions")
-
-                        # Helpers defined at module scope (see line ~1376)
-                        explain_df, provenance, comp_score, diff = _build_explainability_table(issuer_data, scoring_method)
-
-                        left, right = st.columns([3, 2])
-                        with left:
-                            st.markdown(f"**Weight Method (provenance):** {provenance}")
-                            st.dataframe(explain_df, use_container_width=True, hide_index=True)
-                        with right:
-                            st.metric("Composite (as-at)", f"{comp_score:.2f}" if pd.notna(comp_score) else "n/a")
-                            st.metric("Sum of contributions", f"{explain_df['Contribution'].sum():.2f}" if len(explain_df) else "n/a")
-                            if pd.notna(comp_score) and len(explain_df) and abs(diff) > 0.5:
-                                st.warning(f"Contributions differ from Composite by {diff:+.2f}. Check factor set and weights.")
-        
-                        # Time-series sparklines (if data available)
-                        st.markdown("### Time-Series Trends (FY)")
-        
-                        # Get original DataFrame row for series extraction
-                        issuer_original = df_original[df_original[resolve_company_name_column(df_original)] == selected_issuer]
-                        if not issuer_original.empty:
-                            issuer_row = issuer_original.iloc[0]
-        
-                            metrics_for_sparkline = [
-                                ('EBITDA Margin', 'EBITDA Margin'),
-                                ('Return on Equity', 'Return on Equity'),
-                                ('Net Debt / EBITDA', 'Net Debt / EBITDA'),
-                                ('Current Ratio (x)', 'Current Ratio (x)')
-                            ]
-        
-                            sparkline_data = []
-                            for label, metric in metrics_for_sparkline:
-                                try:
-                                    series = get_metric_series_row(issuer_row, metric, prefer='FY')
-                                    if not series.empty and len(series) >= 2:
-                                        sparkline_html = generate_sparkline_html(series.tolist())
-                                        latest = series.iloc[-1] if pd.notna(series.iloc[-1]) else "N/A"
-                                        sparkline_data.append({
-                                            'Metric': label,
-                                            'Latest': f"{latest:.2f}" if isinstance(latest, (int, float)) else latest,
-                                            'Trend': sparkline_html
-                                        })
-                                except Exception:
-                                    continue
-        
-                            if sparkline_data:
-                                for row in sparkline_data:
-                                    col1, col2, col3 = st.columns([2, 1, 2])
-                                    with col1:
-                                        st.write(row['Metric'])
-                                    with col2:
-                                        st.write(row['Latest'])
-                                    with col3:
-                                        st.markdown(row['Trend'], unsafe_allow_html=True)
-                            else:
-                                st.info("No time-series data available for sparklines.")
-                        else:
-                            st.info("Issuer not found in original dataset.")
-                    else:
-                        st.info("No issuers match the current filter.")
+                render_issuer_explainability(filtered, scoring_method)
         
                 # ========================================================================
                 # EXPORT CURRENT VIEW (v2.3)
