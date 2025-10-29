@@ -2512,8 +2512,8 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     median_cycle = results['Cycle_Position_Score'].median(skipna=True)
 
     # Vectorized signal generation (efficient - no row-by-row iteration)
-    # Uses data-driven median threshold to align with quadrant plot split lines
-    high_composite = results['Composite_Score'] >= 60
+    # Align with percentile-based Buy threshold (≥60th pct within band)
+    high_composite = results['Composite_Percentile_in_Band'] >= 60
     high_cycle = results['Cycle_Position_Score'] >= median_cycle
     
     # Four-quadrant classification
@@ -2524,30 +2524,28 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     results['Combined_Signal'] = results['Signal']  # Keep alias for backward compatibility
 
     # ========================================================================
-    # MINIMAL GUARDRAIL RECOMMENDATION LOGIC
+    # PERCENTILE-BASED RECOMMENDATION LOGIC WITH GUARDRAIL
     # ========================================================================
 
-    # --- Minimal guardrail: ONLY block Buy/SB when Weak & Deteriorating ---
-    # Config: choose the cap for Weak & Deteriorating
-    WEAK_DET_CAP = "Hold"   # set to "Avoid" if you want harsher behaviour
+    # --- Guardrail: block Buy/SB when Weak & Deteriorating ---
+    # Default to stricter behaviour; override with env if required.
+    WEAK_DET_CAP = os.getenv("WEAK_DET_CAP", "Avoid")
 
-    # VECTORIZED recommendation generation
-    # (numpy already imported globally as np)
-    
-    # Step 1: Draft recommendations from Composite_Score
-    score = results['Composite_Score'].fillna(0)
+    # Step 1: Draft recommendations from within-band percentiles (0–100)
+    # Requires Composite_Percentile_in_Band computed earlier.
+    pct = results['Composite_Percentile_in_Band'].fillna(0)
     conditions = [
-        score >= 65,
-        score >= 50,
-        score >= 35
+        pct >= 80,  # Strong Buy: top quintile within band
+        pct >= 60,  # Buy
+        pct >= 40   # Hold
     ]
     choices = ['Strong Buy', 'Buy', 'Hold']
     draft_rec = np.select(conditions, choices, default='Avoid')
-    
+
     # Step 2: Apply guardrail (only cap Buy/SB for Weak & Deteriorating)
     is_weak_det = results['Signal'] == 'Weak & Deteriorating'
     is_buy_or_sb = pd.Series(draft_rec).isin(['Buy', 'Strong Buy'])
-    
+
     # Final recommendation
     results['Recommendation'] = draft_rec
     results.loc[is_weak_det & is_buy_or_sb, 'Recommendation'] = WEAK_DET_CAP
@@ -2816,11 +2814,12 @@ if os.environ.get("RG_TESTS") != "1":
                 st.subheader("Four Quadrant Analysis: Quality vs. Momentum")
 
                 # Ensure numeric dtypes for axes
+                results_final['Composite_Percentile_in_Band'] = pd.to_numeric(results_final['Composite_Percentile_in_Band'], errors='coerce')
                 results_final['Composite_Score'] = pd.to_numeric(results_final['Composite_Score'], errors='coerce')
                 results_final['Cycle_Position_Score'] = pd.to_numeric(results_final['Cycle_Position_Score'], errors='coerce')
 
-                # Compute visualization splits (dynamic y-axis split)
-                x_split = 60  # keep aligned with Buy threshold for Composite_Score
+                # Compute visualization splits (aligned with percentile-based logic)
+                x_split = 60  # Fixed at Buy threshold (≥60th percentile within band)
                 y_split = results_final['Cycle_Position_Score'].median(skipna=True)
 
                 # Create color mapping for quadrants
@@ -2831,22 +2830,23 @@ if os.environ.get("RG_TESTS") != "1":
                     "Weak & Deteriorating": "#e74c3c"      # Red
                 }
 
-                # Create scatter plot using px.scatter with data-aligned coordinates
+                # Create scatter plot using within-band percentile on x-axis
                 fig_quadrant = px.scatter(
                     results_final,
-                    x="Composite_Score",
+                    x="Composite_Percentile_in_Band",
                     y="Cycle_Position_Score",
                     color="Combined_Signal",
                     color_discrete_map=color_map,
                     hover_name="Company_Name",
                     hover_data={
                         "Composite_Score": ":.1f",
+                        "Composite_Percentile_in_Band": ":.1f",
                         "Cycle_Position_Score": ":.1f",
                         "Combined_Signal": False
                     },
                     title='Credit Quality vs. Trend Momentum',
                     labels={
-                        "Composite_Score": "Composite Score (Current Quality)",
+                        "Composite_Percentile_in_Band": "Quality Percentile (within rating band, 0–100)",
                         "Cycle_Position_Score": "Cycle Position Score (Trend Direction)"
                     }
                 )
