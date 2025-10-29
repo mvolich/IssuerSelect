@@ -1481,27 +1481,28 @@ def render_issuer_explainability(filtered: pd.DataFrame, scoring_method: str):
         selected_issuer = st.selectbox("Select Issuer", options=issuer_names, key="explainability_issuer")
         issuer_row = filtered[filtered["Company_Name"] == selected_issuer].iloc[0]
 
+        # Header metrics
         c1, c2, c3, c4 = st.columns(4)
         with c1: st.metric("Company ID", issuer_row.get("Company_ID", "—"))
         with c2: st.metric("Rating", issuer_row.get("Credit_Rating_Clean", "—"))
         with c3: st.metric("Rating Band", issuer_row.get("Rating_Band", "—"))
         with c4:
-            comp = issuer_row.get("Composite_Score", float("nan"))
-            st.metric("Composite Score", f"{comp:.1f}" if pd.notna(comp) else "n/a")
+            comp_score = issuer_row.get("Composite_Score", float("nan"))
+            st.metric("Composite Score", f"{comp_score:.1f}" if pd.notna(comp_score) else "n/a")
 
         st.markdown("---")
         st.markdown("### Factor Contributions")
 
-        explain_df, provenance, comp_score, diff = _build_explainability_table(issuer_row, scoring_method)
+        df_contrib, provenance, comp, diff = _build_explainability_table(issuer_row, scoring_method)
 
         left, right = st.columns([3, 2])
         with left:
             st.markdown(f"**Weight Method (provenance):** {provenance}")
-            st.dataframe(explain_df, use_container_width=True, hide_index=True)
+            st.dataframe(df_contrib, use_container_width=True, hide_index=True)
         with right:
-            st.metric("Composite (as-at)", f"{comp_score:.2f}" if pd.notna(comp_score) else "n/a")
-            st.metric("Sum of contributions", f"{explain_df['Contribution'].sum():.2f}" if len(explain_df) else "n/a")
-            if pd.notna(comp_score) and len(explain_df) and abs(diff) > 0.5:
+            st.metric("Composite (as-at)", f"{comp:.2f}" if pd.notna(comp) else "n/a")
+            st.metric("Sum of contributions", f"{df_contrib['Contribution'].sum():.2f}" if len(df_contrib) else "n/a")
+            if pd.notna(comp) and len(df_contrib) and abs(diff) > 0.5:
                 st.warning(f"Contributions differ from Composite by {diff:+.2f}. Check factor set and weights.")
 # ================================
 
@@ -1707,6 +1708,28 @@ use_quarterly_beta = st.sidebar.checkbox(
         "This does NOT change the point-in-time period used for scores."
     ),
     key="cfg_trend_window_quarterly",
+)
+
+# (C) Quality/Trend Split Configuration
+st.sidebar.markdown("#### Quality/Trend Split")
+split_basis = st.sidebar.selectbox(
+    "Quality split basis",
+    ["Percentile within Band (recommended)", "Global Percentile", "Absolute Composite Score"],
+    index=0,
+    help="Defines how we decide Strong vs Weak quality.",
+    key="cfg_quality_split_basis"
+)
+split_threshold = st.sidebar.slider(
+    "Quality threshold",
+    40, 80, 60,
+    help="Percentile or score threshold for Strong vs Weak classification",
+    key="cfg_quality_threshold"
+)
+trend_threshold = st.sidebar.slider(
+    "Trend threshold (Cycle Position)",
+    40, 70, 55,
+    help="Y-axis split for improving vs deteriorating.",
+    key="cfg_trend_threshold"
 )
 
 # Alias for backward compatibility with URL state management
@@ -2104,11 +2127,62 @@ def calculate_cycle_position_score(trend_scores, key_metrics_trends):
     return cycle_score.clip(0, 100)
 
 # ============================================================================
+# QUALITY/TREND SPLIT HELPERS
+# ============================================================================
+
+def _compute_quality_metrics(df, score_col="Composite_Score"):
+    """
+    Precompute global and within-band percentile metrics.
+    Returns a copy of df with added columns:
+    - Composite_Percentile_Global: 0-100 percentile across full universe
+    - Composite_Percentile_in_Band: 0-100 percentile within rating band (already exists, but ensured here)
+    """
+    df = df.copy()
+
+    # Global percentile (0-100 scale)
+    df["Composite_Percentile_Global"] = df[score_col].rank(pct=True, method='average') * 100
+
+    # Within-band percentile (0-100 scale) - recalculate to ensure consistency
+    df["Composite_Percentile_in_Band"] = df.groupby("Rating_Band")[score_col].rank(pct=True, method='average') * 100
+
+    return df
+
+def resolve_quality_metric_and_split(df, split_basis, split_threshold):
+    """
+    Returns (quality_series, x_split_for_plot, axis_label, x_values_for_scatter)
+
+    quality_series: Series to test for Strong/Weak (values compared to x_split_for_plot)
+    x_split_for_plot: Scalar value to draw as vertical line on chart
+    axis_label: String label for x-axis
+    x_values_for_scatter: Series to plot on x-axis (same as quality_series)
+    """
+    if split_basis == "Absolute Composite Score":
+        quality = df["Composite_Score"]
+        # Vertical line at the Nth percentile of absolute scores
+        x_split = float(np.nanpercentile(df["Composite_Score"], split_threshold))
+        axis_label = "Composite Score (0-100)"
+        x_vals = df["Composite_Score"]
+    elif split_basis == "Global Percentile":
+        quality = df["Composite_Percentile_Global"]
+        x_split = float(split_threshold)
+        axis_label = "Global Percentile (0-100)"
+        x_vals = df["Composite_Percentile_Global"]
+    else:
+        # Percentile within band (default/recommended)
+        quality = df["Composite_Percentile_in_Band"]
+        x_split = float(split_threshold)
+        axis_label = "Percentile within Rating Band (0-100)"
+        x_vals = df["Composite_Percentile_in_Band"]
+
+    return quality, x_split, axis_label, x_vals
+
+# ============================================================================
 # MAIN DATA LOADING FUNCTION
 # ============================================================================
 
 @st.cache_data(show_spinner=False)
-def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjusted, use_quarterly_beta=False):
+def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjusted, use_quarterly_beta=False,
+                          split_basis="Percentile within Band (recommended)", split_threshold=60, trend_threshold=55):
     """Load data and calculate issuer scores with v2.3 enhancements"""
 
     # ===== TIMING DIAGNOSTICS =====
@@ -2622,9 +2696,8 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     ).astype('Int64')
 
     # Calculate Composite Percentile within Rating Band (0-100 scale)
-    results['Composite_Percentile_in_Band'] = results.groupby('Rating_Band')['Composite_Score'].rank(
-        pct=True, method='average'
-    ) * 100
+    # Also compute global percentile for unified quality/trend split
+    results = _compute_quality_metrics(results, score_col="Composite_Score")
 
     # [v2.3] Calculate Classification Rank only if classification available
     if has_classification and 'Rubrics_Custom_Classification' in results.columns:
@@ -2641,19 +2714,26 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # GENERATE SIGNAL (Position & Trend quadrant classification)
     # ========================================================================
 
-    # Calculate dynamic threshold to match quadrant plot visualization
-    median_cycle = results['Cycle_Position_Score'].median(skipna=True)
+    # Use unified quality/trend split rule
+    quality_metric, x_split_for_rule, _, _ = resolve_quality_metric_and_split(
+        results, split_basis, split_threshold
+    )
 
-    # Vectorized signal generation (efficient - no row-by-row iteration)
-    # Align with percentile-based Buy threshold (≥60th pct within band)
-    high_composite = results['Composite_Percentile_in_Band'] >= 60
-    high_cycle = results['Cycle_Position_Score'] >= median_cycle
-    
-    # Four-quadrant classification
-    results['Signal'] = 'Weak & Deteriorating'  # default
-    results.loc[high_composite & high_cycle, 'Signal'] = 'Strong & Improving'
-    results.loc[high_composite & ~high_cycle, 'Signal'] = 'Strong but Deteriorating'
-    results.loc[~high_composite & high_cycle, 'Signal'] = 'Weak but Improving'
+    trend_metric = results["Cycle_Position_Score"]
+    is_strong_quality = quality_metric >= x_split_for_rule
+    is_improving = trend_metric >= trend_threshold
+
+    # Map to 4 signals
+    results['Signal'] = np.select(
+        [
+            is_strong_quality & is_improving,
+            is_strong_quality & ~is_improving,
+            ~is_strong_quality & is_improving,
+            ~is_strong_quality & ~is_improving
+        ],
+        ["Strong & Improving", "Strong but Deteriorating", "Weak but Improving", "Weak & Deteriorating"],
+        default="—"
+    )
     results['Combined_Signal'] = results['Signal']  # Keep alias for backward compatibility
 
     # ========================================================================
@@ -2716,7 +2796,10 @@ if os.environ.get("RG_TESTS") != "1":
         # ========================================================================
 
         with st.spinner("Loading and processing data..."):
-            results_final, df_original, audits = load_and_process_data(uploaded_file, data_period, use_sector_adjusted, use_quarterly_beta)
+            results_final, df_original, audits = load_and_process_data(
+                uploaded_file, data_period, use_sector_adjusted, use_quarterly_beta,
+                split_basis, split_threshold, trend_threshold
+            )
             _audit_count("Before freshness filters", results_final, audits)
 
             # Normalize Combined_Signal values once
@@ -2948,12 +3031,16 @@ if os.environ.get("RG_TESTS") != "1":
 
                 # Ensure numeric dtypes for axes
                 results_final['Composite_Percentile_in_Band'] = pd.to_numeric(results_final['Composite_Percentile_in_Band'], errors='coerce')
+                results_final['Composite_Percentile_Global'] = pd.to_numeric(results_final.get('Composite_Percentile_Global', results_final['Composite_Percentile_in_Band']), errors='coerce')
                 results_final['Composite_Score'] = pd.to_numeric(results_final['Composite_Score'], errors='coerce')
                 results_final['Cycle_Position_Score'] = pd.to_numeric(results_final['Cycle_Position_Score'], errors='coerce')
 
-                # Compute visualization splits (aligned with percentile-based logic)
-                x_split = 60  # Fixed at Buy threshold (≥60th percentile within band)
-                y_split = results_final['Cycle_Position_Score'].median(skipna=True)
+                # Use unified quality/trend split for visualization
+                quality_metric_plot, x_split_for_plot, x_axis_label, x_vals = resolve_quality_metric_and_split(
+                    results_final, split_basis, split_threshold
+                )
+                y_vals = results_final["Cycle_Position_Score"]
+                y_split = float(trend_threshold)
 
                 # Create color mapping for quadrants
                 color_map = {
@@ -2963,10 +3050,19 @@ if os.environ.get("RG_TESTS") != "1":
                     "Weak & Deteriorating": "#e74c3c"      # Red
                 }
 
-                # Create scatter plot using within-band percentile on x-axis
+                # Prepare data for scatter plot
+                # Need to determine which column to use for x-axis
+                if split_basis == "Absolute Composite Score":
+                    x_col = "Composite_Score"
+                elif split_basis == "Global Percentile":
+                    x_col = "Composite_Percentile_Global"
+                else:  # Percentile within band
+                    x_col = "Composite_Percentile_in_Band"
+
+                # Create scatter plot using unified quality metric
                 fig_quadrant = px.scatter(
                     results_final,
-                    x="Composite_Percentile_in_Band",
+                    x=x_col,
                     y="Cycle_Position_Score",
                     color="Combined_Signal",
                     color_discrete_map=color_map,
@@ -2979,25 +3075,32 @@ if os.environ.get("RG_TESTS") != "1":
                     },
                     title='Credit Quality vs. Trend Momentum',
                     labels={
-                        "Composite_Percentile_in_Band": "Quality Percentile (within rating band, 0–100)",
+                        x_col: x_axis_label,
                         "Cycle_Position_Score": "Cycle Position Score (Trend Direction)"
                     }
                 )
 
                 # Add split lines in DATA coordinates (xref='x', yref='y')
-                fig_quadrant.add_vline(x=x_split, line_width=1.5, line_dash="dash", line_color="#888", layer="below")
+                fig_quadrant.add_vline(x=x_split_for_plot, line_width=1.5, line_dash="dash", line_color="#888", layer="below")
                 fig_quadrant.add_hline(y=y_split, line_width=1.5, line_dash="dash", line_color="#888", layer="below")
 
                 # Add quadrant labels (positioned relative to splits)
                 y_upper = y_split + (100 - y_split) * 0.5  # midpoint of upper half
                 y_lower = y_split * 0.5  # midpoint of lower half
-                fig_quadrant.add_annotation(x=80, y=y_upper, text="<b>BEST</b><br>Strong & Improving",
+
+                # Calculate x positions based on actual axis range and split
+                x_max = float(results_final[x_col].max())
+                x_min = float(results_final[x_col].min())
+                x_upper = x_split_for_plot + (x_max - x_split_for_plot) * 0.5  # midpoint of upper half
+                x_lower = x_min + (x_split_for_plot - x_min) * 0.5  # midpoint of lower half
+
+                fig_quadrant.add_annotation(x=x_upper, y=y_upper, text="<b>BEST</b><br>Strong & Improving",
                                            showarrow=False, font=dict(size=12, color="gray"), xref='x', yref='y')
-                fig_quadrant.add_annotation(x=80, y=y_lower, text="<b>WARNING</b><br>Strong but Deteriorating",
+                fig_quadrant.add_annotation(x=x_upper, y=y_lower, text="<b>WARNING</b><br>Strong but Deteriorating",
                                            showarrow=False, font=dict(size=12, color="gray"), xref='x', yref='y')
-                fig_quadrant.add_annotation(x=40, y=y_upper, text="<b>OPPORTUNITY</b><br>Weak but Improving",
+                fig_quadrant.add_annotation(x=x_lower, y=y_upper, text="<b>OPPORTUNITY</b><br>Weak but Improving",
                                            showarrow=False, font=dict(size=12, color="gray"), xref='x', yref='y')
-                fig_quadrant.add_annotation(x=40, y=y_lower, text="<b>AVOID</b><br>Weak & Deteriorating",
+                fig_quadrant.add_annotation(x=x_lower, y=y_lower, text="<b>AVOID</b><br>Weak & Deteriorating",
                                            showarrow=False, font=dict(size=12, color="gray"), xref='x', yref='y')
 
                 fig_quadrant.update_layout(
@@ -3701,20 +3804,24 @@ if os.environ.get("RG_TESTS") != "1":
                 # Top improvers (best cycle + momentum)
                 st.subheader("Top 10 Improving Trend Issuers")
 
-                improving = trend_data.nlargest(10, 'Cycle_Position_Score')[
+                # Use unified trend threshold to filter improving issuers
+                mask_improving = (trend_data['Cycle_Position_Score'] >= trend_threshold)
+                top_improving = trend_data[mask_improving].sort_values('Composite_Score', ascending=False).head(10)[
                     ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification', 'Composite_Score', 'Cycle_Position_Score', 'Combined_Signal', 'Recommendation']
                 ]
-                improving.columns = ['Company', 'Rating', 'Classification', 'Score', 'Cycle Score', 'Signal', 'Rec']
-                st.dataframe(improving, use_container_width=True, hide_index=True)
+                top_improving.columns = ['Company', 'Rating', 'Classification', 'Score', 'Cycle Score', 'Signal', 'Rec']
+                st.dataframe(top_improving, use_container_width=True, hide_index=True)
 
                 # Warning list (deteriorating)
                 st.subheader("Top 10 Deteriorating Trend Issuers")
-                
-                deteriorating = trend_data.nsmallest(10, 'Cycle_Position_Score')[
+
+                # Use unified trend threshold to filter deteriorating issuers
+                mask_deteriorating = (trend_data['Cycle_Position_Score'] < trend_threshold)
+                top_deteriorating = trend_data[mask_deteriorating].sort_values('Composite_Score', ascending=False).head(10)[
                     ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification', 'Composite_Score', 'Cycle_Position_Score', 'Combined_Signal', 'Recommendation']
                 ]
-                deteriorating.columns = ['Company', 'Rating', 'Classification', 'Score', 'Cycle Score', 'Signal', 'Rec']
-                st.dataframe(deteriorating, use_container_width=True, hide_index=True)
+                top_deteriorating.columns = ['Company', 'Rating', 'Classification', 'Score', 'Cycle Score', 'Signal', 'Rec']
+                st.dataframe(top_deteriorating, use_container_width=True, hide_index=True)
             
             # ============================================================================
             # TAB 6: METHODOLOGY
@@ -3794,28 +3901,42 @@ These trend metrics do **not** change the point-in-time extraction for Composite
 ---
 
 ## 8. Signal & Recommendation
-**Signal** combines **Position (level)** and **Trend (direction)**:
+**Signal** combines **Quality (level)** and **Trend (direction)** using a unified, configurable split:
 
-- **Position:** Strong / Moderate / Weak — derived from Composite_Score tiers.
-- **Trend:** Improving / Stable / Deteriorating — derived from Cycle_Position_Score.
+### Quality/Trend Split (Configurable)
+The sidebar offers three options for defining "Strong" vs "Weak" quality:
+1. **Percentile within Band (recommended, default)** — Compares issuers only to peers in the same rating band (e.g., BBB issuers ranked among BBBs)
+2. **Global Percentile** — Ranks across all issuers regardless of rating
+3. **Absolute Composite Score** — Uses raw 0-100 score values
 
-This yields four canonical combinations:
-- **Strong & Improving**
-- **Strong but Deteriorating**
-- **Weak but Improving**
-- **Weak & Deteriorating**
+**Default thresholds:**
+- Quality threshold: **60** (60th percentile or score 60, depending on basis)
+- Trend threshold: **55** (Cycle Position Score)
 
-**Recommendation** is driven by Composite_Score bands (e.g., ≥65 = Strong Buy, ≥50 = Buy, ≥35 = Hold, else Avoid) with a presentation-safe guardrail:
-- **Weak & Deteriorating** issuers are **never** labeled Buy or Strong Buy.
+### Four-Quadrant Classification
+This unified rule produces four canonical signals:
+- **Strong & Improving** — Quality ≥ threshold AND Cycle_Position_Score ≥ trend threshold
+- **Strong but Deteriorating** — Quality ≥ threshold AND Cycle_Position_Score < trend threshold
+- **Weak but Improving** — Quality < threshold AND Cycle_Position_Score ≥ trend threshold
+- **Weak & Deteriorating** — Quality < threshold AND Cycle_Position_Score < trend threshold
 
-(*Strong but Deteriorating* and *Weak but Improving* may still be Buy if Composite_Score warrants it.)
+The same thresholds drive:
+- Signal assignment in the data model
+- Quadrant chart split lines (x-axis adjusts to match chosen quality basis)
+- Top 10 Improving/Deteriorating tables
+
+### Recommendation Guardrail
+**Recommendation** is derived from percentile-based bands (≥80 = Strong Buy, ≥60 = Buy, ≥40 = Hold, else Avoid) with a presentation-safe guardrail:
+- **Weak & Deteriorating** issuers are **never** labeled Buy or Strong Buy, regardless of raw score.
+
+(*Strong but Deteriorating* and *Weak but Improving* may still be Buy if their percentile warrants it.)
 
 ---
 
 ## 9. Visualisation
-- **Four-Quadrant Analysis — Quality vs Momentum:** X = Composite_Score; Y = Cycle_Position_Score; dashed guides mark the visual split; colors match the four Signal classes above.
+- **Four-Quadrant Analysis — Quality vs Momentum:** X-axis adapts to the selected quality basis (Absolute Score, Global Percentile, or Within-Band Percentile); Y-axis = Cycle_Position_Score. Dashed guides mark the configurable split thresholds; colors match the four Signal classes above.
 - **PCA Scatter (2D):** Permanent (non-toggle). Factors are robust-scaled and projected into PC1/PC2 to illustrate issuer clustering across IG/HY. Legend reflects Rating_Group and Rating_Band.
-- **Trend Lists:** "Top 10 Improving Trend Issuers" and "Top 10 Deteriorating Trend Issuers."
+- **Trend Lists:** "Top 10 Improving Trend Issuers" (Cycle Position ≥ trend threshold, sorted by Composite Score) and "Top 10 Deteriorating Trend Issuers" (Cycle Position < trend threshold, sorted by Composite Score).
 - **Rank Tables:** Percentile ranks within IG/HY cohorts.
 
 ---
