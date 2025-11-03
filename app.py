@@ -6813,15 +6813,16 @@ if os.environ.get("RG_TESTS") != "1":
                         showlegend=False,
                         title_text="Factor Contributions to Principal Components",
                         title_x=0.5,
+                        title_y=0.98,
                         title_font_size=16,
                         title_font_color='#2C5697',
                         paper_bgcolor='white',
                         plot_bgcolor='white',
-                        margin=dict(t=100, b=40, l=40, r=40)
+                        margin=dict(t=120, b=40, l=40, r=40)
                     )
 
                     # Increase spacing between subplot titles and radar charts
-                    fig_radar.update_annotations(y=1.15)
+                    fig_radar.update_annotations(y=1.10)
 
                     st.plotly_chart(fig_radar, use_container_width=True)
 
