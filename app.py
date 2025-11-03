@@ -6687,7 +6687,271 @@ if os.environ.get("RG_TESTS") != "1":
 
                 # Render dual maps (IG + HY)
                 render_dual_issuer_maps(results_final, 'Company_ID', 'Company_Name')
-        
+
+                # ========================================================================
+                # PCA FACTOR LOADINGS ANALYSIS
+                # ========================================================================
+                st.markdown("---")
+                st.subheader("PCA Factor Loadings Analysis")
+
+                st.markdown("""
+                **Principal Component Analysis** reveals the underlying structure of the 6 credit factors
+                and shows how they contribute to overall variation across issuers. The radar charts display
+                each factor's loading (contribution) on the principal components.
+                """)
+
+                try:
+                    from plotly.subplots import make_subplots
+
+                    # Get factor score columns and filter by coverage (min 50%)
+                    all_factor_cols = [c for c in results_final.columns if c.endswith("_Score") and c != "Composite_Score"]
+
+                    # Filter out factors with <50% coverage
+                    score_cols = []
+                    excluded_factors = []
+                    for col in all_factor_cols:
+                        coverage_pct = (pd.to_numeric(results_final[col], errors='coerce').notna().sum() / len(results_final) * 100)
+                        if coverage_pct >= 50.0:
+                            score_cols.append(col)
+                        else:
+                            excluded_factors.append(col)
+
+                    # Show which factors are being used
+                    if excluded_factors:
+                        excluded_names = [f.replace("_Score", "") for f in excluded_factors]
+                        st.info(f"PCA using {len(score_cols)} factors (excluded due to low coverage: {', '.join(excluded_names)})")
+                    else:
+                        st.info(f"PCA using all {len(score_cols)} factors")
+
+                    # Prepare data for PCA (sample if needed for performance)
+                    df_pca_sample = results_final.copy()
+                    if len(df_pca_sample) > 2000:
+                        df_pca_sample = df_pca_sample.sample(n=2000, random_state=0)
+
+                    # Extract and clean numeric data
+                    X_pca = df_pca_sample[score_cols].copy()
+
+                    # Convert to numeric, coercing errors
+                    for col in score_cols:
+                        X_pca[col] = pd.to_numeric(X_pca[col], errors='coerce')
+
+                    # Check if we have enough valid data
+                    valid_counts = X_pca.notna().sum()
+                    if valid_counts.min() < 10:
+                        raise ValueError(f"Insufficient valid data: some factors have <10 valid values")
+
+                    # Remove rows with ANY missing values (most reliable approach)
+                    X_pca_clean = X_pca.dropna()
+
+                    # Check if we have enough rows after dropping NaNs
+                    if len(X_pca_clean) < 20:
+                        raise ValueError(f"Only {len(X_pca_clean)} complete cases after removing missing values (need ≥20)")
+
+                    # Apply RobustScaler and PCA
+                    scaler = RobustScaler()
+                    X_scaled = scaler.fit_transform(X_pca_clean.values)
+
+                    pca = PCA(n_components=min(3, len(score_cols)), random_state=0)
+                    pca_result = pca.fit_transform(X_scaled)
+
+                    # Get loadings and explained variance
+                    loadings = pca.components_
+                    var_exp = pca.explained_variance_ratio_ * 100
+
+                    # Clean up feature names for display
+                    feature_names = [col.replace('_Score', '') for col in score_cols]
+
+                    # ========================================================================
+                    # SECTION 1: FULL-WIDTH RADAR CHARTS
+                    # ========================================================================
+                    n_components_to_show = min(3, loadings.shape[0])
+
+                    fig_radar = make_subplots(
+                        rows=1, cols=n_components_to_show,
+                        specs=[[{'type': 'polar'}] * n_components_to_show],
+                        subplot_titles=[f'PC{i+1} ({var_exp[i]:.1f}% var)' for i in range(n_components_to_show)],
+                        horizontal_spacing=0.08
+                    )
+
+                    # Color scheme for different PCs
+                    colors = ['#2C5697', '#E74C3C', '#27AE60']
+
+                    for i in range(n_components_to_show):
+                        pc_loadings = loadings[i, :]
+
+                        fig_radar.add_trace(
+                            go.Scatterpolar(
+                                r=pc_loadings,
+                                theta=feature_names,
+                                fill='toself',
+                                name=f'PC{i+1}',
+                                line=dict(width=2.5, color=colors[i]),
+                                marker=dict(size=8),
+                                fillcolor=colors[i],
+                                opacity=0.5
+                            ),
+                            row=1, col=i+1
+                        )
+
+                        fig_radar.update_polars(
+                            radialaxis=dict(
+                                visible=True,
+                                range=[-1, 1],
+                                showticklabels=True,
+                                ticks='outside',
+                                tickfont=dict(size=10),
+                                gridcolor='lightgray'
+                            ),
+                            angularaxis=dict(
+                                tickfont=dict(size=12, color='#333333')
+                            ),
+                            row=1, col=i+1
+                        )
+
+                    fig_radar.update_layout(
+                        height=450,
+                        showlegend=False,
+                        title_text="Factor Contributions to Principal Components",
+                        title_x=0.5,
+                        title_font_size=16,
+                        title_font_color='#2C5697',
+                        paper_bgcolor='white',
+                        plot_bgcolor='white',
+                        margin=dict(t=80, b=40, l=40, r=40)
+                    )
+
+                    st.plotly_chart(fig_radar, use_container_width=True)
+
+                    # ========================================================================
+                    # SECTION 2: VARIANCE METRICS GRID
+                    # ========================================================================
+                    st.markdown("### Variance Explained")
+
+                    # Create columns for variance metrics
+                    metric_cols = st.columns(n_components_to_show + 1)
+
+                    # Individual PC variance
+                    for i in range(n_components_to_show):
+                        with metric_cols[i]:
+                            st.metric(
+                                f"PC{i+1}",
+                                f"{var_exp[i]:.1f}%",
+                                help=f"Principal Component {i+1} explains {var_exp[i]:.1f}% of total variance"
+                            )
+
+                    # Cumulative variance in last column
+                    with metric_cols[n_components_to_show]:
+                        cum_var_total = var_exp[:n_components_to_show].sum()
+                        st.metric(
+                            f"PC1-{n_components_to_show}",
+                            f"{cum_var_total:.1f}%",
+                            help=f"First {n_components_to_show} components explain {cum_var_total:.1f}% of total variance"
+                        )
+
+                    # ========================================================================
+                    # SECTION 3: HOW TO READ GUIDE
+                    # ========================================================================
+                    st.markdown("---")
+                    col_guide1, col_guide2 = st.columns(2)
+
+                    with col_guide1:
+                        st.markdown("**How to Read**")
+                        st.markdown("""
+                        - **Distance from center**: Strength of factor's contribution
+                        - **Positive values** (outward): Factor increases with PC
+                        - **Negative values** (opposite): Factor decreases with PC
+                        """)
+
+                    with col_guide2:
+                        st.markdown("**Interpretation**")
+                        st.markdown("""
+                        - **Near ±1.0**: Very strong influence
+                        - **Near ±0.5**: Moderate influence
+                        - **Near 0.0**: Weak influence
+                        """)
+
+                    # ========================================================================
+                    # SECTION 4: DETAILED INSIGHTS (EXPANDABLE)
+                    # ========================================================================
+                    with st.expander("View Detailed Loadings & Insights"):
+                        # Build loadings dataframe
+                        loadings_df = pd.DataFrame(
+                            loadings[:n_components_to_show].T,
+                            columns=[f'PC{i+1}' for i in range(n_components_to_show)],
+                            index=feature_names
+                        )
+
+                        # Automatic insights
+                        st.markdown("**Dominant Factors by Component:**")
+                        for i in range(n_components_to_show):
+                            pc_loadings_abs = loadings_df[f'PC{i+1}'].abs().sort_values(ascending=False)
+                            top_factor = pc_loadings_abs.index[0]
+                            top_value = loadings_df.loc[top_factor, f'PC{i+1}']
+                            direction = "positively" if top_value > 0 else "negatively"
+
+                            # Get top 2 factors
+                            top2_factors = pc_loadings_abs.head(2)
+                            factor2 = top2_factors.index[1]
+                            value2 = loadings_df.loc[factor2, f'PC{i+1}']
+                            dir2 = "positively" if value2 > 0 else "negatively"
+
+                            st.markdown(f"- **PC{i+1}** ({var_exp[i]:.1f}% var): Most {direction} influenced by **{top_factor}** ({top_value:.3f}), followed by **{factor2}** ({dir2}, {value2:.3f})")
+
+                        st.markdown("---")
+                        st.markdown("**Complete Loadings Table:**")
+
+                        # Add a column showing which PC each factor loads strongest on
+                        loadings_df['Strongest_PC'] = loadings_df.abs().idxmax(axis=1)
+                        loadings_df['Max_Loading'] = loadings_df[[f'PC{i+1}' for i in range(n_components_to_show)]].abs().max(axis=1)
+                        loadings_df_display = loadings_df.sort_values('Max_Loading', ascending=False)
+
+                        # Display with styling
+                        st.dataframe(
+                            loadings_df_display[[f'PC{i+1}' for i in range(n_components_to_show)]].style.format("{:.3f}").background_gradient(
+                                cmap='RdYlGn', axis=0, vmin=-1, vmax=1
+                            ),
+                            use_container_width=True
+                        )
+
+                        # Interpretation guide
+                        st.markdown("---")
+                        st.markdown("**Interpretation Tips:**")
+                        st.markdown("""
+                        - **PC1** typically captures the primary dimension of credit quality (overall strength)
+                        - **PC2** often represents a secondary differentiating factor (e.g., growth vs. stability)
+                        - **PC3** captures tertiary patterns or sector-specific characteristics
+                        - Factors with **similar sign patterns** across PCs tend to move together
+                        - Factors with **opposite signs** represent trade-offs or different credit strategies
+                        """)
+
+                except Exception as e:
+                    # Get diagnostic info
+                    try:
+                        all_factor_cols = [c for c in results_final.columns if c.endswith("_Score") and c != "Composite_Score"]
+                        X_check = results_final[all_factor_cols].apply(pd.to_numeric, errors='coerce')
+                        valid_per_col = X_check.notna().sum()
+                        complete_rows = X_check.dropna().shape[0]
+
+                        st.warning(f"PCA analysis unavailable: {e}")
+
+                        with st.expander("Diagnostic Information"):
+                            st.markdown("**Valid data points per factor:**")
+                            for col in all_factor_cols:
+                                pct = (valid_per_col[col] / len(results_final) * 100) if len(results_final) > 0 else 0
+                                st.caption(f"• {col}: {valid_per_col[col]:,} / {len(results_final):,} ({pct:.1f}%)")
+
+                            st.markdown(f"**Complete cases** (rows with all factors): {complete_rows:,} / {len(results_final):,}")
+
+                            if complete_rows < 20:
+                                st.error("Need at least 20 issuers with complete factor scores for PCA")
+                                st.info("**Suggestion**: Check your data export to ensure all factor scores are populated")
+                            elif valid_per_col.min() < len(results_final) * 0.5:
+                                st.warning("Some factors have >50% missing values")
+                                st.info("**Suggestion**: Review your factor calculation logic or data quality")
+                    except:
+                        st.warning(f"PCA analysis unavailable: {e}")
+                        st.caption("This may occur with insufficient data or if factor scores are missing.")
+
                 # ========================================================================
                 # RATING-BAND LEADERBOARDS (V2.0)
                 # ========================================================================
