@@ -459,8 +459,8 @@ def render_pca_scatter_ig_hy_v1style(dfp: pd.DataFrame, ev, id_col: str, name_co
         font=dict(family="Inter, Arial, sans-serif", size=12),
         legend=dict(title="", orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=20, r=20, t=40, b=40),
-        xaxis_title="PC1",
-        yaxis_title="PC2"
+        xaxis_title="Primary Credit Dimension →",
+        yaxis_title="Secondary Credit Dimension →"
     )
     return fig
 
@@ -507,8 +507,8 @@ def render_dual_issuer_maps(results: pd.DataFrame, id_col: str, name_col: str):
             font=dict(family="Inter, Arial, sans-serif", size=12),
             legend=dict(title="", orientation="v", yanchor="top", y=0.98, xanchor="left", x=1.02),
             margin=dict(l=20, r=20, t=40, b=40),
-            xaxis_title="Overall Credit Quality (Better →)",
-            yaxis_title="Financial Strength vs Leverage Balance"
+            xaxis_title="Credit Quality (Weaker → Stronger)",
+            yaxis_title="Leverage (Higher → Lower)"
         )
         return fig
 
@@ -6606,7 +6606,7 @@ if os.environ.get("RG_TESTS") != "1":
                     title='Credit Quality vs. Trend Momentum',
                     labels={
                         x_col: x_axis_label,
-                        "Cycle_Position_Score": "Cycle Position Score (Trend Direction)"
+                        "Cycle_Position_Score": "Improving ← Trend → Deteriorating"
                     }
                 )
 
@@ -6761,70 +6761,172 @@ if os.environ.get("RG_TESTS") != "1":
                     # Clean up feature names for display
                     feature_names = [col.replace('_Score', '') for col in score_cols]
 
-                    # ========================================================================
-                    # SECTION 1: FULL-WIDTH RADAR CHARTS
-                    # ========================================================================
+                    # Helper function to interpret PC business meaning
+                    def interpret_pc_name(pc_loadings, feature_names):
+                        """Generate interpretive name based on loading patterns."""
+                        abs_loadings = np.abs(pc_loadings)
+                        top3_idx = np.argsort(abs_loadings)[-3:][::-1]
+                        top_factors = [feature_names[i] for i in top3_idx]
+
+                        # Categorize factors
+                        profitability = {'Profitability', 'Credit'}
+                        leverage = {'Leverage'}
+                        coverage = {'Cash_Flow'}
+                        liquidity = {'Liquidity'}
+
+                        top_set = set(top_factors)
+
+                        if profitability & top_set and leverage & top_set:
+                            return "Overall Credit Quality"
+                        elif profitability & top_set and len(profitability & top_set) >= 2:
+                            return "Profitability & Returns"
+                        elif leverage & top_set and coverage & top_set:
+                            return "Leverage & Coverage"
+                        elif liquidity & top_set:
+                            return "Liquidity Position"
+                        elif 'Profitability' in top_set:
+                            return "Operating Performance"
+                        elif 'Leverage' in top_set:
+                            return "Debt & Leverage"
+                        elif 'Cash_Flow' in top_set:
+                            return "Cash Flow & Coverage"
+                        else:
+                            return "Credit Dimension"
+
+                    # Generate interpretive names for each PC
                     n_components_to_show = min(3, loadings.shape[0])
+                    pc_names = [interpret_pc_name(loadings[i], feature_names) for i in range(n_components_to_show)]
 
-                    fig_radar = make_subplots(
-                        rows=1, cols=n_components_to_show,
-                        specs=[[{'type': 'polar'}] * n_components_to_show],
-                        subplot_titles=[f'PC{i+1} ({var_exp[i]:.1f}% var)' for i in range(n_components_to_show)],
-                        horizontal_spacing=0.08
-                    )
+                    # ========================================================================
+                    # SECTION 1: RADAR CHARTS (LEFT) + 3D PLOT (RIGHT)
+                    # ========================================================================
 
-                    # Color scheme for different PCs
-                    colors = ['#2C5697', '#E74C3C', '#27AE60']
+                    col_left, col_right = st.columns([1, 2])
 
-                    for i in range(n_components_to_show):
-                        pc_loadings = loadings[i, :]
+                    # LEFT COLUMN: 3 Vertical Radar Charts
+                    with col_left:
+                        colors = ['#2C5697', '#E74C3C', '#27AE60']
 
-                        fig_radar.add_trace(
-                            go.Scatterpolar(
-                                r=pc_loadings,
-                                theta=feature_names,
-                                fill='toself',
-                                name=f'PC{i+1}',
-                                line=dict(width=2.5, color=colors[i]),
-                                marker=dict(size=8),
-                                fillcolor=colors[i],
-                                opacity=0.5
-                            ),
-                            row=1, col=i+1
+                        for i in range(n_components_to_show):
+                            pc_loadings = loadings[i, :]
+
+                            fig_radar_single = go.Figure()
+
+                            fig_radar_single.add_trace(
+                                go.Scatterpolar(
+                                    r=pc_loadings,
+                                    theta=feature_names,
+                                    fill='toself',
+                                    name=f'PC{i+1}',
+                                    line=dict(width=2.5, color=colors[i]),
+                                    marker=dict(size=8),
+                                    fillcolor=colors[i],
+                                    opacity=0.5
+                                )
+                            )
+
+                            fig_radar_single.update_layout(
+                                height=350,
+                                showlegend=False,
+                                title=dict(
+                                    text=f'<b>PC{i+1}: {pc_names[i]}</b><br>({var_exp[i]:.1f}% variance)',
+                                    x=0.5,
+                                    xanchor='center',
+                                    font=dict(size=13, color='#2C5697')
+                                ),
+                                polar=dict(
+                                    radialaxis=dict(
+                                        visible=True,
+                                        range=[-1, 1],
+                                        showticklabels=True,
+                                        ticks='outside',
+                                        tickfont=dict(size=9),
+                                        gridcolor='lightgray'
+                                    ),
+                                    angularaxis=dict(
+                                        tickfont=dict(size=10, color='#333333')
+                                    )
+                                ),
+                                paper_bgcolor='white',
+                                plot_bgcolor='white',
+                                margin=dict(t=60, b=20, l=20, r=20)
+                            )
+
+                            st.plotly_chart(fig_radar_single, use_container_width=True)
+
+                    # RIGHT COLUMN: 3D Issuer Distribution
+                    with col_right:
+                        # Create 3D scatter plot
+                        fig_3d = go.Figure()
+
+                        # Get color mapping
+                        if 'Rating_Band' in results_final.columns:
+                            color_col = results_final.loc[X_pca_clean.index, 'Rating_Band'].astype(str)
+                            color_discrete_map = {
+                                'AAA': '#1f77b4', 'AA': '#2ca02c', 'A': '#98df8a',
+                                'BBB': '#ffbb78', 'BB': '#ff7f0e', 'B': '#d62728',
+                                'CCC': '#9467bd', 'CC': '#8c564b', 'NR': '#7f7f7f'
+                            }
+                            colors_3d = [color_discrete_map.get(str(b), '#7f7f7f') for b in color_col]
+                        else:
+                            color_col = results_final.loc[X_pca_clean.index, 'Composite_Score']
+                            colors_3d = color_col
+
+                        # Get hover text
+                        hover_text = []
+                        for idx in X_pca_clean.index:
+                            name = results_final.loc[idx, 'Company_Name'] if 'Company_Name' in results_final.columns else str(idx)
+                            comp = results_final.loc[idx, 'Composite_Score'] if 'Composite_Score' in results_final.columns else 'N/A'
+                            rating = results_final.loc[idx, 'Rating_Band'] if 'Rating_Band' in results_final.columns else 'N/A'
+                            pc1_val = pca_result[list(X_pca_clean.index).index(idx), 0]
+                            pc2_val = pca_result[list(X_pca_clean.index).index(idx), 1]
+                            pc3_val = pca_result[list(X_pca_clean.index).index(idx), 2] if pca_result.shape[1] > 2 else 0
+                            hover_text.append(
+                                f"{name}<br>Composite: {comp:.1f}<br>Rating: {rating}<br>" +
+                                f"PC1: {pc1_val:.2f}<br>PC2: {pc2_val:.2f}<br>PC3: {pc3_val:.2f}"
+                            )
+
+                        fig_3d.add_trace(
+                            go.Scatter3d(
+                                x=pca_result[:, 0],
+                                y=pca_result[:, 1],
+                                z=pca_result[:, 2] if pca_result.shape[1] > 2 else np.zeros(len(pca_result)),
+                                mode='markers',
+                                marker=dict(
+                                    size=4,
+                                    color=colors_3d,
+                                    colorscale='RdYlGn' if 'Rating_Band' not in results_final.columns else None,
+                                    showscale='Rating_Band' not in results_final.columns,
+                                    colorbar=dict(title="Composite<br>Score") if 'Rating_Band' not in results_final.columns else None,
+                                    line=dict(width=0.5, color='white')
+                                ),
+                                text=hover_text,
+                                hovertemplate='%{text}<extra></extra>'
+                            )
                         )
 
-                        fig_radar.update_polars(
-                            radialaxis=dict(
-                                visible=True,
-                                range=[-1, 1],
-                                showticklabels=True,
-                                ticks='outside',
-                                tickfont=dict(size=10),
-                                gridcolor='lightgray'
+                        fig_3d.update_layout(
+                            height=1050,
+                            title=dict(
+                                text='<b>3D Issuer Distribution</b>',
+                                x=0.5,
+                                xanchor='center',
+                                font=dict(size=14, color='#2C5697')
                             ),
-                            angularaxis=dict(
-                                tickfont=dict(size=12, color='#333333')
+                            scene=dict(
+                                xaxis=dict(title=f'PC1: {pc_names[0]}<br>({var_exp[0]:.1f}%)', titlefont=dict(size=11)),
+                                yaxis=dict(title=f'PC2: {pc_names[1]}<br>({var_exp[1]:.1f}%)', titlefont=dict(size=11)),
+                                zaxis=dict(title=f'PC3: {pc_names[2]}<br>({var_exp[2]:.1f}%)' if n_components_to_show > 2 else 'PC3', titlefont=dict(size=11)),
+                                camera=dict(
+                                    eye=dict(x=1.5, y=1.5, z=1.3)
+                                )
                             ),
-                            row=1, col=i+1
+                            paper_bgcolor='white',
+                            plot_bgcolor='white',
+                            margin=dict(t=60, b=20, l=20, r=20)
                         )
 
-                    fig_radar.update_layout(
-                        height=450,
-                        showlegend=False,
-                        title_text="Factor Contributions to Principal Components",
-                        title_x=0.5,
-                        title_y=0.98,
-                        title_font_size=16,
-                        title_font_color='#2C5697',
-                        paper_bgcolor='white',
-                        plot_bgcolor='white',
-                        margin=dict(t=120, b=40, l=40, r=40)
-                    )
-
-                    # Increase spacing between subplot titles and radar charts
-                    fig_radar.update_annotations(y=1.10)
-
-                    st.plotly_chart(fig_radar, use_container_width=True)
+                        st.plotly_chart(fig_3d, use_container_width=True)
 
                     # ========================================================================
                     # SECTION 2: VARIANCE METRICS GRID
