@@ -6856,84 +6856,152 @@ if os.environ.get("RG_TESTS") != "1":
 
                     # RIGHT COLUMN: 3D Issuer Distribution
                     with col_right:
-                        # Create 3D scatter plot
-                        fig_3d = go.Figure()
+                        st.markdown("### 3D Issuer Distribution")
+                        st.caption("Each point represents one issuer positioned by their PC1, PC2, and PC3 scores")
 
-                        # Get color mapping
-                        if 'Rating_Band' in results_final.columns:
-                            color_col = results_final.loc[X_pca_clean.index, 'Rating_Band'].astype(str)
-                            color_discrete_map = {
-                                'AAA': '#1f77b4', 'AA': '#2ca02c', 'A': '#98df8a',
-                                'BBB': '#ffbb78', 'BB': '#ff7f0e', 'B': '#d62728',
-                                'CCC': '#9467bd', 'CC': '#8c564b', 'NR': '#7f7f7f'
-                            }
-                            colors_3d = [color_discrete_map.get(str(b), '#7f7f7f') for b in color_col]
+                        if n_components_to_show >= 3:
+                            # Prepare dataframe with PC scores and issuer info
+                            df_3d = pd.DataFrame(
+                                pca_result[:, :3],
+                                columns=['PC1', 'PC2', 'PC3'],
+                                index=X_pca_clean.index
+                            )
+
+                            # Add company name and composite score for hover info
+                            company_name_col = resolve_company_name_column(df_pca_sample)
+                            if company_name_col:
+                                df_3d['Company_Name'] = df_pca_sample.loc[X_pca_clean.index, company_name_col].values
+                            else:
+                                df_3d['Company_Name'] = df_pca_sample.loc[X_pca_clean.index].index.astype(str)
+
+                            df_3d['Composite_Score'] = df_pca_sample.loc[X_pca_clean.index, 'Composite_Score'].values
+
+                            # Add rating band if available
+                            rating_col = resolve_rating_column(df_pca_sample)
+                            if rating_col and 'Rating_Band' in df_pca_sample.columns:
+                                df_3d['Rating_Band'] = df_pca_sample.loc[X_pca_clean.index, 'Rating_Band'].values
+                                color_by = 'Rating_Band'
+                                # Define color mapping for rating bands
+                                rating_band_colors = {
+                                    'AAA': '#006400',
+                                    'AA': '#228B22',
+                                    'A': '#32CD32',
+                                    'BBB': '#FFD700',
+                                    'BB': '#FFA500',
+                                    'B': '#FF6347',
+                                    'CCC & Below': '#8B0000',
+                                    'Not Rated': '#808080'
+                                }
+                                df_3d['Color'] = df_3d['Rating_Band'].map(rating_band_colors).fillna('#808080')
+                            else:
+                                # Color by composite score if no rating band
+                                color_by = 'Composite_Score'
+                                df_3d['Color'] = df_3d['Composite_Score']
+
+                            # Create 3D scatter plot
+                            fig_3d = go.Figure()
+
+                            if color_by == 'Rating_Band':
+                                # Plot by rating band with separate traces for legend
+                                for band in sorted(df_3d['Rating_Band'].unique()):
+                                    band_data = df_3d[df_3d['Rating_Band'] == band]
+                                    fig_3d.add_trace(go.Scatter3d(
+                                        x=band_data['PC1'],
+                                        y=band_data['PC2'],
+                                        z=band_data['PC3'],
+                                        mode='markers',
+                                        marker=dict(
+                                            size=5,
+                                            color=band_data['Color'].iloc[0],
+                                            line=dict(color='white', width=0.3),
+                                            opacity=0.8
+                                        ),
+                                        name=str(band),
+                                        text=band_data['Company_Name'],
+                                        customdata=band_data[['Composite_Score', 'Rating_Band']],
+                                        hovertemplate='<b>%{text}</b><br>' +
+                                                    'PC1: %{x:.2f}<br>' +
+                                                    'PC2: %{y:.2f}<br>' +
+                                                    'PC3: %{z:.2f}<br>' +
+                                                    'Score: %{customdata[0]:.1f}<br>' +
+                                                    'Rating: %{customdata[1]}<br>' +
+                                                    '<extra></extra>'
+                                    ))
+                            else:
+                                # Single trace colored by composite score
+                                fig_3d.add_trace(go.Scatter3d(
+                                    x=df_3d['PC1'],
+                                    y=df_3d['PC2'],
+                                    z=df_3d['PC3'],
+                                    mode='markers',
+                                    marker=dict(
+                                        size=5,
+                                        color=df_3d['Composite_Score'],
+                                        colorscale='RdYlGn_r',
+                                        cmin=0,
+                                        cmax=100,
+                                        showscale=True,
+                                        colorbar=dict(
+                                            title="Score",
+                                            x=1.0,
+                                            len=0.7,
+                                            thickness=15,
+                                            tickfont=dict(size=10)
+                                        ),
+                                        line=dict(color='white', width=0.3),
+                                        opacity=0.8
+                                    ),
+                                    text=df_3d['Company_Name'],
+                                    customdata=df_3d[['Composite_Score']],
+                                    hovertemplate='<b>%{text}</b><br>' +
+                                                'PC1: %{x:.2f}<br>' +
+                                                'PC2: %{y:.2f}<br>' +
+                                                'PC3: %{z:.2f}<br>' +
+                                                'Score: %{customdata[0]:.1f}<br>' +
+                                                '<extra></extra>',
+                                    showlegend=False
+                                ))
+
+                            # Update layout
+                            fig_3d.update_layout(
+                                scene=dict(
+                                    xaxis=dict(
+                                        title=dict(text=f'PC1: {pc_names[0]}<br>({var_exp[0]:.1f}%)', font=dict(size=11))
+                                    ),
+                                    yaxis=dict(
+                                        title=dict(text=f'PC2: {pc_names[1]}<br>({var_exp[1]:.1f}%)', font=dict(size=11))
+                                    ),
+                                    zaxis=dict(
+                                        title=dict(text=f'PC3: {pc_names[2]}<br>({var_exp[2]:.1f}%)', font=dict(size=11))
+                                    ),
+                                    camera=dict(
+                                        eye=dict(x=1.5, y=1.5, z=1.3)
+                                    ),
+                                    aspectmode='cube'
+                                ),
+                                height=1050,
+                                title=dict(
+                                    text=f"<b>3D Issuer Distribution</b><br><sub>n={len(df_3d):,} issuers</sub>",
+                                    x=0.5,
+                                    xanchor='center',
+                                    font=dict(size=14, color='#2C5697')
+                                ),
+                                paper_bgcolor='white',
+                                plot_bgcolor='white',
+                                margin=dict(l=0, r=0, t=60, b=0),
+                                hovermode='closest',
+                                legend=dict(
+                                    title=dict(text="Rating", font=dict(size=10)),
+                                    x=1.0,
+                                    y=0.5,
+                                    bgcolor='rgba(255,255,255,0.8)',
+                                    font=dict(size=9)
+                                ) if color_by == 'Rating_Band' else None
+                            )
+
+                            st.plotly_chart(fig_3d, use_container_width=True, key='3d_issuer_plot')
                         else:
-                            color_col = results_final.loc[X_pca_clean.index, 'Composite_Score']
-                            colors_3d = color_col
-
-                        # Get hover text
-                        hover_text = []
-                        for idx in X_pca_clean.index:
-                            name = results_final.loc[idx, 'Company_Name'] if 'Company_Name' in results_final.columns else str(idx)
-                            comp = results_final.loc[idx, 'Composite_Score'] if 'Composite_Score' in results_final.columns else 'N/A'
-                            rating = results_final.loc[idx, 'Rating_Band'] if 'Rating_Band' in results_final.columns else 'N/A'
-                            pc1_val = pca_result[list(X_pca_clean.index).index(idx), 0]
-                            pc2_val = pca_result[list(X_pca_clean.index).index(idx), 1]
-                            pc3_val = pca_result[list(X_pca_clean.index).index(idx), 2] if pca_result.shape[1] > 2 else 0
-                            hover_text.append(
-                                f"{name}<br>Composite: {comp:.1f}<br>Rating: {rating}<br>" +
-                                f"PC1: {pc1_val:.2f}<br>PC2: {pc2_val:.2f}<br>PC3: {pc3_val:.2f}"
-                            )
-
-                        fig_3d.add_trace(
-                            go.Scatter3d(
-                                x=pca_result[:, 0],
-                                y=pca_result[:, 1],
-                                z=pca_result[:, 2] if pca_result.shape[1] > 2 else np.zeros(len(pca_result)),
-                                mode='markers',
-                                marker=dict(
-                                    size=4,
-                                    color=colors_3d,
-                                    colorscale='RdYlGn_r' if 'Rating_Band' not in results_final.columns else None,
-                                    showscale='Rating_Band' not in results_final.columns,
-                                    colorbar=dict(title="Composite<br>Score") if 'Rating_Band' not in results_final.columns else None,
-                                    line=dict(width=0.5, color='white'),
-                                    opacity=0.6
-                                ),
-                                text=hover_text,
-                                hovertemplate='%{text}<extra></extra>'
-                            )
-                        )
-
-                        fig_3d.update_layout(
-                            height=1050,
-                            title=dict(
-                                text='<b>3D Issuer Distribution</b>',
-                                x=0.5,
-                                xanchor='center',
-                                font=dict(size=14, color='#2C5697')
-                            ),
-                            scene=dict(
-                                xaxis=dict(
-                                    title=dict(text=f'PC1: {pc_names[0]}<br>({var_exp[0]:.1f}%)', font=dict(size=11))
-                                ),
-                                yaxis=dict(
-                                    title=dict(text=f'PC2: {pc_names[1]}<br>({var_exp[1]:.1f}%)', font=dict(size=11))
-                                ),
-                                zaxis=dict(
-                                    title=dict(text=f'PC3: {pc_names[2]}<br>({var_exp[2]:.1f}%)' if n_components_to_show > 2 else 'PC3', font=dict(size=11))
-                                ),
-                                camera=dict(
-                                    eye=dict(x=1.5, y=1.5, z=1.3)
-                                )
-                            ),
-                            paper_bgcolor='white',
-                            plot_bgcolor='white',
-                            margin=dict(t=60, b=20, l=20, r=20)
-                        )
-
-                        st.plotly_chart(fig_3d, use_container_width=True)
+                            st.info(f"3D visualization requires 3 principal components. Currently showing {n_components_to_show} component(s).")
 
                     # ========================================================================
                     # SECTION 2: VARIANCE METRICS GRID
