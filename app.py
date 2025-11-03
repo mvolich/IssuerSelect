@@ -6914,9 +6914,15 @@ if os.environ.get("RG_TESTS") != "1":
                                 font=dict(size=14, color='#2C5697')
                             ),
                             scene=dict(
-                                xaxis=dict(title=f'PC1: {pc_names[0]}<br>({var_exp[0]:.1f}%)', titlefont=dict(size=11)),
-                                yaxis=dict(title=f'PC2: {pc_names[1]}<br>({var_exp[1]:.1f}%)', titlefont=dict(size=11)),
-                                zaxis=dict(title=f'PC3: {pc_names[2]}<br>({var_exp[2]:.1f}%)' if n_components_to_show > 2 else 'PC3', titlefont=dict(size=11)),
+                                xaxis=dict(
+                                    title=dict(text=f'PC1: {pc_names[0]}<br>({var_exp[0]:.1f}%)', font=dict(size=11))
+                                ),
+                                yaxis=dict(
+                                    title=dict(text=f'PC2: {pc_names[1]}<br>({var_exp[1]:.1f}%)', font=dict(size=11))
+                                ),
+                                zaxis=dict(
+                                    title=dict(text=f'PC3: {pc_names[2]}<br>({var_exp[2]:.1f}%)' if n_components_to_show > 2 else 'PC3', font=dict(size=11))
+                                ),
                                 camera=dict(
                                     eye=dict(x=1.5, y=1.5, z=1.3)
                                 )
