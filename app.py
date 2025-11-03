@@ -3291,7 +3291,7 @@ def _mrav(row: pd.Series, names: list) -> float:
 
 def _cf_components_row(row: pd.Series) -> dict:
     """Return cash-flow components for one issuer (annual values). Capex is NEGATIVE (outflow) in input."""
-    ocf   = _mrav(row, ["Cash from Operations", "Operating Cash Flow", "Cash from Ops", "Net Cash Provided by Operating Activities"])
+    ocf   = _mrav(row, ["Cash from Ops.", "Cash from Operations", "Operating Cash Flow", "Cash from Ops", "Net Cash Provided by Operating Activities"])
     capex = _mrav(row, ["Capital Expenditure", "Capital Expenditures", "CAPEX"])
     rev   = _mrav(row, ["Total Revenues", "Total Revenue", "Revenue"])
     debt  = _mrav(row, ["Total Debt"])
