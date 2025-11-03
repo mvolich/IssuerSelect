@@ -6898,7 +6898,8 @@ if os.environ.get("RG_TESTS") != "1":
                                     colorscale='RdYlGn_r' if 'Rating_Band' not in results_final.columns else None,
                                     showscale='Rating_Band' not in results_final.columns,
                                     colorbar=dict(title="Composite<br>Score") if 'Rating_Band' not in results_final.columns else None,
-                                    line=dict(width=0.5, color='white')
+                                    line=dict(width=0.5, color='white'),
+                                    opacity=0.6
                                 ),
                                 text=hover_text,
                                 hovertemplate='%{text}<extra></extra>'
