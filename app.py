@@ -6817,8 +6817,11 @@ if os.environ.get("RG_TESTS") != "1":
                         title_font_color='#2C5697',
                         paper_bgcolor='white',
                         plot_bgcolor='white',
-                        margin=dict(t=80, b=40, l=40, r=40)
+                        margin=dict(t=100, b=40, l=40, r=40)
                     )
+
+                    # Increase spacing between subplot titles and radar charts
+                    fig_radar.update_annotations(y=1.15)
 
                     st.plotly_chart(fig_radar, use_container_width=True)
 
