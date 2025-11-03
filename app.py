@@ -3179,6 +3179,77 @@ def latest_periods(cal: pd.DataFrame, max_k_fy=4, max_k_cq=7) -> pd.DataFrame:
     return piv
 
 # ============================================================================
+# BATCH METRIC EXTRACTION (moved to module level for reuse)
+# ============================================================================
+
+def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_setting):
+    """
+    OPTIMIZED: Extract all metrics at once using vectorized operations.
+    Returns dict of {metric_name: Series of values}.
+    """
+    result = {}
+
+    if not has_period_alignment:
+        # Fallback: use get_most_recent_column for each metric
+        for metric in metric_list:
+            result[metric] = get_most_recent_column(df, metric, data_period_setting)
+        return result
+
+    # Parse Period Ended columns once for all metrics
+    pe_data = parse_period_ended_cols(df)
+    if not pe_data:
+        # No period data - fall back to base columns
+        for metric in metric_list:
+            if metric in df.columns:
+                result[metric] = pd.to_numeric(df[metric], errors='coerce')
+            else:
+                result[metric] = pd.Series(np.nan, index=df.index)
+        return result
+
+    # Build FY suffix list (annual-only)
+    fy_suffixes, _ = period_cols_by_kind(pe_data, df)
+    candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data[:5]]  # First 5 as fallback
+
+    # For each metric, extract most recent annual value (vectorized)
+    for metric in metric_list:
+        # Collect (date, value) pairs for this metric across all FY suffixes
+        metric_data = []
+        for sfx in candidate_suffixes:
+            col = f"{metric}{sfx}" if sfx else metric
+            if col not in df.columns:
+                continue
+
+            date_series = dict(pe_data).get(sfx)
+            if date_series is None:
+                continue
+
+            # Build chunk for this suffix
+            chunk = pd.DataFrame({
+                'row_idx': df.index,
+                'date': pd.to_datetime(date_series.values, errors='coerce'),
+                'value': pd.to_numeric(df[col], errors='coerce')
+            })
+            metric_data.append(chunk)
+
+        if not metric_data:
+            result[metric] = pd.Series(np.nan, index=df.index)
+            continue
+
+        # Concatenate and filter
+        long_df = pd.concat(metric_data, ignore_index=True)
+        long_df = long_df[long_df['date'].notna() & long_df['value'].notna()]
+        long_df = long_df[long_df['date'].dt.year != 1900]
+
+        # Get most recent (latest date) value per issuer
+        long_df = long_df.sort_values(['row_idx', 'date'])
+        most_recent = long_df.groupby('row_idx').last()['value']
+
+        # Reindex to match original df
+        result[metric] = most_recent.reindex(df.index, fill_value=np.nan)
+
+    return result
+
+# ============================================================================
 # CASH FLOW HELPERS (v3 - DataFrame-level with alias-aware batch extraction)
 # ============================================================================
 
@@ -5719,73 +5790,6 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # ========================================================================
     # CALCULATE QUALITY SCORES ([V2.0] ANNUAL-ONLY DEFAULT)
     # ========================================================================
-
-    def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_setting):
-        """
-        OPTIMIZED: Extract all metrics at once using vectorized operations.
-        Returns dict of {metric_name: Series of values}.
-        """
-        result = {}
-
-        if not has_period_alignment:
-            # Fallback: use get_most_recent_column for each metric
-            for metric in metric_list:
-                result[metric] = get_most_recent_column(df, metric, data_period_setting)
-            return result
-
-        # Parse Period Ended columns once for all metrics
-        pe_data = parse_period_ended_cols(df)
-        if not pe_data:
-            # No period data - fall back to base columns
-            for metric in metric_list:
-                if metric in df.columns:
-                    result[metric] = pd.to_numeric(df[metric], errors='coerce')
-                else:
-                    result[metric] = pd.Series(np.nan, index=df.index)
-            return result
-
-        # Build FY suffix list (annual-only)
-        fy_suffixes, _ = period_cols_by_kind(pe_data, df)
-        candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data[:5]]  # First 5 as fallback
-
-        # For each metric, extract most recent annual value (vectorized)
-        for metric in metric_list:
-            # Collect (date, value) pairs for this metric across all FY suffixes
-            metric_data = []
-            for sfx in candidate_suffixes:
-                col = f"{metric}{sfx}" if sfx else metric
-                if col not in df.columns:
-                    continue
-
-                date_series = dict(pe_data).get(sfx)
-                if date_series is None:
-                    continue
-
-                # Build chunk for this suffix
-                chunk = pd.DataFrame({
-                    'row_idx': df.index,
-                    'date': pd.to_datetime(date_series.values, errors='coerce'),
-                    'value': pd.to_numeric(df[col], errors='coerce')
-                })
-                metric_data.append(chunk)
-
-            if not metric_data:
-                result[metric] = pd.Series(np.nan, index=df.index)
-                continue
-
-            # Concatenate and filter
-            long_df = pd.concat(metric_data, ignore_index=True)
-            long_df = long_df[long_df['date'].notna() & long_df['value'].notna()]
-            long_df = long_df[long_df['date'].dt.year != 1900]
-
-            # Get most recent (latest date) value per issuer
-            long_df = long_df.sort_values(['row_idx', 'date'])
-            most_recent = long_df.groupby('row_idx').last()['value']
-
-            # Reindex to match original df
-            result[metric] = most_recent.reindex(df.index, fill_value=np.nan)
-
-        return result
 
     def calculate_quality_scores(df, data_period_setting, has_period_alignment):
         scores = pd.DataFrame(index=df.index)
