@@ -6805,6 +6805,9 @@ if os.environ.get("RG_TESTS") != "1":
 
                     # LEFT COLUMN: 3 Vertical Radar Charts
                     with col_left:
+                        st.markdown("### Factor Loadings")
+                        st.caption("Each radar chart shows how the 6 credit factors contribute to each principal component")
+
                         colors = ['#2C5697', '#E74C3C', '#27AE60']
 
                         for i in range(n_components_to_show):
