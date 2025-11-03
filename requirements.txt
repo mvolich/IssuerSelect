@@ -6,3 +6,4 @@ scikit-learn
 python-dateutil
 openai
 openpyxl
+matplotlib
