@@ -3178,144 +3178,75 @@ def latest_periods(cal: pd.DataFrame, max_k_fy=4, max_k_cq=7) -> pd.DataFrame:
            .reset_index())
     return piv
 
-def get_metric_series_row(row: pd.Series, base: str, prefer="FY") -> pd.Series:
-    """
-    [DEPRECATED - Use _metric_series_for_row() for alias-aware resolution]
-
-    Extract time series for a metric from a single issuer row.
-
-    WARNING: This function does NOT use alias-aware column resolution (METRIC_ALIASES).
-    It only works with exact column names. For robust metric extraction that handles
-    variations like "EBITDA Margin" vs "EBITDA margin %" vs "EBITDA Margin (%)",
-    use _metric_series_for_row() from PATCH 1 instead.
-
-    Primary method: Uses parsed Period Ended dates and period_cols_by_kind() classifier
-                   to detect FY vs CQ based on date frequency analysis (at the DataFrame level).
-    Fallback method: When working with a single row (no frequency analysis possible),
-                    treats first 5 suffixes as FY and remainder as CQ (documented fallback).
-
-    Args:
-        row: Single row from DataFrame
-        base: Base metric name (e.g., "EBITDA Margin", "Net Debt / EBITDA")
-        prefer: "FY" for annual only, "CQ" for quarterly only, "ALL" for both
-
-    Returns:
-        Series indexed by actual period-end dates (ISO format strings), values are metric data
-
-    Note: This function operates on a single row, so it uses the fallback classification
-          method. For DataFrame-level operations, _latest_period_dates() uses the primary
-          classifier when available.
-    """
-    pe_cols = [c for c in row.index if c.startswith("Period Ended")]
-    pe_cols = sorted(pe_cols, key=lambda c: int(c.split(".")[1]) if "." in c and c.split(".")[1].isdigit() else 0)
-
-    # [V2.0] Row-based FY/CQ classification using documented fallback:
-    # First 5 periods treated as FY, remainder as CQ
-    # (Frequency-based classification requires full DataFrame context, unavailable here)
-    fy_cols = pe_cols[:min(5, len(pe_cols))]
-    cq_cols = pe_cols[5:] if len(pe_cols) > 5 else []
-
-    # Choose columns based on preference
-    if prefer == "FY":
-        chosen = fy_cols
-    elif prefer == "CQ":
-        chosen = cq_cols
-    else:  # "ALL"
-        chosen = pe_cols
-
-    # Get period dates
-    dates = row[chosen]
-    dates_series = pd.to_datetime(dates, errors="coerce")
-
-    # Map to metric columns (same suffix pattern)
-    all_metric_cols = [base + (c[len("Period Ended"):] or "") for c in chosen]
-
-    # Track which indices have available metric columns
-    metric_available = [c in row.index for c in all_metric_cols]
-    available_indices = [i for i, avail in enumerate(metric_available) if avail]
-    metric_cols = [all_metric_cols[i] for i in available_indices]
-
-    if len(metric_cols) == 0:
-        return pd.Series(dtype=float)  # No data available
-
-    # Extract numeric values for available metrics
-    s = pd.to_numeric(row[metric_cols], errors="coerce")
-
-    # Get corresponding dates (only for available metrics)
-    dates_for_metrics = dates_series.iloc[available_indices]
-
-    # Filter out entries where period date is NaT
-    valid_mask = ~dates_for_metrics.isna().values
-    s_values = s.values[valid_mask]
-    dates_values = dates_for_metrics.values[valid_mask]
-
-    # Create filtered series
-    s_filtered = pd.Series(s_values)
-
-    # Index by actual period-end dates for display/export
-    if len(dates_values) > 0:
-        # Convert datetime objects to ISO date strings
-        try:
-            idx = pd.to_datetime(dates_values).strftime("%Y-%m-%d")
-        except:
-            idx = pd.Series(dates_values).astype(str)
-        s_filtered.index = idx
-
-    return s_filtered.dropna()
-
-def most_recent_annual_value(row: pd.Series, base: str):
-    """
-    [DEPRECATED - Uses non-alias-aware get_metric_series_row()]
-
-    Get the most recent annual (FY) value for a metric.
-    Returns np.nan if no data available.
-
-    WARNING: This function uses get_metric_series_row() which does NOT handle
-    metric aliases. For robust extraction, use _metric_series_for_row() with
-    the full DataFrame instead.
-    """
-    s = get_metric_series_row(row, base, prefer="FY")
-    return s.iloc[-1] if len(s) > 0 else np.nan
-
 # ============================================================================
-# CASH FLOW HELPERS (v2 - OCF + UFCF components)
+# CASH FLOW HELPERS (v3 - DataFrame-level with alias-aware batch extraction)
 # ============================================================================
 
-def _mrav(row: pd.Series, names: list) -> float:
-    """Most-recent annual value using any of the provided base names."""
-    for n in names:
-        v = most_recent_annual_value(row, n)
-        if pd.notna(v):
-            return v
-    return np.nan
+def _cf_components_dataframe(df: pd.DataFrame, data_period_setting: str, has_period_alignment: bool) -> pd.DataFrame:
+    """Extract cash flow components using alias-aware batch extraction."""
 
-def _cf_components_row(row: pd.Series) -> dict:
-    """Return cash-flow components for one issuer (annual values). Capex is NEGATIVE (outflow) in input."""
-    ocf   = _mrav(row, ["Cash from Ops.", "Cash from Operations", "Operating Cash Flow", "Cash from Ops", "Net Cash Provided by Operating Activities"])
-    capex = _mrav(row, ["Capital Expenditure", "Capital Expenditures", "CAPEX"])
-    rev   = _mrav(row, ["Total Revenues", "Total Revenue", "Revenue"])
-    debt  = _mrav(row, ["Total Debt"])
-    lfcf  = _mrav(row, ["Levered Free Cash Flow", "Free Cash Flow"])
+    cash_flow_metrics = [
+        'Cash from Ops.',
+        'Cash from Operations',
+        'Operating Cash Flow',
+        'Cash from Ops',
+        'Capital Expenditure',
+        'Capital Expenditures',
+        'CAPEX',
+        'Total Revenues',
+        'Total Revenue',
+        'Revenue',
+        'Total Debt',
+        'Levered Free Cash Flow',
+        'Free Cash Flow'
+    ]
 
-    if pd.isna(ocf) or pd.isna(capex):
-        ufcf = np.nan
-    else:
-        # Capex negative → UFCF = OCF + Capex (e.g., 100 + (-30) = 70)
-        ufcf = ocf + capex
+    metrics = _batch_extract_metrics(df, cash_flow_metrics, has_period_alignment, data_period_setting)
 
-    return {"OCF": ocf, "Capex": capex, "UFCF": ufcf, "Revenue": rev, "Debt": debt, "LFCF": lfcf}
+    # Map to standardized names
+    ocf = metrics.get('Cash from Ops.', metrics.get('Cash from Operations',
+          metrics.get('Operating Cash Flow', metrics.get('Cash from Ops', pd.Series(np.nan, index=df.index)))))
 
-def _safe_div(a, b):
-    return np.nan if pd.isna(a) or pd.isna(b) or b == 0 else a / b
+    capex = metrics.get('Capital Expenditure', metrics.get('Capital Expenditures',
+            metrics.get('CAPEX', pd.Series(np.nan, index=df.index))))
 
-def _cf_raw_series(row: pd.Series) -> dict:
-    v = _cf_components_row(row)
-    return {
-        "OCF_to_Revenue": _safe_div(v["OCF"],  v["Revenue"]),
-        "OCF_to_Debt":    _safe_div(v["OCF"],  v["Debt"]),
-        "UFCF_margin":    _safe_div(v["UFCF"], v["Revenue"]),
-        "LFCF_margin":    _safe_div(v["LFCF"], v["Revenue"]),
-    }
+    rev = metrics.get('Total Revenues', metrics.get('Total Revenue',
+          metrics.get('Revenue', pd.Series(np.nan, index=df.index))))
+
+    debt = metrics.get('Total Debt', pd.Series(np.nan, index=df.index))
+
+    lfcf = metrics.get('Levered Free Cash Flow', metrics.get('Free Cash Flow',
+           pd.Series(np.nan, index=df.index)))
+
+    # Calculate UFCF vectorized
+    ufcf = pd.Series(np.nan, index=df.index)
+    valid_mask = ocf.notna() & capex.notna()
+    ufcf[valid_mask] = ocf[valid_mask] + capex[valid_mask]
+
+    return pd.DataFrame({
+        'OCF': ocf,
+        'Capex': capex,
+        'UFCF': ufcf,
+        'Revenue': rev,
+        'Debt': debt,
+        'LFCF': lfcf
+    })
+
+def _cf_raw_dataframe(cf_components: pd.DataFrame) -> pd.DataFrame:
+    """Calculate cash flow ratios from components DataFrame (vectorized)."""
+
+    def _safe_div_vectorized(a: pd.Series, b: pd.Series) -> pd.Series:
+        result = pd.Series(np.nan, index=a.index)
+        valid_mask = a.notna() & b.notna() & (b != 0)
+        result[valid_mask] = a[valid_mask] / b[valid_mask]
+        return result
+
+    return pd.DataFrame({
+        'OCF_to_Revenue': _safe_div_vectorized(cf_components['OCF'], cf_components['Revenue']),
+        'OCF_to_Debt': _safe_div_vectorized(cf_components['OCF'], cf_components['Debt']),
+        'UFCF_margin': _safe_div_vectorized(cf_components['UFCF'], cf_components['Revenue']),
+        'LFCF_margin': _safe_div_vectorized(cf_components['LFCF'], cf_components['Revenue'])
+    })
 
 # Conservative global clip windows (simple, deterministic)
 _CF_CLIPS = {
@@ -3338,11 +3269,16 @@ def _scale_0_100(s: pd.Series) -> pd.Series:
     z = (s - mn) / (mx - mn)
     return z * 100.0
 
-def _cash_flow_component_scores(df: pd.DataFrame) -> pd.DataFrame:
-    raw = df.apply(_cf_raw_series, axis=1, result_type="expand")
+def _cash_flow_component_scores(df: pd.DataFrame, data_period_setting: str, has_period_alignment: bool) -> pd.DataFrame:
+    """Calculate cash flow component scores using alias-aware extraction."""
+
+    components = _cf_components_dataframe(df, data_period_setting, has_period_alignment)
+    raw = _cf_raw_dataframe(components)
+
     for k, (lo, hi) in _CF_CLIPS.items():
         if k in raw.columns:
             raw[k] = _clip_series(raw[k], lo, hi)
+
     out = pd.DataFrame({f"{k}_Score": _scale_0_100(raw[k]) for k in raw.columns if k in raw})
     return out
 
@@ -6030,10 +5966,10 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
 
         scores['growth_score'] = rev_3y_score * 0.4 + rev_1y_score * 0.3 + ebitda_3y_score * 0.3
 
-        # Cash Flow ([v2 - OCF + UFCF components] Annual-only)
+        # Cash Flow ([v3 - DataFrame-level with alias-aware batch extraction] Annual-only)
         # Compute 4 equal-weighted components: OCF/Revenue, OCF/Debt, UFCF margin, LFCF margin
         # Each clipped globally then min-max scaled to 0-100; average available components
-        _cf_comp = _cash_flow_component_scores(df)
+        _cf_comp = _cash_flow_component_scores(df, data_period_setting, has_period_alignment)
         _cf_cols = [c for c in ["OCF_to_Revenue_Score", "OCF_to_Debt_Score",
                                  "UFCF_margin_Score", "LFCF_margin_Score"] if c in _cf_comp.columns]
 
