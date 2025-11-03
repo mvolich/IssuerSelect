@@ -6895,7 +6895,7 @@ if os.environ.get("RG_TESTS") != "1":
                                 marker=dict(
                                     size=4,
                                     color=colors_3d,
-                                    colorscale='RdYlGn' if 'Rating_Band' not in results_final.columns else None,
+                                    colorscale='RdYlGn_r' if 'Rating_Band' not in results_final.columns else None,
                                     showscale='Rating_Band' not in results_final.columns,
                                     colorbar=dict(title="Composite<br>Score") if 'Rating_Band' not in results_final.columns else None,
                                     line=dict(width=0.5, color='white')
