@@ -6826,13 +6826,13 @@ if os.environ.get("RG_TESTS") != "1":
                             )
 
                             fig_radar_single.update_layout(
-                                height=350,
+                                height=340,
                                 showlegend=False,
                                 title=dict(
                                     text=f'<b>PC{i+1}: {pc_names[i]}</b><br>({var_exp[i]:.1f}% variance)',
                                     x=0.5,
                                     xanchor='center',
-                                    font=dict(size=13, color='#2C5697')
+                                    font=dict(size=12, color='#2C5697')
                                 ),
                                 polar=dict(
                                     radialaxis=dict(
@@ -6849,7 +6849,7 @@ if os.environ.get("RG_TESTS") != "1":
                                 ),
                                 paper_bgcolor='white',
                                 plot_bgcolor='white',
-                                margin=dict(t=60, b=20, l=20, r=20)
+                                margin=dict(t=50, b=20, l=20, r=20)
                             )
 
                             st.plotly_chart(fig_radar_single, use_container_width=True)
