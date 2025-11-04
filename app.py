@@ -6506,70 +6506,43 @@ if os.environ.get("RG_TESTS") != "1":
                     ]
                     bottom10.columns = ['Rank', 'Company', 'Rating', 'Classification', 'Score', 'Rec']
                     st.dataframe(bottom10, use_container_width=True, hide_index=True)
-                
-                # Score distribution
-                st.subheader("Score Distribution by Rating Group")
-                
-                fig = go.Figure()
-                for group in ['Investment Grade', 'High Yield']:
-                    group_data = results_final[results_final['Rating_Group'] == group]['Composite_Score']
-                    fig.add_trace(go.Histogram(
-                        x=group_data,
-                        name=group,
-                        opacity=0.7,
-                        nbinsx=20
-                    ))
-                
-                fig.update_layout(
-                    barmode='overlay',
-                    xaxis_title='Composite Score',
-                    yaxis_title='Count',
-                    title='Composite Score Distribution',
-                    height=400
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Classification comparison
-                st.subheader("Average Scores by Classification")
-                classification_avg = results_final.groupby('Rubrics_Custom_Classification').agg({
-                    'Composite_Score': 'mean',
-                    'Company_Name': 'count'
-                }).reset_index()
-                classification_avg.columns = ['Classification', 'Avg Score', 'Count']
-                classification_avg = classification_avg.sort_values('Avg Score', ascending=False)
-                
-                fig2 = go.Figure(data=[
-                    go.Bar(
-                        x=classification_avg['Classification'],
-                        y=classification_avg['Avg Score'],
-                        text=classification_avg['Avg Score'].round(1),
-                        textposition='outside',
-                        marker_color='#2C5697'
-                    )
-                ])
-                fig2.update_layout(
-                    xaxis_title='Classification',
-                    yaxis_title='Average Composite Score',
-                    title='Classification Performance Comparison',
-                    height=400,
-                    showlegend=False
-                )
-                st.plotly_chart(fig2, use_container_width=True)
-                
+
                 # Four Quadrant Analysis
                 st.subheader("Four Quadrant Analysis: Quality vs. Momentum")
 
+                # Rating group filter
+                rating_filter = st.selectbox(
+                    "Filter by Rating Group",
+                    options=["All Issuers (IG + HY)", "Investment Grade Only", "High Yield Only"],
+                    index=0,
+                    key="quadrant_rating_filter"
+                )
+
+                # Apply filter
+                if rating_filter == "Investment Grade Only":
+                    results_filtered = results_final[results_final['Rating_Group'] == 'Investment Grade'].copy()
+                    filter_label = " - Investment Grade"
+                elif rating_filter == "High Yield Only":
+                    results_filtered = results_final[results_final['Rating_Group'] == 'High Yield'].copy()
+                    filter_label = " - High Yield"
+                else:
+                    results_filtered = results_final.copy()
+                    filter_label = ""
+
+                # Show count caption
+                st.caption(f"Displaying {len(results_filtered):,} issuers")
+
                 # Ensure numeric dtypes for axes
-                results_final['Composite_Percentile_in_Band'] = pd.to_numeric(results_final['Composite_Percentile_in_Band'], errors='coerce')
-                results_final['Composite_Percentile_Global'] = pd.to_numeric(results_final.get('Composite_Percentile_Global', results_final['Composite_Percentile_in_Band']), errors='coerce')
+                results_filtered['Composite_Percentile_in_Band'] = pd.to_numeric(results_filtered['Composite_Percentile_in_Band'], errors='coerce')
+                results_filtered['Composite_Percentile_Global'] = pd.to_numeric(results_filtered.get('Composite_Percentile_Global', results_filtered['Composite_Percentile_in_Band']), errors='coerce')
                 # Composite_Score already numeric from calculation - no conversion needed
-                results_final['Cycle_Position_Score'] = pd.to_numeric(results_final['Cycle_Position_Score'], errors='coerce')
+                results_filtered['Cycle_Position_Score'] = pd.to_numeric(results_filtered['Cycle_Position_Score'], errors='coerce')
 
                 # Use unified quality/trend split for visualization
                 quality_metric_plot, x_split_for_plot, x_axis_label, x_vals = resolve_quality_metric_and_split(
-                    results_final, split_basis, split_threshold
+                    results_filtered, split_basis, split_threshold
                 )
-                y_vals = results_final["Cycle_Position_Score"]
+                y_vals = results_filtered["Cycle_Position_Score"]
                 y_split = float(trend_threshold)
 
                 # Create color mapping for quadrants
@@ -6591,7 +6564,7 @@ if os.environ.get("RG_TESTS") != "1":
 
                 # Create scatter plot using unified quality metric
                 fig_quadrant = px.scatter(
-                    results_final,
+                    results_filtered,
                     x=x_col,
                     y="Cycle_Position_Score",
                     color="Combined_Signal",
@@ -6603,7 +6576,7 @@ if os.environ.get("RG_TESTS") != "1":
                         "Cycle_Position_Score": ":.1f",
                         "Combined_Signal": False
                     },
-                    title='Credit Quality vs. Trend Momentum',
+                    title=f'Credit Quality vs. Trend Momentum{filter_label}',
                     labels={
                         x_col: x_axis_label,
                         "Cycle_Position_Score": "Improving ← Trend → Deteriorating"
@@ -6619,8 +6592,8 @@ if os.environ.get("RG_TESTS") != "1":
                 y_lower = y_split * 0.5  # midpoint of lower half
 
                 # Calculate x positions based on actual axis range and split
-                x_max = float(results_final[x_col].max())
-                x_min = float(results_final[x_col].min())
+                x_max = float(results_filtered[x_col].max())
+                x_min = float(results_filtered[x_col].min())
                 x_upper = x_split_for_plot + (x_max - x_split_for_plot) * 0.5  # midpoint of upper half
                 x_lower = x_min + (x_split_for_plot - x_min) * 0.5  # midpoint of lower half
 
@@ -6656,8 +6629,8 @@ if os.environ.get("RG_TESTS") != "1":
                 st.subheader("Quadrant Distribution")
                 col1, col2, col3, col4 = st.columns(4)
 
-                quadrant_counts = results_final['Combined_Signal'].value_counts()
-                total = len(results_final)
+                quadrant_counts = results_filtered['Combined_Signal'].value_counts()
+                total = len(results_filtered)
 
                 with col1:
                     count = quadrant_counts.get("Strong & Improving", 0)
@@ -6674,25 +6647,12 @@ if os.environ.get("RG_TESTS") != "1":
                 with col4:
                     count = quadrant_counts.get("Weak & Deteriorating", 0)
                     st.metric("Weak & Deteriorating", f"{count}", f"{count/total*100:.1f}%")
-        
-                # ========================================================================
-                # DUAL ISSUER POSITIONING MAPS
-                # ========================================================================
-
-                # Compute derived axes for positioning maps
-                results_final["Overall_Credit_Quality"] = results_final["Composite_Score"]
-                results_final["Financial_Strength_vs_Leverage_Balance"] = (
-                    results_final["Credit_Score"] - results_final["Leverage_Score"]
-                )
-
-                # Render dual maps (IG + HY)
-                render_dual_issuer_maps(results_final, 'Company_ID', 'Company_Name')
 
                 # ========================================================================
-                # PCA FACTOR LOADINGS ANALYSIS
+                # PRINCIPAL COMPONENT ANALYSIS
                 # ========================================================================
                 st.markdown("---")
-                st.subheader("PCA Factor Loadings Analysis")
+                st.subheader("Principal Component Analysis")
 
                 st.markdown("""
                 **Principal Component Analysis** reveals the underlying structure of the 6 credit factors
@@ -7137,8 +7097,63 @@ if os.environ.get("RG_TESTS") != "1":
                         st.caption("This may occur with insufficient data or if factor scores are missing.")
 
                 # ========================================================================
+                # SCORE DISTRIBUTION AND CLASSIFICATION ANALYSIS
+                # ========================================================================
+                st.markdown("---")
+
+                # Score distribution
+                st.subheader("Score Distribution by Rating Group")
+
+                fig = go.Figure()
+                for group in ['Investment Grade', 'High Yield']:
+                    group_data = results_final[results_final['Rating_Group'] == group]['Composite_Score']
+                    fig.add_trace(go.Histogram(
+                        x=group_data,
+                        name=group,
+                        opacity=0.7,
+                        nbinsx=20
+                    ))
+
+                fig.update_layout(
+                    barmode='overlay',
+                    xaxis_title='Composite Score',
+                    yaxis_title='Count',
+                    title='Composite Score Distribution',
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Classification comparison
+                st.subheader("Average Scores by Classification")
+                classification_avg = results_final.groupby('Rubrics_Custom_Classification').agg({
+                    'Composite_Score': 'mean',
+                    'Company_Name': 'count'
+                }).reset_index()
+                classification_avg.columns = ['Classification', 'Avg Score', 'Count']
+                classification_avg = classification_avg.sort_values('Avg Score', ascending=False)
+
+                fig2 = go.Figure(data=[
+                    go.Bar(
+                        x=classification_avg['Classification'],
+                        y=classification_avg['Avg Score'],
+                        text=classification_avg['Avg Score'].round(1),
+                        textposition='outside',
+                        marker_color='#2C5697'
+                    )
+                ])
+                fig2.update_layout(
+                    xaxis_title='Classification',
+                    yaxis_title='Average Composite Score',
+                    title='Classification Performance Comparison',
+                    height=400,
+                    showlegend=False
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+
+                # ========================================================================
                 # RATING-BAND LEADERBOARDS (V2.0)
                 # ========================================================================
+                st.markdown("---")
                 st.subheader("Rating-Band Leaderboards")
         
                 left, mid, right = st.columns([2, 1, 1])
