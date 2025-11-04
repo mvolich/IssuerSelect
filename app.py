@@ -26,10 +26,10 @@ except Exception:  # SDK not installed in some envs
     OpenAI = None
     _OPENAI_AVAILABLE = False
 
-# [V2.0] Only configure Streamlit if not running tests
+# [V2.1] Only configure Streamlit if not running tests
 if os.environ.get("RG_TESTS") != "1":
     st.set_page_config(
-        page_title="Issuer Credit Screening Model V2.0",
+        page_title="Issuer Credit Screening Model V2.1",
         layout="wide",
         page_icon="https://rubricsam.com/wp-content/uploads/2021/01/cropped-rubrics-logo-tight.png",
     )
@@ -49,7 +49,7 @@ def render_header(results_final=None, data_period=None, use_sector_adjusted=Fals
     st.markdown("""
     <div class="rb-header">
       <div class="rb-title">
-        <h1>Issuer Credit Screening Model V2.0</h1>
+        <h1>Issuer Credit Screening Model V2.1</h1>
         <div class="rb-sub">6-Factor Composite Scoring with Sector Adjustment & Trend Analysis</div>
       </div>
       <div class="rb-logo">
@@ -88,7 +88,7 @@ def render_header(results_final=None, data_period=None, use_sector_adjusted=Fals
         st.markdown("---")
 
 # ============================================================================
-# [V2.0] MINIMAL IDENTIFIERS + FEATURE GATES
+# [V2.1] MINIMAL IDENTIFIERS + FEATURE GATES
 # ============================================================================
 
 RATING_ALIASES = [
@@ -313,7 +313,7 @@ def feature_available(name, df):
     return True
 
 # ============================================================================
-# [V2.0] PLOT/BRAND HELPERS
+# [V2.1] PLOT/BRAND HELPERS
 # ============================================================================
 
 def apply_rubrics_plot_theme(fig):
@@ -330,7 +330,7 @@ def apply_rubrics_plot_theme(fig):
     return fig
 
 # ============================================================================
-# [V2.0] PCA VISUALIZATION (IG/HY COHORT CLUSTERING)
+# [V2.1] PCA VISUALIZATION (IG/HY COHORT CLUSTERING)
 # ============================================================================
 
 def _factor_score_columns(results: pd.DataFrame) -> list:
@@ -521,7 +521,7 @@ def render_dual_issuer_maps(results: pd.DataFrame, id_col: str, name_col: str):
     st.plotly_chart(hy_fig, use_container_width=True)
 
 # ============================================================================
-# [V2.0] RATING-BAND UTILITIES (LEADERBOARDS)
+# [V2.1] RATING-BAND UTILITIES (LEADERBOARDS)
 # ============================================================================
 
 RATING_BAND_ORDER = [
@@ -624,7 +624,7 @@ def generate_sparkline_html(values: list, width: int = 100, height: int = 20) ->
     return svg
 
 # ============================================================================
-# DIAGNOSTICS & DATA HEALTH (V2.0)
+# DIAGNOSTICS & DATA HEALTH (V2.1)
 # ============================================================================
 
 def _pct(n, d):
@@ -2860,7 +2860,7 @@ Write a skeptical, concise issuer credit note (200–300 words). Anchor every cl
         st.code(traceback.format_exc())
 
 # ============================================================================
-# [V2.0] URL STATE & PRESETS
+# [V2.1] URL STATE & PRESETS
 # ============================================================================
 
 URL_STATE_KEYS = [
@@ -2928,7 +2928,7 @@ def _build_deep_link(state: dict) -> str:
     return "?" + urlencode(qp)
 
 # ============================================================================
-# [V2.0] PERIOD ENDED PARSING (ACTUAL DATES)
+# [V2.1] PERIOD ENDED PARSING (ACTUAL DATES)
 # ============================================================================
 
 def parse_period_ended_cols(df: pd.DataFrame) -> list:
@@ -3025,7 +3025,7 @@ def period_cols_by_kind(pe_data, df):
     return fy_suffixes, cq_suffixes
 
 # ============================================================================
-# [V2.0] PERIOD CALENDAR UTILITIES (ROBUST HANDLING OF VENDOR DATES & FY/CQ OVERLAP)
+# [V2.1] PERIOD CALENDAR UTILITIES (ROBUST HANDLING OF VENDOR DATES & FY/CQ OVERLAP)
 # ============================================================================
 
 _EXCEL_EPOCH = pd.Timestamp("1899-12-30")  # Excel serial origin
@@ -3369,7 +3369,7 @@ def _audit_count(stage_name: str, df: pd.DataFrame, audits: list):
     audits.append((stage_name, len(df)))
 
 # ============================================================================
-# FRESHNESS HELPERS (V2.0)
+# FRESHNESS HELPERS (V2.1)
 # ============================================================================
 
 def _latest_valid_period_date_for_row(row: pd.Series, pe_cols: list) -> pd.Timestamp:
@@ -3419,7 +3419,7 @@ def _freshness_flag(days: float) -> str:
     return "Red"
 
 # ============================================================================
-# PERIOD LABELING & FY/CQ CLASSIFICATION (V2.0)
+# PERIOD LABELING & FY/CQ CLASSIFICATION (V2.1)
 # ============================================================================
 
 def _latest_period_dates(df: pd.DataFrame):
@@ -3724,7 +3724,7 @@ def get_classification_weights(classification, use_sector_adjusted=True):
     return SECTOR_WEIGHTS['Default']
 
 # ================================
-# EXPLAINABILITY HELPERS (V2.0) — canonical
+# EXPLAINABILITY HELPERS (V2.1) — canonical
 # ================================
 
 def _resolve_text_field(row: pd.Series, candidates):
@@ -3921,7 +3921,7 @@ def render_methodology_tab(df_original: pd.DataFrame, results_final: pd.DataFram
         df_original: Original uploaded DataFrame
         results_final: Final results DataFrame with scores and signals
     """
-    st.markdown("# Model Methodology (V2.0)")
+    st.markdown("# Model Methodology (V2.1)")
     st.markdown("*Programmatically Generated Specification — All values reflect current configuration*")
     st.markdown("---")
 
@@ -4080,7 +4080,7 @@ where all weights sum to 1.0
         """)
 
         st.markdown("""
-        **Period Calendar (V2.0):**
+        **Period Calendar (V2.1):**
         - Sentinel dates (e.g., `0/01/1900`) are removed
         - FY/CQ overlaps within ±10 days are resolved (preference per trend window mode)
         - Multi-index vendor headers supported
@@ -4124,7 +4124,7 @@ ELSE:
     """, language="text")
 
     st.markdown("""
-    **Context-aware refinements (V2.0):**
+    **Context-aware refinements (V2.1):**
     Strong states may be further classified as **Moderating** (high volatility plateau) or **Normalizing** (peak stabilisation with medium-term improving trend) based on dual-horizon analysis and exceptional quality flags. Weak states remain Improving or Deteriorating.
 
     """)
@@ -4294,7 +4294,7 @@ ELSE:
     st.markdown("## 10. Export Methodology")
 
     # Build markdown export
-    export_md = f"""# Issuer Credit Screening Model - Methodology Specification (V2.0)
+    export_md = f"""# Issuer Credit Screening Model - Methodology Specification (V2.1)
 
 *Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}*
 
@@ -4654,7 +4654,7 @@ trend_threshold = st.sidebar.slider(
 )
 
 # ============================================================================
-# [V2.0] ADVANCED: DUAL-HORIZON CONTEXT THRESHOLDS
+# [V2.1] ADVANCED: DUAL-HORIZON CONTEXT THRESHOLDS
 # ============================================================================
 with st.sidebar.expander("⚙️ Advanced: Dual-Horizon Context", expanded=False):
     st.markdown("""
@@ -4788,7 +4788,7 @@ if not HAS_DATA:
 
 def get_most_recent_column(df, base_metric, data_period_setting):
     """
-    [V2.0] Returns the appropriate metric column based on parsed Period Ended dates.
+    [V2.1] Returns the appropriate metric column based on parsed Period Ended dates.
 
     Instead of assuming .4 = FY0 and .12 = CQ-0, this function:
     1. Parses Period Ended columns to get actual dates
@@ -4979,7 +4979,7 @@ def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: 
     return wide_df
 
 # ============================================================================
-# DUAL-HORIZON TREND ANALYSIS UTILITIES (V2.0)
+# DUAL-HORIZON TREND ANALYSIS UTILITIES (V2.1)
 # ============================================================================
 
 def robust_slope(xs: np.ndarray, ys: np.ndarray) -> float:
@@ -5598,7 +5598,7 @@ def _dq_checks(df, staleness_days=365):
 def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjusted, use_quarterly_beta=False,
                           split_basis="Percentile within Band (recommended)", split_threshold=60, trend_threshold=55,
                           volatility_cv_threshold=0.30, outlier_z_threshold=-2.5, damping_factor=0.5, near_peak_tolerance=0.10):
-    """Load data and calculate issuer scores with V2.0 enhancements and V2.0 dual-horizon context"""
+    """Load data and calculate issuer scores with V2.1 enhancements and V2.1 dual-horizon context"""
 
     # ===== TIMING DIAGNOSTICS =====
     _start_time = time.time()
@@ -5639,11 +5639,11 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     _log_timing("01_File_Loaded")
     _audit_count("Raw input", df, audits)
 
-    # [V2.0] TIERED VALIDATION - minimal identifiers with flexible column matching
+    # [V2.1] TIERED VALIDATION - minimal identifiers with flexible column matching
     missing, RATING_COL, COMPANY_ID_COL, COMPANY_NAME_COL = validate_core(df)
     if missing:
         st.error(f"ERROR: Missing required identifiers:\n\n" + "\n".join([f"  • {m}" for m in missing]) +
-                 f"\n\nV2.0 requires only: Company Name, Company ID, and S&P Credit Rating\n(or their common aliases)")
+                 f"\n\nV2.1 requires only: Company Name, Company ID, and S&P Credit Rating\n(or their common aliases)")
         st.stop()
 
     # Canonicalize to standard names for stable downstream code
@@ -5695,12 +5695,12 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
 
     _audit_count("Core IDs/Names/Ratings present", df, audits)
 
-    # [V2.0] Check feature availability (classification, country/region, period alignment)
+    # [V2.1] Check feature availability (classification, country/region, period alignment)
     has_classification = feature_available("classification", df)
     has_country_region = feature_available("country_region", df)
     has_period_alignment = feature_available("period_alignment", df)
 
-    # [V2.0] Parse Period Ended columns if available
+    # [V2.1] Parse Period Ended columns if available
     if has_period_alignment:
         pe_cols = parse_period_ended_cols(df)
         if os.environ.get("RG_TESTS") == "1":
@@ -5708,7 +5708,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     else:
         pe_cols = []
 
-    # [V2.0] Build period calendar with FY/CQ overlap resolution
+    # [V2.1] Build period calendar with FY/CQ overlap resolution
     period_calendar = None
     if has_period_alignment:
         try:
@@ -5753,7 +5753,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     _log_timing("03_Trend_Indicators_Complete")
 
     # ========================================================================
-    # [V2.0] DUAL-HORIZON TREND & CONTEXT FLAGS
+    # [V2.1] DUAL-HORIZON TREND & CONTEXT FLAGS
     # ========================================================================
 
     # Compute dual-horizon metrics for Composite Score (using time series)
@@ -5788,7 +5788,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     _log_timing("03b_Dual_Horizon_Complete")
 
     # ========================================================================
-    # CALCULATE QUALITY SCORES ([V2.0] ANNUAL-ONLY DEFAULT)
+    # CALCULATE QUALITY SCORES ([V2.1] ANNUAL-ONLY DEFAULT)
     # ========================================================================
 
     def calculate_quality_scores(df, data_period_setting, has_period_alignment):
@@ -5936,7 +5936,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
 
         scores['leverage_score'] = pd.Series(leverage_scores, index=df.index)
 
-        # Profitability ([V2.0] Annual-only)
+        # Profitability ([V2.1] Annual-only)
         roe = _pct_to_100(metrics['Return on Equity'])
         ebitda_margin = _pct_to_100(metrics['EBITDA Margin'])
         roa = _pct_to_100(metrics['Return on Assets'])
@@ -5950,7 +5950,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         scores['profitability_score'] = (roe_score * 0.3 + margin_score * 0.3 +
                                          roa_score * 0.2 + ebit_score * 0.2)
 
-        # Liquidity ([V2.0] Annual-only)
+        # Liquidity ([V2.1] Annual-only)
         current_ratio = metrics['Current Ratio (x)'].clip(lower=0)
         quick_ratio = metrics['Quick Ratio (x)'].clip(lower=0)
 
@@ -5959,7 +5959,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
 
         scores['liquidity_score'] = current_score * 0.6 + quick_score * 0.4
 
-        # Growth ([V2.0] Annual-only)
+        # Growth ([V2.1] Annual-only)
         rev_growth_1y = _pct_to_100(metrics['Total Revenues, 1 Year Growth'])
         rev_cagr_3y = _pct_to_100(metrics['Total Revenues, 3 Yr. CAGR'])
         ebitda_cagr_3y = _pct_to_100(metrics['EBITDA, 3 Years CAGR'])
@@ -6002,7 +6002,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     df['_Credit_Rating_Clean'] = df[RATING_COL].map(_clean_rating_outer)
     
     # ========================================================================
-    # CALCULATE COMPOSITE SCORE ([V2.0] FEATURE-GATED CLASSIFICATION WEIGHTS)
+    # CALCULATE COMPOSITE SCORE ([V2.1] FEATURE-GATED CLASSIFICATION WEIGHTS)
     # ========================================================================
 
     qs = quality_scores.copy()
@@ -6022,7 +6022,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         if col in qs.columns:
             qs[col] = qs[col].fillna(default_val)
 
-    # [V2.0] Calculate composite score - use classification weights only if available
+    # [V2.1] Calculate composite score - use classification weights only if available
     # OPTIMIZED: Vectorized calculation instead of iterrows()
     
     if has_classification and use_sector_adjusted:
@@ -6058,11 +6058,11 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     _log_timing("05_Composite_Score_Complete")
 
     # ========================================================================
-    # CREATE RESULTS DATAFRAME ([V2.0] WITH OPTIONAL COLUMNS)
+    # CREATE RESULTS DATAFRAME ([V2.1] WITH OPTIONAL COLUMNS)
     # ========================================================================
 
     # Start with core identifiers (always required)
-    # [V2.0] Use resolved/canonical column names (not hard-coded strings)
+    # [V2.1] Use resolved/canonical column names (not hard-coded strings)
     # Enforce Company_ID as string to preserve leading zeros, avoid scientific notation
     results_dict = {
         'Company_ID': df[COMPANY_ID_COL].astype(str),
@@ -6082,7 +6082,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # Add Cash_Flow_Score (matches verification pattern)
     results_dict['Cash_Flow_Score'] = quality_scores['cash_flow_score']
 
-    # [V2.0] Add optional columns if available
+    # [V2.1] Add optional columns if available
     if 'Ticker' in df.columns:
         # Enforce Ticker as string to preserve formatting
         results_dict['Ticker'] = df['Ticker'].astype(str)
@@ -6119,7 +6119,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     results['Rating_Band'] = results['Credit_Rating_Clean'].str.upper().str.strip().map(rating_to_band).fillna('Unrated')
     
     # Add Rating Group (IG/HY) - VECTORIZED
-    # [V2.0] All non-IG ratings (including NR/WD/N/M/empty/NaN) classified as High Yield
+    # [V2.1] All non-IG ratings (including NR/WD/N/M/empty/NaN) classified as High Yield
     ig_ratings_set = {'AAA','AA+','AA','AA-','A+','A','A-','BBB+','BBB','BBB-'}
     
     # Vectorized classification: clean, check membership, assign
@@ -6140,7 +6140,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # Also compute global percentile for unified quality/trend split
     results = _compute_quality_metrics(results, score_col="Composite_Score")
 
-    # [V2.0] Calculate Classification Rank only if classification available
+    # [V2.1] Calculate Classification Rank only if classification available
     if has_classification and 'Rubrics_Custom_Classification' in results.columns:
         results['Classification_Rank'] = results.groupby('Rubrics_Custom_Classification')['Composite_Score'].rank(
             ascending=False, method='dense'
@@ -6152,7 +6152,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     ).astype('Int64')
 
     # ========================================================================
-    # [V2.0] CONTEXT FLAGS FOR DUAL-HORIZON ANALYSIS
+    # [V2.1] CONTEXT FLAGS FOR DUAL-HORIZON ANALYSIS
     # ========================================================================
 
     # Exceptional quality flag (≥90th percentile composite OR top factor)
@@ -6178,7 +6178,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     results['NearPeak'] = dual_horizon_metrics['NearPeak']
 
     # ========================================================================
-    # [V2.0] VOLATILITY DAMPING FOR CYCLE POSITION SCORE
+    # [V2.1] VOLATILITY DAMPING FOR CYCLE POSITION SCORE
     # ========================================================================
 
     # Apply volatility damping: reduce negative short-term impact if volatile or outlier
@@ -6223,7 +6223,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     )
 
     # ========================================================================
-    # [V2.0] LABEL OVERRIDE LOGIC FOR CONTEXT-AWARE SIGNALS
+    # [V2.1] LABEL OVERRIDE LOGIC FOR CONTEXT-AWARE SIGNALS
     # ========================================================================
 
     # Start with base signal
@@ -6354,7 +6354,7 @@ if os.environ.get("RG_TESTS") != "1":
                     "Strong & Moderating"} for x in uniq), f"Unexpected Combined_Signal values: {uniq}"
 
             # ============================================================================
-            # COMPUTE FRESHNESS METRICS (V2.0)
+            # COMPUTE FRESHNESS METRICS (V2.1)
             # ============================================================================
         
             # Financial data freshness (from Period Ended dates)
@@ -6411,7 +6411,7 @@ if os.environ.get("RG_TESTS") != "1":
                 results_final["Rating_Review_Freshness_Flag"] = "Unknown"
         
             # ============================================================================
-            # FRESHNESS FILTERS (V2.0) - Sidebar
+            # FRESHNESS FILTERS (V2.1) - Sidebar
             # ============================================================================
         
             with st.sidebar.expander("  Data Freshness Filters", expanded=False):
@@ -7151,7 +7151,7 @@ if os.environ.get("RG_TESTS") != "1":
                 st.plotly_chart(fig2, use_container_width=True)
 
                 # ========================================================================
-                # RATING-BAND LEADERBOARDS (V2.0)
+                # RATING-BAND LEADERBOARDS (V2.1)
                 # ========================================================================
                 st.markdown("---")
                 st.subheader("Rating-Band Leaderboards")
@@ -7412,7 +7412,7 @@ if os.environ.get("RG_TESTS") != "1":
                 ]
         
                 # ========================================================================
-                # WATCHLIST / EXCLUSIONS (V2.0)
+                # WATCHLIST / EXCLUSIONS (V2.1)
                 # ========================================================================
                 with st.expander(" Watchlist / Exclusions", expanded=False):
                     col_w, col_e = st.columns(2)
@@ -7509,12 +7509,12 @@ if os.environ.get("RG_TESTS") != "1":
                 st.dataframe(filtered_display, use_container_width=True, hide_index=True, height=600)
         
                 # ========================================================================
-                # ISSUER EXPLAINABILITY (V2.0)
+                # ISSUER EXPLAINABILITY (V2.1)
                 # ========================================================================
                 render_issuer_explainability(filtered, scoring_method)
         
                 # ========================================================================
-                # EXPORT CURRENT VIEW (V2.0)
+                # EXPORT CURRENT VIEW (V2.1)
                 # ========================================================================
                 with st.expander(" Export Current View (CSV)", expanded=False):
                     export_cols = [
@@ -8153,19 +8153,19 @@ if os.environ.get("RG_TESTS") != "1":
             st.markdown("---")
             st.markdown("""
         <div style='text-align: center; color: #4c566a; padding: 20px;'>
-            <p><strong>Issuer Credit Screening Model V2.0</strong></p>
+            <p><strong>Issuer Credit Screening Model V2.1</strong></p>
             <p>© 2025 Rubrics Asset Management | Annual-Only Default + Minimal Identifiers</p>
         </div>
         """, unsafe_allow_html=True)
         
         # ============================================================================
-        # [V2.0] SELF-TESTS (Run with RG_TESTS=1 environment variable)
+        # [V2.1] SELF-TESTS (Run with RG_TESTS=1 environment variable)
         # ============================================================================
         
 if os.environ.get("RG_TESTS") == "1":
     import sys
     print("\n" + "="*60)
-    print("Running RG_TESTS for V2.0...")
+    print("Running RG_TESTS for V2.1...")
     print("="*60 + "\n")
     import sys
 
@@ -8522,7 +8522,7 @@ if os.environ.get("RG_TESTS") == "1":
     print("  OK non-December FY recognized as FY in LLM extractor")
 
     print("\n" + "="*60)
-    print("SUCCESS: ALL RG_TESTS PASSED for V2.0 (12 tests)")
+    print("SUCCESS: ALL RG_TESTS PASSED for V2.1 (12 tests)")
     print("="*60 + "\n")
 
     # Exit successfully after tests
