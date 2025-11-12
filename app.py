@@ -5352,8 +5352,12 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False,
             mean_val = abs(values.mean())
             if mean_val > 0:
                 slope_pct_per_year = slope_per_year / mean_val
+                # Scale up by 5x to restore sensitivity for typical financial metrics
+                # (1-5% annual change is normal for financial ratios and should translate to meaningful trend scores)
+                # Without scaling: 2% improvement → 0.02 → score 51 (barely detectable)
+                # With 5x scaling: 2% improvement → 0.10 → score 55 (clearly improving)
                 # Clip to ±100% per year → ±1.0 trend score
-                trend = float(np.clip(slope_pct_per_year, -1, 1))
+                trend = float(np.clip(slope_pct_per_year * 5, -1, 1))
             else:
                 trend = 0.0
         else:
@@ -5744,6 +5748,22 @@ def compute_raw_scores_v2(df_original: pd.DataFrame) -> pd.DataFrame:
     for m in dn_levels:
         q_parts.append(_pct_rank(latest_df[m], invert=True))
     quality = pd.concat(q_parts, axis=1).mean(axis=1, skipna=True)
+
+    # [V2.2] Validation: Require minimum 4 of 8 factors for reliable quality score
+    # This prevents unreliable scores from issuers with sparse data
+    factors_available = pd.concat(q_parts, axis=1).notna().sum(axis=1)
+    insufficient_data = factors_available < 4
+
+    if insufficient_data.any() and not os.environ.get("RG_TESTS"):
+        st.sidebar.warning(
+            f"**Data Quality Alert**\n\n"
+            f"{insufficient_data.sum()} issuer(s) excluded from quality scoring due to insufficient data "
+            f"(need at least 4 of 8 quality factors).\n\n"
+            f"These issuers will have NaN quality scores and be filtered from analysis."
+        )
+
+    # Set quality score to NaN for issuers with insufficient data
+    quality[insufficient_data] = np.nan
 
     t_parts = []
     for m in ["EBITDA Margin", "Return on Equity", "EBITDA / Interest Expense (x)"]:
@@ -6533,6 +6553,43 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     results['Combined_Signal'] = results['Signal']  # Keep alias for backward compatibility
 
     _log_timing("05c_Label_Override_Complete")
+
+    # ========================================================================
+    # [V2.2] DIAGNOSTIC: Signal Assignment Quality Control
+    # ========================================================================
+    # Check for any "Weak & Deteriorating" issuers incorrectly marked with strong signals
+    # This should never happen, but validates the classification logic
+
+    if split_basis == "Percentile within Band (recommended)":
+        quality_check = results['Composite_Percentile_in_Band']
+    elif split_basis == "Global Percentile":
+        quality_check = results['Composite_Percentile']
+    else:
+        quality_check = results['Composite_Score']
+
+    # Identify potential misclassifications (Weak & Deteriorating should never be strong)
+    weak_deteriorating = (
+        (quality_check < x_split_for_rule) &  # Weak quality
+        (results['Cycle_Position_Score'] < trend_threshold)  # Deteriorating trend
+    )
+
+    # Check if any are incorrectly in the strong quadrant
+    misclassified_signals = weak_deteriorating & results['Signal'].isin(['Strong & Improving', 'Strong but Deteriorating', 'Strong & Normalizing'])
+
+    if misclassified_signals.any() and not os.environ.get("RG_TESTS"):
+        st.warning(
+            f"**Signal Classification Alert**\n\n"
+            f"{misclassified_signals.sum()} issuer(s) have Weak & Deteriorating fundamentals "
+            f"but were initially classified in the Strong category. This may indicate data quality issues "
+            f"or edge cases in the classification logic.\n\n"
+            f"Review these issuers carefully before making investment decisions."
+        )
+
+        # Show affected issuers in expander (don't clutter main view)
+        with st.expander("View Affected Issuers"):
+            alert_cols = ['Company_Name', 'Composite_Score', 'Composite_Percentile_in_Band',
+                         'Cycle_Position_Score', 'Signal', 'Credit_Rating_Clean']
+            st.dataframe(results[misclassified_signals][alert_cols])
 
     # ========================================================================
     # PERCENTILE-BASED RECOMMENDATION LOGIC WITH GUARDRAIL
