@@ -32,26 +32,59 @@ except Exception:  # SDK not installed in some envs
 
 def get_reference_date():
     """
-    Auto-determine appropriate reference date for trend alignment.
+    Auto-determine appropriate reference date for alignment.
 
-    Strategy: Use December 31 of the prior calendar year, unless we're
-    early in the current year (before April), then use December 31 of
-    two years ago to ensure data availability.
+    Returns the most recent fiscal year-end that most issuers would have reported.
+
+    Strategy:
+    - Uses December 31 of the most recent year where we can expect broad data availability
+    - Before April: Use Dec 31 of TWO years ago (companies still reporting prior year)
+    - April-June: Use Dec 31 of prior year (most annual data available)
+    - July onwards: Use most recent quarter-end that's at least 45 days old
+
+    This ensures the reference date automatically advances as time passes.
     """
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     current_date = datetime.now()
     current_year = current_date.year
     current_month = current_date.month
 
-    # If before April, use Dec 31 of two years ago
-    # (many companies haven't reported prior year yet)
-    if current_month < 4:
-        reference_year = current_year - 2
-    else:
-        reference_year = current_year - 1
+    # Determine most recent reportable period
+    # Companies typically report within 45-60 days of period end
 
-    return pd.Timestamp(f"{reference_year}-12-31")
+    if current_month <= 3:
+        # Jan-Mar: Use Dec 31 of TWO years ago
+        # (Most companies haven't reported prior year's Q4/FY yet)
+        reference_year = current_year - 2
+        return pd.Timestamp(f"{reference_year}-12-31")
+
+    elif current_month <= 6:
+        # Apr-Jun: Use Dec 31 of prior year
+        # (Annual reports should be filed by now)
+        reference_year = current_year - 1
+        return pd.Timestamp(f"{reference_year}-12-31")
+
+    else:
+        # Jul onwards: Use most recent quarter-end that's 60+ days old
+        # This allows the reference date to advance quarterly through the year
+
+        # Calculate date 60 days ago (reporting lag)
+        reporting_lag_date = current_date - timedelta(days=60)
+
+        # Find most recent quarter-end before reporting_lag_date
+        year = reporting_lag_date.year
+        month = reporting_lag_date.month
+
+        # Determine quarter-end
+        if month >= 10:  # Q4 (Dec 31)
+            return pd.Timestamp(f"{year}-12-31")
+        elif month >= 7:  # Q3 (Sep 30)
+            return pd.Timestamp(f"{year}-09-30")
+        elif month >= 4:  # Q2 (Jun 30)
+            return pd.Timestamp(f"{year}-06-30")
+        else:  # Q1 (Mar 31)
+            return pd.Timestamp(f"{year}-03-31")
 
 # [V2.2] Only configure Streamlit if not running tests
 if os.environ.get("RG_TESTS") != "1":
@@ -65,12 +98,13 @@ if os.environ.get("RG_TESTS") != "1":
 # HEADER RENDERING HELPER
 # ============================================================================
 
-def render_header(results_final=None, data_period=None, use_sector_adjusted=False, df_original=None):
+def render_header(results_final=None, data_period=None, use_sector_adjusted=False, df_original=None,
+                  use_quarterly_beta=False, align_to_reference=False):
     """
     Render the application header exactly once.
 
     Pre-upload: Shows only hero (title + subtitle + logo)
-    Post-upload: Shows hero + 4 metrics + caption with period dates
+    Post-upload: Shows hero + 4 metrics + caption with period dates (and reference date if aligned)
     """
     # Always render the hero once
     st.markdown("""
@@ -108,7 +142,17 @@ def render_header(results_final=None, data_period=None, use_sector_adjusted=Fals
 
         # Actual end-date labels
         _period_labels = build_dynamic_period_labels(df_original)
-        st.caption(f"📅 Data Periods: {_period_labels['fy_label']}  |  {_period_labels['cq_label']}")
+
+        # Show reference date info if alignment is active
+        if use_quarterly_beta and align_to_reference:
+            ref_date = get_reference_date()
+            st.caption(
+                f"Data Periods: {_period_labels['fy_label']}  |  {_period_labels['cq_label']}  |  "
+                f"**Reference Date**: {ref_date.strftime('%b %d, %Y')} (aligned for fair comparison)"
+            )
+        else:
+            st.caption(f"Data Periods: {_period_labels['fy_label']}  |  {_period_labels['cq_label']}")
+
         if os.environ.get("RG_TESTS") and _period_labels.get("used_fallback"):
             st.caption("[DEV] FY/CQ classifier not available — using documented fallback (first 5 FY, rest CQ).")
 
@@ -3186,10 +3230,14 @@ def latest_periods(cal: pd.DataFrame, max_k_fy=4, max_k_cq=7) -> pd.DataFrame:
 # BATCH METRIC EXTRACTION (moved to module level for reuse)
 # ============================================================================
 
-def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_setting):
+def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_setting, reference_date=None):
     """
     OPTIMIZED: Extract all metrics at once using vectorized operations.
     Returns dict of {metric_name: Series of values}.
+
+    Args:
+        reference_date: If provided, filters to only use data on or before this date.
+                       Used for alignment when CQ-0 is selected with align_to_reference=True.
     """
     result = {}
 
@@ -3260,6 +3308,11 @@ def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_se
         long_df = long_df[long_df['date'].notna() & long_df['value'].notna()]
         long_df = long_df[long_df['date'].dt.year != 1900]
 
+        # Filter to reference date if provided (for alignment)
+        if reference_date is not None:
+            reference_dt = pd.to_datetime(reference_date)
+            long_df = long_df[long_df['date'] <= reference_dt]
+
         # Get most recent (latest date) value per issuer
         long_df = long_df.sort_values(['row_idx', 'date'])
         most_recent = long_df.groupby('row_idx').last()['value']
@@ -3273,8 +3326,12 @@ def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_se
 # CASH FLOW HELPERS (v3 - DataFrame-level with alias-aware batch extraction)
 # ============================================================================
 
-def _cf_components_dataframe(df: pd.DataFrame, data_period_setting: str, has_period_alignment: bool) -> pd.DataFrame:
-    """Extract cash flow components using alias-aware batch extraction."""
+def _cf_components_dataframe(df: pd.DataFrame, data_period_setting: str, has_period_alignment: bool, reference_date=None) -> pd.DataFrame:
+    """Extract cash flow components using alias-aware batch extraction.
+
+    Args:
+        reference_date: If provided, filters to only use data on or before this date.
+    """
 
     cash_flow_metrics = [
         'Cash from Ops.',
@@ -3292,7 +3349,7 @@ def _cf_components_dataframe(df: pd.DataFrame, data_period_setting: str, has_per
         'Free Cash Flow'
     ]
 
-    metrics = _batch_extract_metrics(df, cash_flow_metrics, has_period_alignment, data_period_setting)
+    metrics = _batch_extract_metrics(df, cash_flow_metrics, has_period_alignment, data_period_setting, reference_date)
 
     # Map to standardized names
     ocf = metrics.get('Cash from Ops.', metrics.get('Cash from Operations',
@@ -3360,10 +3417,14 @@ def _scale_0_100(s: pd.Series) -> pd.Series:
     z = (s - mn) / (mx - mn)
     return z * 100.0
 
-def _cash_flow_component_scores(df: pd.DataFrame, data_period_setting: str, has_period_alignment: bool) -> pd.DataFrame:
-    """Calculate cash flow component scores using alias-aware extraction."""
+def _cash_flow_component_scores(df: pd.DataFrame, data_period_setting: str, has_period_alignment: bool, reference_date=None) -> pd.DataFrame:
+    """Calculate cash flow component scores using alias-aware extraction.
 
-    components = _cf_components_dataframe(df, data_period_setting, has_period_alignment)
+    Args:
+        reference_date: If provided, filters to only use data on or before this date.
+    """
+
+    components = _cf_components_dataframe(df, data_period_setting, has_period_alignment, reference_date)
     raw = _cf_raw_dataframe(components)
 
     for k, (lo, hi) in _CF_CLIPS.items():
@@ -4639,6 +4700,15 @@ data_period_setting = st.sidebar.selectbox(
     key="cfg_period_for_scores",
 )
 
+# Show timing difference warning when CQ-0 is selected
+if data_period_setting == "Most Recent Quarter (CQ-0)":
+    st.sidebar.info(
+        "**Note: Timing differences in CQ-0 mode**\n\n"
+        "Different issuers have different 'most recent quarter' dates (up to 9-12 months apart). "
+        "This affects Composite Scores. To align all issuers to a common reference date, "
+        "enable quarterly data below and check the alignment option."
+    )
+
 # (B) Trend window configuration
 st.sidebar.markdown("#### Trend Analysis Window")
 
@@ -4656,19 +4726,19 @@ use_quarterly_beta = st.sidebar.checkbox(
 # Conditional: only show alignment option when quarterly mode is active
 if use_quarterly_beta:
     align_to_reference = st.sidebar.checkbox(
-        "⚖️ Align all issuers to common reference date",
+        "Align all issuers to common reference date",
         value=align0,
         help=(
             "**Trade-off between currency and fairness:**\n\n"
-            "✓ **When CHECKED (Recommended for screening):**\n"
-            "  • Filters all data to December 31, 2024\n"
+            "**When CHECKED (Recommended for screening):**\n"
+            "  • Filters all data to common reference date\n"
             "  • Ensures fair comparison (no timing bias)\n"
-            "  • Data is ~10 months old but consistent across all issuers\n"
+            "  • Data may be older but consistent across all issuers\n"
             "  • Eliminates sector bias from mixed reporting schedules\n\n"
-            "✓ **When UNCHECKED (For monitoring specific issuers):**\n"
+            "**When UNCHECKED (For monitoring specific issuers):**\n"
             "  • Uses latest available data for each issuer\n"
-            "  • Maximum currency (includes Q3 2025 if available)\n"
-            "  • Creates 9-12 month timing gaps between issuers\n"
+            "  • Maximum currency (includes most recent quarters if available)\n"
+            "  • Creates timing gaps between issuers\n"
             "  • May introduce sector bias (quarterly reporters more current)"
         ),
         key="cfg_align_to_reference",
@@ -4678,12 +4748,12 @@ if use_quarterly_beta:
     if align_to_reference:
         ref_date_display = get_reference_date()
         st.sidebar.info(
-            f"📅 **Reference date**: {ref_date_display.strftime('%B %d, %Y')}\n\n"
+            f"**Reference date**: {ref_date_display.strftime('%B %d, %Y')}\n\n"
             f"All trend analysis will use data through this date for fair comparison."
         )
     else:
         st.sidebar.warning(
-            "⚠️ **Timing differences active**\n\n"
+            "**Timing differences active**\n\n"
             "Quarterly reporters will use more recent data than annual reporters. "
             "This may introduce sector bias but provides maximum currency."
         )
@@ -5977,8 +6047,25 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # CALCULATE QUALITY SCORES ([V2.2] ANNUAL-ONLY DEFAULT)
     # ========================================================================
 
-    def calculate_quality_scores(df, data_period_setting, has_period_alignment):
+    def calculate_quality_scores(df, data_period_setting, has_period_alignment, reference_date=None, align_to_reference=False):
+        """
+        Calculate quality scores for all issuers.
+
+        Args:
+            reference_date: If provided AND align_to_reference is True AND data_period_setting is CQ-0,
+                          filters point-in-time metrics to this reference date for fair comparison.
+            align_to_reference: Whether alignment is enabled by user.
+        """
         scores = pd.DataFrame(index=df.index)
+
+        # Determine whether to apply reference date filtering for point-in-time metrics
+        # Only apply if: (1) CQ-0 selected AND (2) alignment enabled
+        apply_reference_date = (
+            reference_date is not None
+            and align_to_reference
+            and data_period_setting == "Most Recent Quarter (CQ-0)"
+        )
+        ref_date_for_extraction = reference_date if apply_reference_date else None
 
         def _pct_to_100(s):
             if isinstance(s, pd.Series):
@@ -6019,7 +6106,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
             'Levered Free Cash Flow Margin',
             'Cash from Ops. to Curr. Liab. (x)'
         ]
-        metrics = _batch_extract_metrics(df, needed_metrics, has_period_alignment, data_period_setting)
+        metrics = _batch_extract_metrics(df, needed_metrics, has_period_alignment, data_period_setting, ref_date_for_extraction)
 
         # Credit Score – 100% S&P LT Issuer Rating (Interest Coverage moved under Leverage)
 
@@ -6159,7 +6246,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         # Cash Flow ([v3 - DataFrame-level with alias-aware batch extraction] Annual-only)
         # Compute 4 equal-weighted components: OCF/Revenue, OCF/Debt, UFCF margin, LFCF margin
         # Each clipped globally then min-max scaled to 0-100; average available components
-        _cf_comp = _cash_flow_component_scores(df, data_period_setting, has_period_alignment)
+        _cf_comp = _cash_flow_component_scores(df, data_period_setting, has_period_alignment, ref_date_for_extraction)
         _cf_cols = [c for c in ["OCF_to_Revenue_Score", "OCF_to_Debt_Score",
                                  "UFCF_margin_Score", "LFCF_margin_Score"] if c in _cf_comp.columns]
 
@@ -6173,7 +6260,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
 
         return scores
 
-    quality_scores = calculate_quality_scores(df, data_period_setting, has_period_alignment)
+    quality_scores = calculate_quality_scores(df, data_period_setting, has_period_alignment, reference_date, align_to_reference)
     _log_timing("04_Quality_Scores_Complete")
 
     _audit_count("After factor construction", df, audits)
@@ -6650,7 +6737,8 @@ if os.environ.get("RG_TESTS") != "1":
             # HEADER
             # ============================================================================
 
-            render_header(results_final, data_period, use_sector_adjusted, df_original)
+            render_header(results_final, data_period, use_sector_adjusted, df_original,
+                        use_quarterly_beta, align_to_reference)
 
             # ============================================================================
             # TAB NAVIGATION
