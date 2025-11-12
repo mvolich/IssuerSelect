@@ -2916,13 +2916,14 @@ def _set_query_params(d: dict):
         # Older Streamlit: show the deep link for copy/paste
         st.info("Copy this link to reproduce the state:\n\n" + "?" + urlencode(qp))
 
-def collect_current_state(scoring_method, data_period, use_quarterly_beta,
+def collect_current_state(scoring_method, data_period, use_quarterly_beta, align_to_reference,
                           band_default=None, top_n_default=20):
     """Collect current UI state into a dictionary."""
     state = {
         "scoring_method": scoring_method,
         "data_period": data_period,
         "use_quarterly_beta": bool(use_quarterly_beta),
+        "align_to_reference": bool(align_to_reference),
         "band_default": band_default or "",
         "top_n_default": int(top_n_default)
     }
@@ -2942,9 +2943,10 @@ def apply_state_to_controls(state):
         dp = "Most Recent Fiscal Year (FY0)"
 
     qb = str(state.get("use_quarterly_beta", "false")).lower() in ("1", "true", "yes")
+    align = str(state.get("align_to_reference", "false")).lower() in ("1", "true", "yes")
     band_default = state.get("band_default") or ""
     top_n_default = int(state.get("top_n_default") or 20)
-    return sm, dp, qb, band_default, top_n_default
+    return sm, dp, qb, align, band_default, top_n_default
 
 def _build_deep_link(state: dict) -> str:
     """
@@ -4595,7 +4597,7 @@ st.sidebar.title(" Configuration")
 # Restore state from URL if present
 _url_state = _get_query_params()
 _original_dp = _url_state.get("data_period")  # Save original before coercion
-sm0, dp0, qb0, band0, topn0 = apply_state_to_controls(_url_state)
+sm0, dp0, qb0, align0, band0, topn0 = apply_state_to_controls(_url_state)
 
 # Optional: Show deprecation notice if URL contained FY-4
 if _original_dp == "FY-4 (Legacy)":
@@ -4637,17 +4639,57 @@ data_period_setting = st.sidebar.selectbox(
     key="cfg_period_for_scores",
 )
 
-# (B) Trend window (affects momentum/volatility only)
+# (B) Trend window configuration
+st.sidebar.markdown("#### Trend Analysis Window")
+
 use_quarterly_beta = st.sidebar.checkbox(
-    "Trend window: use quarterly data where available",
+    "Use quarterly data where available",
     value=qb0,
     help=(
-        "When ON, momentum/volatility are computed from quarterly time series (base + .1 … .12). "
-        "When OFF, momentum/volatility use annual-only series (base + .1 … .4). "
+        "When ON, momentum/volatility are computed from quarterly time series (up to 13 periods). "
+        "When OFF, momentum/volatility use annual-only series (5 periods). "
         "This does NOT change the point-in-time period used for scores."
     ),
     key="cfg_trend_window_quarterly",
 )
+
+# Conditional: only show alignment option when quarterly mode is active
+if use_quarterly_beta:
+    align_to_reference = st.sidebar.checkbox(
+        "⚖️ Align all issuers to common reference date",
+        value=align0,
+        help=(
+            "**Trade-off between currency and fairness:**\n\n"
+            "✓ **When CHECKED (Recommended for screening):**\n"
+            "  • Filters all data to December 31, 2024\n"
+            "  • Ensures fair comparison (no timing bias)\n"
+            "  • Data is ~10 months old but consistent across all issuers\n"
+            "  • Eliminates sector bias from mixed reporting schedules\n\n"
+            "✓ **When UNCHECKED (For monitoring specific issuers):**\n"
+            "  • Uses latest available data for each issuer\n"
+            "  • Maximum currency (includes Q3 2025 if available)\n"
+            "  • Creates 9-12 month timing gaps between issuers\n"
+            "  • May introduce sector bias (quarterly reporters more current)"
+        ),
+        key="cfg_align_to_reference",
+    )
+
+    # Show info/warning based on selection
+    if align_to_reference:
+        ref_date_display = get_reference_date()
+        st.sidebar.info(
+            f"📅 **Reference date**: {ref_date_display.strftime('%B %d, %Y')}\n\n"
+            f"All trend analysis will use data through this date for fair comparison."
+        )
+    else:
+        st.sidebar.warning(
+            "⚠️ **Timing differences active**\n\n"
+            "Quarterly reporters will use more recent data than annual reporters. "
+            "This may introduce sector bias but provides maximum currency."
+        )
+else:
+    # If quarterly mode is off, no reference date needed
+    align_to_reference = False
 
 # (C) Quality/Trend Split Configuration
 st.sidebar.markdown("#### Quality/Trend Split")
@@ -4723,6 +4765,7 @@ _current_state = collect_current_state(
     scoring_method=scoring_method,
     data_period=data_period,
     use_quarterly_beta=use_quarterly_beta,
+    align_to_reference=align_to_reference,
     band_default=band0,  # Will be updated later when band selector is rendered
     top_n_default=topn0  # Will be updated later when top_n slider is rendered
 )
@@ -5724,9 +5767,15 @@ def _dq_checks(df, staleness_days=365):
 
 @st.cache_data(show_spinner=False)
 def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjusted, use_quarterly_beta=False,
+                          align_to_reference=False,
                           split_basis="Percentile within Band (recommended)", split_threshold=60, trend_threshold=55,
                           volatility_cv_threshold=0.30, outlier_z_threshold=-2.5, damping_factor=0.5, near_peak_tolerance=0.10):
-    """Load data and calculate issuer scores with V2.2 enhancements and V2.2 dual-horizon context"""
+    """Load data and calculate issuer scores with V2.2 enhancements and V2.2 dual-horizon context
+
+    Args:
+        align_to_reference: If True (and use_quarterly_beta is True), align all issuers to common reference date.
+                          If False, use latest available data for each issuer (maximum currency).
+    """
 
     # ===== TIMING DIAGNOSTICS =====
     _start_time = time.time()
@@ -5876,10 +5925,11 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     ]
 
     # Determine reference date for timing alignment
-    if use_quarterly_beta:
+    # Only apply reference date if user explicitly enables alignment
+    if use_quarterly_beta and align_to_reference:
         reference_date = get_reference_date()  # Auto-determine based on current date
     else:
-        reference_date = None  # Annual mode doesn't need alignment
+        reference_date = None  # Use latest available data (no filtering)
 
     # Thread use_quarterly_beta into trend calculation
     trend_scores = calculate_trend_indicators(df, key_metrics_for_trends,
@@ -6459,6 +6509,7 @@ if os.environ.get("RG_TESTS") != "1":
         with st.spinner("Loading and processing data..."):
             results_final, df_original, audits, period_calendar = load_and_process_data(
                 uploaded_file, data_period, use_sector_adjusted, use_quarterly_beta,
+                align_to_reference,
                 split_basis, split_threshold, trend_threshold,
                 volatility_cv_threshold, outlier_z_threshold, damping_factor, near_peak_tolerance / 100.0
             )
@@ -7328,7 +7379,7 @@ if os.environ.get("RG_TESTS") != "1":
         
                 # Persist band and Top N to URL
                 _set_query_params(collect_current_state(
-                    scoring_method, data_period, use_quarterly_beta,
+                    scoring_method, data_period, use_quarterly_beta, align_to_reference,
                     band_default=band if band else "",
                     top_n_default=top_n
                 ))
@@ -7485,6 +7536,7 @@ if os.environ.get("RG_TESTS") != "1":
                     scoring_method=scoring_method,
                     data_period=data_period,
                     use_quarterly_beta=use_quarterly_beta,
+                    align_to_reference=align_to_reference,
                     band_default=band if band else "",
                     top_n_default=top_n
                 )
