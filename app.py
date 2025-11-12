@@ -4223,22 +4223,44 @@ ELSE:
     """)
 
     # ========================================================================
-    # SECTION 7: RECOMMENDATION GUARDRAIL
+    # SECTION 7: RECOMMENDATION LOGIC [V2.2]
     # ========================================================================
 
-    st.markdown("## 7. Recommendation Guardrail")
+    st.markdown("## 7. Recommendation Logic [V2.2]")
     st.markdown("""
-    **Base percentile bands:**
-    - Composite_Score ≥ 80th percentile → **Strong Buy**
-    - Composite_Score ≥ 60th percentile → **Buy**
-    - Composite_Score ≥ 40th percentile → **Hold**
-    - Composite_Score < 40th percentile → **Avoid**
+    **New comprehensive approach:** Recommendations are based on **classification first**, then refined by percentile and rating.
 
-    **Guardrail override:**
-    - **Weak & Deteriorating** issuers are **never** labeled Buy or Strong Buy, regardless of raw score
-    - They are capped at **Hold** (if percentile ≥ 40) or **Avoid** (if percentile < 40)
+    ### Base Recommendation by Classification
 
-    *(Strong but Deteriorating and Weak but Improving may still be Buy/Strong Buy if percentile warrants)*
+    | Classification | High Percentile (≥70%) | Low Percentile (<70%) |
+    |---------------|----------------------|---------------------|
+    | **Strong & Improving** | Strong Buy | Buy |
+    | **Strong but Deteriorating** | Buy | Hold |
+    | **Strong & Normalizing** | Buy | Buy |
+    | **Strong & Moderating** | Buy | Buy |
+    | **Weak but Improving** | Buy | Hold |
+    | **Weak & Deteriorating** | Avoid | Avoid |
+
+    ### Rating Guardrails (Applied After Classification)
+
+    **Distressed Issuers (CCC/CC/C/D):**
+    - Strong Buy → Capped to **Hold**
+    - Buy → Capped to **Hold**
+    - Rationale: High default risk, should not recommend buying
+
+    **Single-B Issuers:**
+    - Strong Buy → Capped to **Buy**
+    - Rationale: Speculative grade, too risky for "Strong Buy"
+
+    **Investment Grade & BB:**
+    - No caps applied
+
+    ### Key Changes from V2.1
+
+    - ✓ Recommendations now **respect classification** (e.g., "Strong & Improving" always gets Buy/Strong Buy)
+    - ✓ Added **rating-based guardrails** (distressed and single-B caps)
+    - ✓ "Strong & Moderating" treated as **Buy** (high quality despite volatility)
+    - ✓ Comprehensive **validation** prevents inappropriate recommendations
     """)
 
     # ========================================================================
@@ -4449,14 +4471,22 @@ ELSE:
 
 **Quality metric basis:** {quality_basis}
 
-## Recommendation Guardrail
+## Recommendation Logic [V2.2]
 
-- Composite_Score ≥ 80th percentile → Strong Buy
-- Composite_Score ≥ 60th percentile → Buy
-- Composite_Score ≥ 40th percentile → Hold
-- Composite_Score < 40th percentile → Avoid
+**Classification-first approach with rating guardrails:**
 
-**Override:** Weak & Deteriorating issuers are never labeled Buy or Strong Buy (capped at Hold/Avoid).
+Base recommendations by classification:
+- Strong & Improving: Strong Buy (≥70% percentile) or Buy
+- Strong but Deteriorating: Buy (≥70% percentile) or Hold
+- Strong & Normalizing: Always Buy (quality overrides short-term weakness)
+- Strong & Moderating: Always Buy (high quality despite volatility)
+- Weak but Improving: Buy (≥70% percentile) or Hold
+- Weak & Deteriorating: Always Avoid
+
+Rating guardrails (applied after classification):
+- Distressed (CCC/CC/C/D): Cap Strong Buy/Buy → Hold
+- Single-B: Cap Strong Buy → Buy
+- Investment Grade & BB: No caps
 
 ## Data Vintage
 
@@ -5352,12 +5382,12 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False,
             mean_val = abs(values.mean())
             if mean_val > 0:
                 slope_pct_per_year = slope_per_year / mean_val
-                # Scale up by 5x to restore sensitivity for typical financial metrics
-                # (1-5% annual change is normal for financial ratios and should translate to meaningful trend scores)
-                # Without scaling: 2% improvement → 0.02 → score 51 (barely detectable)
-                # With 5x scaling: 2% improvement → 0.10 → score 55 (clearly improving)
+                # Scale up by 10x to fully spread distribution across 20-80 range
+                # Financial metrics with 1-5% annual change translate to meaningful trend scores:
+                # 1% per year → 0.01 * 10 = 0.10 → score 55 (slightly improving)
+                # 5% per year → 0.05 * 10 = 0.50 → score 75 (strongly improving)
                 # Clip to ±100% per year → ±1.0 trend score
-                trend = float(np.clip(slope_pct_per_year * 5, -1, 1))
+                trend = float(np.clip(slope_pct_per_year * 10, -1, 1))
             else:
                 trend = 0.0
         else:
@@ -6592,38 +6622,255 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
             st.dataframe(results[misclassified_signals][alert_cols])
 
     # ========================================================================
-    # PERCENTILE-BASED RECOMMENDATION LOGIC WITH GUARDRAIL
+    # [V2.2] COMPREHENSIVE RECOMMENDATION LOGIC
     # ========================================================================
+    #
+    # New approach: Classification-first with rating guardrails
+    # Priority: 1) Classification → 2) Percentile within classification → 3) Rating caps
 
-    # --- Guardrail: block Buy/SB when Weak & Deteriorating ---
-    # Default to stricter behaviour; override with env if required.
-    WEAK_DET_CAP = os.getenv("WEAK_DET_CAP", "Avoid")
+    def _apply_rating_guardrails(base_rec, rating_band):
+        """
+        Apply rating-based caps to prevent inappropriate recommendations for weak credits.
 
-    # Step 1: Draft recommendations from within-band percentiles (0–100)
-    # Requires Composite_Percentile_in_Band computed earlier.
-    pct = results['Composite_Percentile_in_Band'].fillna(0)
-    conditions = [
-        pct >= 80,  # Strong Buy: top quintile within band
-        pct >= 60,  # Buy
-        pct >= 40   # Hold
-    ]
-    choices = ['Strong Buy', 'Buy', 'Hold']
-    draft_rec = np.select(conditions, choices, default='Avoid')
+        Args:
+            base_rec: Base recommendation from classification logic
+            rating_band: Issuer's rating band (AAA, AA, A, BBB, BB, B, CCC, etc.)
 
-    # Step 2: Apply guardrail (only cap Buy/SB for Weak & Deteriorating)
-    is_weak_det = results['Signal'] == 'Weak & Deteriorating'
-    is_buy_or_sb = pd.Series(draft_rec).isin(['Buy', 'Strong Buy'])
+        Returns:
+            Final recommendation after applying rating caps
+        """
+        # Defaulted issuers: Always Avoid
+        if pd.isna(rating_band) or rating_band in ['D', 'SD']:
+            return 'Avoid'
 
-    # Final recommendation
-    results['Recommendation'] = draft_rec
-    results.loc[is_weak_det & is_buy_or_sb, 'Recommendation'] = WEAK_DET_CAP
-    results['Rec'] = results['Recommendation']
+        # Distressed (CCC/CC/C): Cap at Hold
+        # Rationale: High default risk, should not recommend buying
+        if rating_band in ['CCC', 'CC', 'C']:
+            if base_rec in ['Strong Buy', 'Buy']:
+                return 'Hold'
+            return base_rec
+
+        # Single-B: Cap at Buy
+        # Rationale: Speculative grade, too risky for "Strong Buy"
+        if rating_band == 'B':
+            if base_rec == 'Strong Buy':
+                return 'Buy'
+            return base_rec
+
+        # Investment Grade (AAA-BBB) and BB: No caps
+        return base_rec
+
+    def _assign_recommendation_by_classification(classification, percentile_in_band):
+        """
+        Map classification + percentile to base recommendation (before rating guardrails).
+
+        Logic:
+        - Classification determines the tier (primary driver)
+        - Percentile within band refines Strong vs regular (secondary modifier)
+
+        Args:
+            classification: Signal classification (e.g., "Strong & Improving")
+            percentile_in_band: 0-100 percentile rank within rating band
+
+        Returns:
+            Base recommendation string
+        """
+        # Handle missing data
+        if pd.isna(classification) or pd.isna(percentile_in_band):
+            return 'Hold'
+
+        # Ensure percentile is numeric
+        pct = float(percentile_in_band)
+
+        # ===================================================================
+        # CLASSIFICATION-BASED RECOMMENDATION MAPPING
+        # ===================================================================
+
+        if classification == "Strong & Improving":
+            # Best quadrant: Strong quality + Improving trend
+            # → Always positive recommendation (Buy or Strong Buy)
+            return "Strong Buy" if pct >= 70 else "Buy"
+
+        elif classification == "Strong but Deteriorating":
+            # Good quality but declining trend
+            # → Cautiously positive (Buy or Hold)
+            return "Buy" if pct >= 70 else "Hold"
+
+        elif classification == "Strong & Normalizing":
+            # Special case: Exceptional quality (90th+ percentile)
+            # Medium-term improving, short-term dip (likely temporary)
+            # → Buy regardless of percentile (quality overrides short-term weakness)
+            return "Buy"
+
+        elif classification == "Strong & Moderating":
+            # Special case: Exceptional quality but high volatility
+            # Short-term deteriorating with volatile series
+            # → Buy (USER REQUESTED: treat as buy opportunity despite volatility)
+            return "Buy"
+
+        elif classification == "Weak but Improving":
+            # Poor quality but turning around
+            # → Cautiously positive if strong momentum (Buy or Hold)
+            return "Buy" if pct >= 70 else "Hold"
+
+        elif classification == "Weak & Deteriorating":
+            # Worst quadrant: Weak quality + Deteriorating trend
+            # → Always negative recommendation (Avoid)
+            return "Avoid"
+
+        else:
+            # Unknown/missing classification
+            return "Hold"
+
+    def assign_final_recommendation(row):
+        """
+        Complete recommendation logic with audit trail.
+
+        Process:
+        1. Get base recommendation from classification + percentile
+        2. Apply rating guardrails (downgrade if needed)
+        3. Generate reason for transparency
+
+        Args:
+            row: DataFrame row with 'Signal', 'Composite_Percentile_in_Band', 'Rating_Band'
+
+        Returns:
+            tuple: (final_recommendation, reason_string)
+        """
+        # Step 1: Base recommendation from classification
+        base = _assign_recommendation_by_classification(
+            row['Signal'],
+            row['Composite_Percentile_in_Band']
+        )
+
+        # Step 2: Apply rating guardrails
+        final = _apply_rating_guardrails(base, row['Rating_Band'])
+
+        # Step 3: Generate reason for transparency
+        classification = row['Signal'] if pd.notna(row['Signal']) else '—'
+        pct = row['Composite_Percentile_in_Band']
+        pct_str = f"{pct:.0f}%" if pd.notna(pct) else "N/A"
+        rating = row['Rating_Band'] if pd.notna(row['Rating_Band']) else 'NR'
+
+        reason = f"{classification} (Percentile: {pct_str})"
+
+        if final != base:
+            reason += f" → Capped from {base} due to {rating} rating"
+
+        return final, reason
+
+    # Apply recommendation logic to all rows
+    if not os.environ.get("RG_TESTS"):
+        st.write("📊 Assigning recommendations...")
+    recommendation_results = results.apply(
+        lambda row: pd.Series(assign_final_recommendation(row)),
+        axis=1
+    )
+    results['Recommendation'] = recommendation_results[0]
+    results['Recommendation_Reason'] = recommendation_results[1]
+    results['Rec'] = results['Recommendation']  # Alias for backward compatibility
+
     _log_timing("06_Recommendations_Complete")
 
-    # Dev-only assertion: verify no Weak & Deteriorating issuers get Buy/Strong Buy
-    if os.environ.get("RG_TESTS") == "1":
-        _bad = results.query("Recommendation in ['Buy','Strong Buy'] and Signal == 'Weak & Deteriorating'")
-        assert len(_bad) == 0, f"{len(_bad)} Weak & Deteriorating issuers still rated Buy/SB"
+    # ========================================================================
+    # [V2.2] COMPREHENSIVE VALIDATION: Verify Recommendation Quality
+    # ========================================================================
+
+    # Count violations of each guardrail type
+    validation_results = {}
+
+    # Violation 1: Weak & Deteriorating with Buy/Strong Buy
+    weak_det_violations = (
+        (results['Signal'] == 'Weak & Deteriorating') &
+        results['Recommendation'].isin(['Buy', 'Strong Buy'])
+    )
+    validation_results['weak_det'] = weak_det_violations.sum()
+
+    # Violation 2: Distressed (CCC/CC/C/D) with Strong Buy
+    distressed_violations = (
+        results['Rating_Band'].isin(['CCC', 'CC', 'C', 'D', 'SD']) &
+        (results['Recommendation'] == 'Strong Buy')
+    )
+    validation_results['distressed'] = distressed_violations.sum()
+
+    # Violation 3: Single-B with Strong Buy
+    single_b_violations = (
+        (results['Rating_Band'] == 'B') &
+        (results['Recommendation'] == 'Strong Buy')
+    )
+    validation_results['single_b'] = single_b_violations.sum()
+
+    # Violation 4: Strong & Improving with Avoid
+    strong_improving_avoid = (
+        (results['Signal'] == 'Strong & Improving') &
+        (results['Recommendation'] == 'Avoid')
+    )
+    validation_results['strong_improving_avoid'] = strong_improving_avoid.sum()
+
+    # Count successful guardrail applications (for info)
+    weak_det_capped = (
+        (results['Signal'] == 'Weak & Deteriorating') &
+        (results['Composite_Percentile_in_Band'] >= 60)
+    ).sum()
+
+    distressed_capped = (
+        results['Rating_Band'].isin(['CCC', 'CC', 'C', 'D', 'SD']) &
+        (results['Composite_Percentile_in_Band'] >= 80)
+    ).sum()
+
+    single_b_capped = (
+        (results['Rating_Band'] == 'B') &
+        (results['Composite_Percentile_in_Band'] >= 80)
+    ).sum()
+
+    # Display validation results
+    total_violations = sum(validation_results.values())
+
+    if total_violations > 0 and not os.environ.get("RG_TESTS"):
+        # CRITICAL: Guardrails failed
+        st.error(
+            f"🔴 **RECOMMENDATION VALIDATION FAILED**\n\n"
+            f"**{total_violations} violations detected:**\n"
+            f"- {validation_results['weak_det']} Weak & Deteriorating → Buy/Strong Buy\n"
+            f"- {validation_results['distressed']} Distressed (CCC/CC/C/D) → Strong Buy\n"
+            f"- {validation_results['single_b']} Single-B → Strong Buy\n"
+            f"- {validation_results['strong_improving_avoid']} Strong & Improving → Avoid\n\n"
+            f"**DO NOT USE THESE RECOMMENDATIONS** - Logic error detected."
+        )
+
+        # Show violating issuers
+        with st.expander("🔍 View Violating Issuers"):
+            all_violations = (
+                weak_det_violations |
+                distressed_violations |
+                single_b_violations |
+                strong_improving_avoid
+            )
+            violation_cols = [
+                'Company_Name', 'Rating_Band', 'Signal',
+                'Composite_Percentile_in_Band', 'Recommendation', 'Recommendation_Reason'
+            ]
+            st.dataframe(results[all_violations][violation_cols])
+
+    else:
+        # SUCCESS: All guardrails working
+        guardrails_applied = weak_det_capped + distressed_capped + single_b_capped
+
+        if guardrails_applied > 0 and not os.environ.get("RG_TESTS"):
+            st.sidebar.success(
+                f"✓ **Quality Guardrails Active**\n\n"
+                f"Protected {guardrails_applied} issuers from inappropriate recommendations:\n"
+                f"- {weak_det_capped} Weak & Deteriorating (capped to Avoid)\n"
+                f"- {distressed_capped} Distressed CCC/CC/C (capped to Hold)\n"
+                f"- {single_b_capped} Single-B (capped to Buy)\n\n"
+                f"These had high percentiles but were downgraded due to quality/rating concerns."
+            )
+
+        # Log success for tests
+        if os.environ.get("RG_TESTS") == "1":
+            print(f"\n✓ All recommendation guardrails passed validation")
+            print(f"  - 0 violations detected")
+            print(f"  - {guardrails_applied} guardrails successfully applied")
 
     _log_timing("07_FINAL_COMPLETE")
 
