@@ -26,6 +26,33 @@ except Exception:  # SDK not installed in some envs
     OpenAI = None
     _OPENAI_AVAILABLE = False
 
+# ============================================================================
+# REFERENCE DATE HELPER (for timing alignment in quarterly mode)
+# ============================================================================
+
+def get_reference_date():
+    """
+    Auto-determine appropriate reference date for trend alignment.
+
+    Strategy: Use December 31 of the prior calendar year, unless we're
+    early in the current year (before April), then use December 31 of
+    two years ago to ensure data availability.
+    """
+    from datetime import datetime
+
+    current_date = datetime.now()
+    current_year = current_date.year
+    current_month = current_date.month
+
+    # If before April, use Dec 31 of two years ago
+    # (many companies haven't reported prior year yet)
+    if current_month < 4:
+        reference_year = current_year - 2
+    else:
+        reference_year = current_year - 1
+
+    return pd.Timestamp(f"{reference_year}-12-31")
+
 # [V2.1] Only configure Streamlit if not running tests
 if os.environ.get("RG_TESTS") != "1":
     st.set_page_config(
@@ -4884,12 +4911,16 @@ def get_most_recent_column(df, base_metric, data_period_setting):
 
     return pd.Series(result, index=df.index)
 
-def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: bool, pe_data_cached=None, fy_cq_cached=None) -> pd.DataFrame:
+def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: bool,
+                              reference_date=None,
+                              pe_data_cached=None, fy_cq_cached=None) -> pd.DataFrame:
     """
     OPTIMIZED: Vectorized time series construction with FY/CQ de-duplication.
     Returns DataFrame where each row is an issuer's time series (columns = ISO dates).
 
     Args:
+        reference_date: Optional cutoff date (str or pd.Timestamp) to align all issuers.
+                       If provided, only uses data up to this date for all issuers.
         pe_data_cached: Pre-parsed period columns to avoid re-parsing (performance optimization)
         fy_cq_cached: Pre-computed (fy_suffixes, cq_suffixes) tuple
     """
@@ -4951,6 +4982,11 @@ def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: 
     # 5) Filter out invalid dates and values
     long_df = long_df[long_df['date'].notna() & long_df['value'].notna()]
     long_df = long_df[long_df['date'].dt.year != 1900]  # Remove 1900 sentinels
+
+    # 5a) TIMING MISMATCH FIX: Filter to reference date if provided
+    if reference_date is not None:
+        reference_dt = pd.to_datetime(reference_date)
+        long_df = long_df[long_df['date'] <= reference_dt]
 
     # 6) De-duplicate: For same (row_idx, date), prefer CQ over FY
     if use_quarterly:
@@ -5136,7 +5172,8 @@ def compute_dual_horizon_trends(ts_row: pd.Series, min_periods: int = 5, peak_to
     return result
 
 
-def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
+def calculate_trend_indicators(df, base_metrics, use_quarterly=False,
+                                reference_date=None):
     """
     SOLUTION TO ISSUE #2: MISSING CYCLICALITY & TREND ANALYSIS
     OPTIMIZED: Caches period parsing and uses vectorized calculations.
@@ -5148,6 +5185,8 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
         base_metrics: List of base metric names
         use_quarterly: If True, use [base, .1, .2, ..., .12] (13 periods: 5 annual + 8 quarterly)
                       If False, use [base, .1, .2, .3, .4] (5 annual periods only)
+        reference_date: Optional cutoff date (str or pd.Timestamp) to align all issuers.
+                       If provided, only uses data up to this date for all issuers.
 
     Returns DataFrame with new columns:
     - {metric}_trend: -1 to +1 (negative = deteriorating, positive = improving)
@@ -5167,9 +5206,106 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
     else:
         fy_cq_cached = None
 
-    # Helper function for vectorized calculations
+    # Helper function for vectorized calculations - TIME-AWARE VERSION
     def _calc_row_stats(row_series):
-        """Calculate trend, volatility, momentum for a single row's time series."""
+        """
+        Calculate trend, volatility, momentum for a single row's time series.
+
+        TIME-AWARE VERSION: Accounts for actual time intervals between periods.
+
+        Args:
+            row_series: Series with ISO date strings as index and metric values
+
+        Returns:
+            Series with 'trend', 'vol', 'mom' scores
+        """
+        values = row_series.dropna()
+        n = len(values)
+
+        if n < 3:
+            return pd.Series({'trend': 0.0, 'vol': 50.0, 'mom': 50.0})
+
+        # Parse dates from index (ISO strings like "2024-12-31")
+        try:
+            dates = pd.to_datetime(values.index)
+        except Exception:
+            # Fallback: if date parsing fails, use legacy logic
+            return _calc_row_stats_legacy(row_series)
+
+        # Convert dates to years from start (for time-aware regression)
+        time_zero = dates[0]
+        time_years = np.array([(d - time_zero).days / 365.25 for d in dates])
+        y = values.values
+
+        # === TREND CALCULATION (TIME-AWARE) ===
+        if n >= 3 and np.std(y) > 0 and time_years[-1] > 0:
+            # Linear regression: y = a + b*time_years
+            # Slope 'b' is now in units of "metric per YEAR"
+            slope_per_year = np.polyfit(time_years, y, 1)[0]
+
+            # Normalize slope by mean to make it scale-independent
+            # This gives "percent change per year"
+            mean_val = abs(values.mean())
+            if mean_val > 0:
+                slope_pct_per_year = slope_per_year / mean_val
+                # Clip to ±100% per year → ±1.0 trend score
+                trend = float(np.clip(slope_pct_per_year, -1, 1))
+            else:
+                trend = 0.0
+        else:
+            trend = 0.0
+
+        # === VOLATILITY CALCULATION (UNCHANGED) ===
+        # This is already time-agnostic - just measures dispersion
+        if n >= 3 and values.mean() != 0:
+            cv = values.std() / abs(values.mean())
+            vol = float(100 - np.clip(cv * 100, 0, 100))
+        else:
+            vol = 50.0
+
+        # === MOMENTUM CALCULATION (TIME-AWARE) ===
+        if n >= 8 and time_years[-1] > 0:
+            # Use TIME-BASED windows instead of index-based
+            # Split time span into two equal halves
+            total_time_span = time_years[-1] - time_years[0]
+            midpoint_time = time_years[0] + (total_time_span / 2.0)
+
+            # Prior half: [start, midpoint)
+            # Recent half: [midpoint, end]
+            prior_mask = time_years < midpoint_time
+            recent_mask = time_years >= midpoint_time
+
+            # Calculate averages for each half
+            if np.any(prior_mask) and np.any(recent_mask):
+                prior_count = np.sum(prior_mask)
+                recent_count = np.sum(recent_mask)
+
+                # Require at least 2 data points in each window
+                if prior_count >= 2 and recent_count >= 2:
+                    prior_avg = float(values[prior_mask].mean())
+                    recent_avg = float(values[recent_mask].mean())
+
+                    if prior_avg != 0:
+                        mom = 50.0 + 50.0 * ((recent_avg - prior_avg) / abs(prior_avg))
+                    else:
+                        mom = 50.0
+                    mom = float(np.clip(mom, 0, 100))
+                else:
+                    mom = 50.0
+            else:
+                # Edge case: all data in one half
+                mom = 50.0
+        else:
+            # Not enough data or time span too small
+            mom = 50.0
+
+        return pd.Series({'trend': trend, 'vol': vol, 'mom': mom})
+
+    def _calc_row_stats_legacy(row_series):
+        """
+        LEGACY VERSION: Original index-based calculation (for fallback).
+        Used if date parsing fails or for backward compatibility.
+        """
         values = row_series.dropna()
         n = len(values)
 
@@ -5182,14 +5318,14 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
         else:
             trend = 0.0
 
-        # Volatility (coefficient of variation, inverted)
+        # Volatility
         if n >= 3 and values.mean() != 0:
             cv = values.std() / abs(values.mean())
             vol = float(100 - np.clip(cv * 100, 0, 100))
         else:
             vol = 50.0
 
-        # Momentum (recent 4 vs prior 4)
+        # Momentum
         if n >= 8:
             recent_avg = float(values.iloc[-4:].mean())
             prior_avg = float(values.iloc[-8:-4].mean())
@@ -5206,6 +5342,7 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False):
     # Process each metric with cached data
     for base_metric in base_metrics:
         ts = _build_metric_timeseries(df, base_metric, use_quarterly=use_quarterly,
+                                      reference_date=reference_date,
                                       pe_data_cached=pe_data_cached, fy_cq_cached=fy_cq_cached)
 
         # Vectorized calculation using apply
@@ -5747,8 +5884,16 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         'Current Ratio (x)'
     ]
 
+    # Determine reference date for timing alignment
+    if use_quarterly_beta:
+        reference_date = get_reference_date()  # Auto-determine based on current date
+    else:
+        reference_date = None  # Annual mode doesn't need alignment
+
     # Thread use_quarterly_beta into trend calculation
-    trend_scores = calculate_trend_indicators(df, key_metrics_for_trends, use_quarterly=use_quarterly_beta)
+    trend_scores = calculate_trend_indicators(df, key_metrics_for_trends,
+                                             use_quarterly=use_quarterly_beta,
+                                             reference_date=reference_date)
     cycle_score = calculate_cycle_position_score(trend_scores, key_metrics_for_trends)
     _log_timing("03_Trend_Indicators_Complete")
 
@@ -8429,10 +8574,10 @@ if os.environ.get("RG_TESTS") == "1":
     test_metrics = ["EBITDA Margin", "Total Debt / EBITDA (x)", "Return on Equity", "Current Ratio (x)"]
 
     # Test 9a: FY-mode (use_quarterly=False) - should use only base + .1-.4
-    trend_fy = calculate_trend_indicators(trend_test, test_metrics, use_quarterly=False)
+    trend_fy = calculate_trend_indicators(trend_test, test_metrics, use_quarterly=False, reference_date=None)
 
     # Test 9b: Quarterly-mode (use_quarterly=True) - should use base + .1-.12 (available up to .8 here)
-    trend_cq = calculate_trend_indicators(trend_test, test_metrics, use_quarterly=True)
+    trend_cq = calculate_trend_indicators(trend_test, test_metrics, use_quarterly=True, reference_date=None)
 
     # Verify that momentum differs between the two modes
     # Momentum compares recent vs prior periods, so including .5-.8 should change the result
@@ -8476,8 +8621,8 @@ if os.environ.get("RG_TESTS") == "1":
 
     # B. Trend window affects momentum/volatility but NOT the period selector
     try:
-        m_annual = calculate_trend_indicators(_df, test_metrics, use_quarterly=False)
-        m_quarterly = calculate_trend_indicators(_df, test_metrics, use_quarterly=True)
+        m_annual = calculate_trend_indicators(_df, test_metrics, use_quarterly=False, reference_date=None)
+        m_quarterly = calculate_trend_indicators(_df, test_metrics, use_quarterly=True, reference_date=None)
 
         # Check if momentum differs between annual and quarterly windows
         if (m_annual["EBITDA Margin_momentum"] != m_quarterly["EBITDA Margin_momentum"]).any():
