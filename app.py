@@ -3233,13 +3233,29 @@ def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_se
                 result[metric] = pd.Series(np.nan, index=df.index)
         return result
 
-    # Build FY suffix list (annual-only)
-    fy_suffixes, _ = period_cols_by_kind(pe_data, df)
-    candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data[:5]]  # First 5 as fallback
+    # Build suffix list based on data_period_setting (FY0 or CQ-0)
+    fy_suffixes, cq_suffixes = period_cols_by_kind(pe_data, df)
 
-    # For each metric, extract most recent annual value (vectorized)
+    if data_period_setting == "Most Recent Quarter (CQ-0)":
+        # User wants most recent quarter - include both CQ and FY, most recent date wins
+        if cq_suffixes:
+            # Include both CQ and FY periods - line 3270-3272 will pick the most recent
+            candidate_suffixes = cq_suffixes + fy_suffixes
+        else:
+            # No quarterly data available - use FY as fallback
+            candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data[:5]]
+
+    elif data_period_setting == "Most Recent Fiscal Year (FY0)":
+        # User wants fiscal year data only
+        candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data[:5]]
+
+    else:
+        # Unknown setting - default to FY for safety
+        candidate_suffixes = fy_suffixes if fy_suffixes else [s for s, _ in pe_data[:5]]
+
+    # For each metric, extract most recent value based on data_period_setting (vectorized)
     for metric in metric_list:
-        # Collect (date, value) pairs for this metric across all FY suffixes
+        # Collect (date, value) pairs for this metric across candidate suffixes
         metric_data = []
         for sfx in candidate_suffixes:
             col = f"{metric}{sfx}" if sfx else metric
