@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Issuer Credit Screening Model V2.0** - A Streamlit-based application for analyzing corporate credit quality using a 6-factor composite scoring system with sector-adjusted weights, dual-horizon trend analysis, PCA-based cohort clustering, and AI-powered credit report generation.
+**Issuer Credit Screening Model V2.2.1** - A Streamlit-based application for analyzing corporate credit quality using a 6-factor composite scoring system with sector-adjusted weights, dual-horizon trend analysis, classification-first recommendation logic with rating guardrails, PCA-based cohort clustering, and AI-powered credit report generation.
 
 ## Running the Application
 
@@ -25,7 +25,7 @@ python test_genai_patches.py
 ## Architecture
 
 ### Single-File Structure
-The entire application is contained in `app.py` (~8100 lines). This is intentional for deployment simplicity to Streamlit Cloud.
+The entire application is contained in `app.py` (~8,700 lines). This is intentional for deployment simplicity to Streamlit Cloud.
 
 ### Tab Structure (7 tabs)
 
@@ -98,6 +98,14 @@ Two modes controlled by `use_quarterly_beta`:
 - **Short-term trend** (1-2 periods): Recent momentum indicator
 - **Context-aware signals**: Combined analysis produces refined signals like "Strong & Normalizing", "Weak & Deteriorating"
 
+**Trend Sensitivity** (V2.2.1):
+- **10x multiplier** applied to normalized slope for full distribution spread (app.py:5360)
+- Financial metrics with 1-5% annual change translate to meaningful trend scores:
+  - 1% per year → score 55 (slightly improving)
+  - 5% per year → score 75 (strongly improving)
+- **Expected distribution**: min 15-25, mean 48-55, max 75-85, std 15-20
+- Previous 5x multiplier caused clustering around neutral (48-52)
+
 ### Data Validation
 
 **Required columns** (flexible name matching via aliases):
@@ -110,6 +118,98 @@ Two modes controlled by `use_quarterly_beta`:
 - `period_alignment`: Requires "Period Ended" column
 
 Functions `resolve_column()` and `validate_core()` handle robust column name matching (case-insensitive, handles NBSP, extra spaces).
+
+### Reference Date Alignment (V2.2)
+
+**Dynamic Reference Date** (app.py:33-87):
+- `get_reference_date()` auto-advances quarterly based on current date and 60-day reporting lag
+- Strategy:
+  - Before April: Dec 31 of TWO years ago (companies still reporting prior year)
+  - April-June: Dec 31 of prior year (most annual data available)
+  - July onwards: Most recent quarter-end that's 60+ days old
+- Example: Nov 2025 → Sep 30, 2025; Apr 2026 → Dec 31, 2025
+
+**Two-Checkbox Approach** (app.py:4676-4725):
+- **Checkbox 1**: "Use quarterly data where available" (use_quarterly_beta)
+- **Checkbox 2**: "Align all issuers to common reference date" (align_to_reference)
+  - Only shown when quarterly mode is ON
+  - User can choose currency vs fairness trade-off
+
+**Alignment Scope** (V2.2.1):
+- **When enabled** (CQ-0 + align_to_reference=True):
+  - Filters **point-in-time metrics** to reference date (Composite Score inputs)
+  - Filters **trend analysis** to reference date (Cycle Position inputs)
+  - Ensures fair comparison across all issuers (no 9-12 month timing gaps)
+- **When disabled**: Uses latest available data for each issuer (maximum currency)
+
+**Key Functions**:
+- `get_reference_date()` - Auto-determine reference date (lines 33-87)
+- `_batch_extract_metrics()` - Accepts reference_date parameter (lines 3222-3312)
+- `_cf_components_dataframe()` - Cash flow extraction with alignment (lines 3318-3366)
+- `calculate_quality_scores()` - Quality scores with reference_date (lines 6039-6252)
+- `calculate_trend_indicators()` - Trend scores with reference_date (lines 5126-5590)
+
+**UI Indicators**:
+- Header shows reference date when alignment active
+- Info box in sidebar shows reference date and rationale
+- Warning box when alignment disabled (timing differences active)
+- CQ-0 selector shows timing difference warning
+
+### Recommendation Logic (V2.2.1)
+
+**Classification-First Approach** (app.py:6594-6843):
+
+The recommendation system uses a **three-tier logic**:
+
+**Tier 1: Classification Determines Base Recommendation** (_assign_recommendation_by_classification):
+- **Strong & Improving**: Strong Buy (≥70% percentile) or Buy
+- **Strong but Deteriorating**: Buy (≥70% percentile) or Hold
+- **Strong & Normalizing**: Always Buy (quality overrides short-term weakness)
+- **Strong & Moderating**: Always Buy (high quality despite volatility)
+- **Weak but Improving**: Buy (≥70% percentile) or Hold
+- **Weak & Deteriorating**: Always Avoid
+
+**Tier 2: Rating Guardrails** (_apply_rating_guardrails):
+- **Distressed (CCC/CC/C/D)**: Cap Strong Buy/Buy → Hold (high default risk)
+- **Single-B**: Cap Strong Buy → Buy (speculative grade, too risky)
+- **Investment Grade & BB**: No caps applied
+
+**Tier 3: Comprehensive Validation** (lines 6745-6843):
+- Checks 4 violation types:
+  1. Weak & Deteriorating with Buy/Strong Buy
+  2. Distressed with Strong Buy
+  3. Single-B with Strong Buy
+  4. Strong & Improving with Avoid
+- Displays error message if violations detected
+- Shows success message with guardrail statistics
+- Full audit trail via `Recommendation_Reason` column
+
+**Key Differences from V2.1**:
+- ✓ Recommendations now **respect classification** (not just percentile)
+- ✓ **Rating-based guardrails** prevent inappropriate recommendations for weak credits
+- ✓ "Strong & Moderating" treated as **Buy** opportunity (high quality despite volatility)
+- ✓ **Comprehensive validation** with user-visible messages
+- ✗ Old logic used percentile only, ignored classification entirely
+
+### Validation Framework (V2.2.1)
+
+**Signal Classification Diagnostic** (app.py:6541-6576):
+- Checks for Weak & Deteriorating issuers incorrectly classified as Strong
+- Shows warning with affected issuer count
+- Expandable table to review specific cases
+- Suppressed during tests
+
+**Minimum Factor Validation** (app.py:5752-5766):
+- Requires minimum 4 of 8 quality factors for reliable score
+- Sets quality score to NaN for insufficient data
+- Sidebar warning with exclusion count
+- Prevents unreliable scores from sparse data
+
+**Recommendation Validation** (app.py:6745-6843):
+- Validates all 4 guardrail types
+- Shows detailed error if violations detected
+- Success message with guardrail statistics
+- Full transparency for users
 
 ### PCA Visualization
 
@@ -224,13 +324,17 @@ Functions:
 2. **Column validation** → `validate_core()`
 3. **Period parsing** → `parse_period_ended_cols()`
 4. **Period classification** → `period_cols_by_kind()` (FY vs CQ)
-5. **Metric extraction** → `get_most_recent_column()` per user's data period setting
-6. **Trend calculation** → Dual-horizon trend indicators (medium-term + short-term)
-7. **Weight resolution** → `get_classification_weights()`
-8. **Scoring** → Raw quality/trend scores + composite score
-9. **Signal derivation** → Context-aware signals (V2.0)
-10. **Rating band assignment** → `assign_rating_band()`
-11. **Display** → Filters → PCA → Leaderboards → GenAI Reports
+5. **Reference date determination** → `get_reference_date()` (if alignment enabled)
+6. **Metric extraction** → `_batch_extract_metrics()` with optional reference_date filtering
+7. **Trend calculation** → Dual-horizon trend indicators (medium-term + short-term) with 10x multiplier
+8. **Weight resolution** → `get_classification_weights()`
+9. **Scoring** → Raw quality/trend scores + composite score (with reference_date if CQ-0 + aligned)
+10. **Signal derivation** → Context-aware signals (Strong & Improving, Weak & Deteriorating, etc.)
+11. **Signal validation** → Check for misclassifications (V2.2.1)
+12. **Recommendation assignment** → Classification-first with rating guardrails (V2.2.1)
+13. **Recommendation validation** → 4 violation checks with user messages (V2.2.1)
+14. **Rating band assignment** → `assign_rating_band()`
+15. **Display** → Filters → PCA → Leaderboards → GenAI Reports
 
 ## React-Safe Table Rendering
 
@@ -249,9 +353,10 @@ Functions:
 
 - **Testing mode**: Many sections check `os.environ.get("RG_TESTS")` to disable UI code during tests
 - **Caching**: `@st.cache_data` on `load_and_process_data()` for performance
-- **Version markers**: Code sections tagged with `[V2.0]` comments
-- **No emojis**: Professional appearance, emojis removed in V2.0
+- **Version markers**: Code sections tagged with `[V2.0]`, `[V2.2]`, `[V2.2.1]` comments
+- **No emojis**: Professional appearance, emojis removed in V2.0 and V2.2.1
 - **Robust error handling**: Graceful fallbacks throughout
+- **User transparency**: Validation messages, success indicators, audit trails (V2.2.1)
 
 ## Common Modifications
 
@@ -298,6 +403,17 @@ Functions:
 - `resolve_company_name_column()` - Find company name column
 - `resolve_rating_column()` - Find rating column
 
+**Recommendation Logic (V2.2.1)**:
+- `_assign_recommendation_by_classification()` - Map classification + percentile to base recommendation
+- `_apply_rating_guardrails()` - Apply rating-based caps (distressed, single-B)
+- `assign_final_recommendation()` - Complete recommendation with audit trail
+- Returns: (final_recommendation, reason_string) tuple
+
+**Validation (V2.2.1)**:
+- Signal classification diagnostic (lines 6541-6576)
+- Minimum factor validation (lines 5752-5766)
+- Recommendation validation (lines 6745-6843)
+
 **Diagnostics**:
 - `generate_data_diagnostics_v2()` - Per-issuer data quality report
 - `generate_global_data_health_v2()` - Dataset-wide health metrics
@@ -318,17 +434,74 @@ Optional:
 
 ## Performance Notes
 
-- **File size**: ~8100 lines (single-file architecture)
+- **File size**: ~8,700 lines (single-file architecture)
 - **Dataset handling**: Optimized for 100-5000 issuers
 - **PCA**: Subsamples to 2000 points for performance
 - **Caching**: Data loading and processing cached via `@st.cache_data`
 - **GenAI reports**: ~5-15 seconds per report (OpenAI API latency)
+- **Trend calculation**: 10x multiplier optimized for financial metrics (1-5% typical change)
 
-## Recent Changes (V2.0)
+## Recent Changes (V2.2.1)
+
+### Major Features (V2.2.1 - Current)
+
+1. **Classification-First Recommendation Logic** (Complete Rewrite)
+   - Three-tier system: Classification → Rating Guardrails → Validation
+   - Respects signal classification (Strong & Improving always gets Buy/Strong Buy)
+   - Rating-based caps: Distressed (CCC/CC/C/D) capped to Hold, Single-B capped to Buy
+   - Comprehensive validation with 4 violation checks
+   - User-visible success/error messages with audit trail
+   - `Recommendation_Reason` column for transparency
+   - Fixes critical bug where 75% of recommendations were wrong (ignored classification)
+
+2. **Enhanced Trend Sensitivity**
+   - Increased multiplier from 5x to 10x for full distribution spread
+   - Financial metrics with 1-5% annual change now produce meaningful scores
+   - Expected distribution: min 15-25, mean 48-55, max 75-85, std 15-20
+   - Eliminates clustering around neutral (48-52)
+   - Clear differentiation between improving and deteriorating issuers
+
+3. **Extended Reference Date Alignment**
+   - Alignment now applies to BOTH point-in-time (Composite Score) AND trends (Cycle Position)
+   - Dynamic reference date auto-advances quarterly based on current date
+   - Two-checkbox approach: use quarterly + optional alignment
+   - CQ-0 timing warning at point-in-time selector
+   - Header shows reference date when alignment active
+   - Ensures fair comparison across all issuers (no 9-12 month timing gaps)
+
+4. **Comprehensive Validation Framework**
+   - Signal classification diagnostic (detects misclassifications)
+   - Minimum 4 of 8 quality factors required for reliable scores
+   - Recommendation validation with 4 guardrail checks
+   - User-visible warnings and success messages
+   - Full transparency for data quality issues
+
+5. **UI/UX Improvements**
+   - Removed all emojis for professional appearance
+   - Dynamic reference date display in header
+   - Info/warning boxes for alignment status
+   - CQ-0 timing difference warnings
+   - Guardrail success messages with statistics
+
+### V2.2 Features
+
+1. **Dynamic Reference Date Logic**
+   - Auto-advances quarterly (no manual updates needed)
+   - Accounts for 60-day reporting lag
+   - Before April: Dec 31 two years ago
+   - April-June: Dec 31 prior year
+   - July onwards: Most recent quarter-end 60+ days old
+
+2. **Point-in-Time Alignment**
+   - Reference date filtering for Composite Score inputs
+   - Conditional application (only when CQ-0 + alignment enabled)
+   - Updated cash flow extraction functions
+   - Updated quality score calculation
+
+### V2.0 Features
 
 1. **GenAI Credit Report Tab**
    - AI-powered credit analysis using GPT-4 Turbo
-   - Replaces legacy AI Analysis tab
    - Professional 7-section reports
    - Downloadable markdown format
 
@@ -336,21 +509,15 @@ Optional:
    - Handles non-December fiscal year ends
    - Uses `parse_period_ended_cols()` for accuracy
    - Graceful fallback to month heuristic
-   - Consistent across application
 
 3. **React-Safe Rendering**
    - Migrated to `st.table()` from `st.dataframe()`
-   - Simplified data structures
    - Eliminated ChunkLoadError issues
 
-4. **Version Standardization**
-   - All version references now "V2.0"
-   - Updated header, comments, documentation
-
-5. **Enhanced Testing**
-   - 12 RG_TESTS (up from 11)
-   - Added non-December FY classification test
-   - Additional GenAI patch test suite
+4. **Enhanced Testing**
+   - 12 RG_TESTS total
+   - Non-December FY classification test
+   - GenAI patch test suite
 
 ## Known Issues / Edge Cases
 
