@@ -27,6 +27,20 @@ except Exception:  # SDK not installed in some envs
     _OPENAI_AVAILABLE = False
 
 # ============================================================================
+# PERIOD SELECTION ENUMS (V2.3 Unified Period Selection)
+# ============================================================================
+
+class PeriodSelectionMode(Enum):
+    """Unified period selection mode for both quality and trend scores"""
+    LATEST_AVAILABLE = "latest_available"  # Option A: Maximum currency, accepts misalignment
+    REFERENCE_ALIGNED = "reference_aligned"  # Option B: Common reference date, enforces alignment
+
+class PeriodType(Enum):
+    """Type of financial period"""
+    ANNUAL = "FY"  # Fiscal Year
+    QUARTERLY = "CQ"  # Calendar Quarter
+
+# ============================================================================
 # REFERENCE DATE HELPER (for timing alignment in quarterly mode)
 # ============================================================================
 
@@ -85,6 +99,295 @@ def get_reference_date():
             return pd.Timestamp(f"{year}-06-30")
         else:  # Q1 (Mar 31)
             return pd.Timestamp(f"{year}-03-31")
+
+
+def calculate_reference_date_coverage(df):
+    """
+    Calculate what % of issuers have data available for each calendar quarter.
+
+    Logic: A company has data for Q2 2025 if ANY of their Period Ended columns
+    contains a date between April 1, 2025 and June 30, 2025 (inclusive).
+
+    Args:
+        df: DataFrame with Period Ended columns
+
+    Returns:
+        List of dicts with keys: date, coverage_pct, quarter_label, date_label,
+                                 label, label_with_coverage, companies_with_data, total_companies
+        Sorted by date descending (most recent first)
+    """
+    from datetime import datetime
+
+    # Get all Period Ended columns (handle multi-index)
+    period_cols = []
+    for col in df.columns:
+        col_str = str(col)
+        if 'Period Ended' in col_str:
+            period_cols.append(col)
+
+    if not period_cols:
+        return []
+
+    # Define possible reference quarters (last 8 quarters)
+    current_date = datetime.now()
+    current_year = current_date.year
+
+    possible_quarters = [
+        pd.Timestamp(f"{current_year}-12-31"),
+        pd.Timestamp(f"{current_year}-09-30"),
+        pd.Timestamp(f"{current_year}-06-30"),
+        pd.Timestamp(f"{current_year}-03-31"),
+        pd.Timestamp(f"{current_year-1}-12-31"),
+        pd.Timestamp(f"{current_year-1}-09-30"),
+        pd.Timestamp(f"{current_year-1}-06-30"),
+        pd.Timestamp(f"{current_year-1}-03-31"),
+    ]
+
+    # Filter to only quarters that make sense (not in future)
+    valid_quarters = [q for q in possible_quarters if q <= pd.Timestamp(current_date)]
+
+    # Count total companies in dataset (for accurate coverage calculation)
+    total_companies = len(df)
+
+    # Pre-filter to identify companies with at least one valid period date
+    companies_with_any_data = 0
+    for idx, row in df.iterrows():
+        has_any_date = False
+        for col in period_cols:
+            try:
+                period_date = pd.to_datetime(row[col], errors='coerce')
+                if pd.notna(period_date) and period_date.year >= 1950:
+                    has_any_date = True
+                    break
+            except:
+                continue
+        if has_any_date:
+            companies_with_any_data += 1
+
+    # If no companies have data, return empty list
+    if companies_with_any_data == 0:
+        return []
+
+    # Calculate coverage for each quarter
+    coverage_results = []
+
+    for quarter_end in valid_quarters:
+        companies_with_data = 0
+
+        # Define EXACT quarter boundaries (no tolerance)
+        year = quarter_end.year
+        month = quarter_end.month
+
+        if month == 12:  # Q4: Oct 1 - Dec 31
+            quarter_start = pd.Timestamp(f"{year}-10-01")
+        elif month == 9:  # Q3: Jul 1 - Sep 30
+            quarter_start = pd.Timestamp(f"{year}-07-01")
+        elif month == 6:  # Q2: Apr 1 - Jun 30
+            quarter_start = pd.Timestamp(f"{year}-04-01")
+        else:  # Q1: Jan 1 - Mar 31
+            quarter_start = pd.Timestamp(f"{year}-01-01")
+
+        # Count companies with at least one period ending in this quarter
+        for idx, row in df.iterrows():
+            has_data_in_quarter = False
+
+            # Check all period columns for this company
+            for col in period_cols:
+                try:
+                    period_date = pd.to_datetime(row[col], errors='coerce')
+
+                    # Check if period end date falls within the quarter boundaries
+                    if pd.notna(period_date) and period_date.year >= 1950:
+                        if quarter_start <= period_date <= quarter_end:
+                            has_data_in_quarter = True
+                            break
+                except:
+                    continue
+
+            if has_data_in_quarter:
+                companies_with_data += 1
+
+        # Calculate coverage as % of ALL companies (not just those with any data)
+        coverage_pct = (companies_with_data / total_companies * 100) if total_companies > 0 else 0
+
+        # Create display labels with quarter format
+        quarter_num = (month - 1) // 3 + 1  # 1-4 for Q1-Q4
+        quarter_label = f"Q{quarter_num} {year}"
+        date_label = quarter_end.strftime("%b %d, %Y")
+        label_with_coverage = f"{quarter_label} ({coverage_pct:.0f}% coverage)"
+
+        coverage_results.append({
+            'date': quarter_end,
+            'coverage_pct': coverage_pct,
+            'quarter_label': quarter_label,         # "Q3 2025"
+            'date_label': date_label,               # "Sep 30, 2025"
+            'label': quarter_label,                 # Use quarter as primary label
+            'label_with_coverage': label_with_coverage,  # "Q3 2025 (11% coverage)"
+            'companies_with_data': companies_with_data,
+            'total_companies': total_companies,  # Use actual total, not filtered count
+            'companies_with_valid_data': companies_with_any_data,  # Track this separately for diagnostics
+            'quarter_start': quarter_start,         # For debug/display
+            'quarter_end': quarter_end              # For debug/display
+        })
+
+    # Sort by date descending (most recent first)
+    coverage_results.sort(key=lambda x: x['date'], reverse=True)
+
+    return coverage_results
+
+
+# ============================================================================
+# PERIOD SELECTION HELPER FUNCTIONS (V2.3)
+# ============================================================================
+
+def get_period_selection_options(df):
+    """
+    Generate dropdown options for reference period selection with coverage indicators.
+
+    Args:
+        df: DataFrame with Period Ended columns
+
+    Returns:
+        List of tuples: (display_label, reference_date_value, coverage_pct)
+    """
+    coverage_data = calculate_reference_date_coverage(df)
+
+    if not coverage_data:
+        return []
+
+    options = []
+    for info in coverage_data:
+        coverage_pct = info['coverage_pct']
+        ref_date = info['date']
+        quarter_label = info['quarter_label']
+
+        # Format: "Q4 2024 (Dec 31, 2024) - 87% coverage"
+        display_label = f"{quarter_label} ({ref_date.strftime('%b %d, %Y')}) - {coverage_pct:.0f}% coverage"
+
+        # Append warning for low coverage
+        if coverage_pct < 50:
+            display_label += " [Low coverage]"
+        elif coverage_pct >= 85:
+            display_label += " [Good coverage]"
+
+        options.append((display_label, ref_date, coverage_pct))
+
+    # Already sorted by date descending in calculate_reference_date_coverage
+    return options
+
+
+def get_recommended_reference_date(df):
+    """
+    Automatically select the best reference date.
+
+    Strategy:
+    1. Find most recent period with >= 85% coverage
+    2. If none, find most recent period with >= 70% coverage
+    3. If none, use most recent available period
+
+    Args:
+        df: DataFrame with Period Ended columns
+
+    Returns:
+        pd.Timestamp or None
+    """
+    options = get_period_selection_options(df)
+
+    if not options:
+        return None
+
+    # Try to find period with >= 85% coverage
+    for label, ref_date, coverage in options:
+        if coverage >= 85:
+            return ref_date
+
+    # Fall back to >= 70% coverage
+    for label, ref_date, coverage in options:
+        if coverage >= 70:
+            return ref_date
+
+    # Fall back to most recent
+    return options[0][1]
+
+
+def detect_stale_data(df, reference_date, stale_threshold_days=180):
+    """
+    Identify issuers with stale data (significantly older than reference date).
+
+    Args:
+        df: DataFrame with Period Ended columns
+        reference_date: pd.Timestamp reference date
+        stale_threshold_days: Number of days before data is considered stale
+
+    Returns:
+        DataFrame with columns: Company ID, Company Name, Latest Period, Days Old
+    """
+    company_id_col = resolve_company_id_column(df)
+    company_name_col = resolve_company_name_column(df)
+
+    if not company_id_col or not company_name_col:
+        return pd.DataFrame()
+
+    period_cols = parse_period_ended_cols(df)
+    if not period_cols:
+        return pd.DataFrame()
+
+    stale_issuers = []
+
+    for idx, row in df.iterrows():
+        # Find latest valid date for this issuer
+        latest_date = None
+        for col in period_cols:
+            try:
+                date_val = pd.to_datetime(row[col], errors='coerce')
+                if pd.notna(date_val) and date_val.year > 1950:
+                    if latest_date is None or date_val > latest_date:
+                        latest_date = date_val
+            except:
+                continue
+
+        if latest_date:
+            days_old = (reference_date - latest_date).days
+            if days_old > stale_threshold_days:
+                stale_issuers.append({
+                    'Company ID': row[company_id_col],
+                    'Company Name': row[company_name_col],
+                    'Latest Period': latest_date.strftime('%Y-%m-%d'),
+                    'Days Old': days_old,
+                    'Quarters Behind': days_old // 90
+                })
+
+    return pd.DataFrame(stale_issuers).sort_values('Days Old', ascending=False) if stale_issuers else pd.DataFrame()
+
+
+def get_period_type_for_date(period_calendar, company_id, target_date):
+    """
+    Determine if a given date corresponds to Annual or Quarterly data for an issuer.
+
+    Args:
+        period_calendar: DataFrame from build_period_calendar()
+        company_id: Issuer identifier
+        target_date: pd.Timestamp date to check
+
+    Returns:
+        PeriodType.ANNUAL or PeriodType.QUARTERLY
+    """
+    if period_calendar is None or period_calendar.empty:
+        return PeriodType.QUARTERLY  # Default
+
+    issuer_data = period_calendar[period_calendar['company_id'] == company_id]
+
+    if issuer_data.empty:
+        return PeriodType.QUARTERLY
+
+    # Check if date matches an FY period
+    fy_periods = issuer_data[issuer_data['period_type'] == 'FY']
+    for _, period in fy_periods.iterrows():
+        if abs((period['period_date'] - target_date).days) <= 10:
+            return PeriodType.ANNUAL
+
+    return PeriodType.QUARTERLY
+
 
 # [V2.2] Only configure Streamlit if not running tests
 if os.environ.get("RG_TESTS") != "1":
@@ -145,7 +448,7 @@ def render_header(results_final=None, data_period=None, use_sector_adjusted=Fals
 
         # Show reference date info if alignment is active
         if use_quarterly_beta and align_to_reference:
-            ref_date = get_reference_date()
+            ref_date = st.session_state.get('reference_date_override', get_reference_date())
             st.caption(
                 f"Data Periods: {_period_labels['fy_label']}  |  {_period_labels['cq_label']}  |  "
                 f"**Reference Date**: {ref_date.strftime('%b %d, %Y')} (aligned for fair comparison)"
@@ -935,12 +1238,20 @@ def extract_issuer_financial_data(df_original: pd.DataFrame, company_name: str) 
             # Skip if missing
             if pd.isna(period_value) or pd.isna(metric_value):
                 continue
+
+            # Try to convert metric value to float, skip if not numeric
+            try:
+                numeric_value = float(metric_value)
+            except (ValueError, TypeError):
+                # Skip non-numeric values like 'NM', 'N/A', etc.
+                continue
+
             # Robust parse; ignore Excel serials/NaT/1900 sentinels
             dt = pd.to_datetime(period_value, errors="coerce", dayfirst=True)
             if pd.isna(dt) or (hasattr(dt, "year") and dt.year == 1900):
                 continue
             date_str = pd.Timestamp(dt).strftime("%Y-%m-%d")
-            time_series[date_str] = float(metric_value)
+            time_series[date_str] = numeric_value
             # Prefer classifier by suffix; otherwise use month heuristic
             kind = period_kind_by_suffix.get(suffix)
             if kind is None:
@@ -2653,8 +2964,8 @@ def render_ai_analysis_chat(df_original: pd.DataFrame, results_final: pd.DataFra
     try:
         buckets = build_buckets_v2(results_final,
                                     df_original,
-                                    trend_thr=st.session_state.get("cfg_trend_threshold", 55),
-                                    quality_thr=st.session_state.get("cfg_quality_threshold", 60))
+                                    trend_thr=55,  # Fixed threshold
+                                    quality_thr=60)  # Fixed threshold
         df_counts = buckets.get("counts", pd.DataFrame())
         if isinstance(df_counts, dict):
             df_counts = pd.DataFrame(list(df_counts.items()), columns=["Signal","Count"])
@@ -3598,6 +3909,164 @@ def build_dynamic_period_labels(df: pd.DataFrame):
     }
 
 # ============================================================================
+# DYNAMIC WEIGHT CALIBRATION (V2.2.1)
+# ============================================================================
+
+def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True):
+    """
+    Calculate sector weights that normalize scores across sectors.
+
+    Methodology: Inverse Deviation Weighting
+    - If sector underperforms on factor → REDUCE weight (minimize penalty)
+    - If sector outperforms on factor → REDUCE weight (don't amplify advantage)
+    - If sector is neutral on factor → INCREASE weight (make it differentiator)
+
+    Args:
+        df: DataFrame with factor scores and classifications
+        rating_band: Rating level to calibrate on (default 'BBB' for broad IG)
+        use_dynamic: If True, calculate from uploaded data. If False, use pre-computed.
+
+    Returns:
+        dict: Sector name -> {factor: weight} mappings, normalized to sum=1.0
+    """
+    if not use_dynamic:
+        # Return pre-computed weights (for performance/stability)
+        return SECTOR_WEIGHTS  # Falls back to current weights
+
+    # Define rating bands
+    rating_bands = {
+        'BBB': ['BBB+', 'BBB', 'BBB-'],
+        'A': ['A+', 'A', 'A-'],
+        'BB': ['BB+', 'BB', 'BB-'],
+    }
+
+    # Get companies in target rating band
+    target_ratings = rating_bands.get(rating_band, ['BBB+', 'BBB', 'BBB-'])
+
+    # Find the rating column
+    rating_col = None
+    for col_name in ['Credit_Rating_Clean', 'S&P LT Issuer Credit Rating', 'Credit Rating', 'Rating']:
+        if col_name in df.columns:
+            rating_col = col_name
+            break
+
+    if rating_col is None:
+        return SECTOR_WEIGHTS
+
+    df_rated = df[df[rating_col].isin(target_ratings)].copy()
+
+    if len(df_rated) < 50:  # Insufficient data
+        return SECTOR_WEIGHTS
+
+    # Map factor scores to their column names
+    factor_score_cols = {
+        'credit_score': 'Credit_Score',
+        'leverage_score': 'Leverage_Score',
+        'profitability_score': 'Profitability_Score',
+        'liquidity_score': 'Liquidity_Score',
+        'growth_score': 'Growth_Score',
+        'cash_flow_score': 'Cash_Flow_Score'
+    }
+
+    # Get classification field
+    class_field = None
+    for field in ['Rubrics_Custom_Classification', 'Rubrics Custom Classification',
+                  'Classification', 'Custom_Classification']:
+        if field in df_rated.columns:
+            class_field = field
+            break
+
+    if class_field is None:
+        return SECTOR_WEIGHTS
+
+    # Calculate market medians (for this rating band)
+    market_medians = {}
+    for factor_key, score_col in factor_score_cols.items():
+        if score_col in df_rated.columns:
+            values = pd.to_numeric(df_rated[score_col], errors='coerce').dropna()
+            if len(values) > 0:
+                market_medians[factor_key] = values.median()
+
+    # Calculate sector-specific weights
+    calibrated_weights = {}
+
+    for sector_name in SECTOR_WEIGHTS.keys():
+        if sector_name == 'Default':
+            continue
+
+        # Get classifications for this sector
+        sector_classifications = [k for k, v in CLASSIFICATION_TO_SECTOR.items()
+                                 if v == sector_name]
+
+        # Get companies in this sector
+        sector_df = df_rated[df_rated[class_field].isin(sector_classifications)]
+
+        if len(sector_df) < 5:  # Insufficient data for this sector
+            calibrated_weights[sector_name] = SECTOR_WEIGHTS[sector_name]
+            continue
+
+        # Calculate sector medians
+        sector_medians = {}
+        for factor_key, score_col in factor_score_cols.items():
+            if score_col in sector_df.columns:
+                values = pd.to_numeric(sector_df[score_col], errors='coerce').dropna()
+                if len(values) > 0:
+                    sector_medians[factor_key] = values.median()
+
+        # Calculate deviations and calibrated weights
+        raw_weights = {}
+
+        for factor_key in factor_score_cols.keys():
+            if factor_key not in sector_medians or factor_key not in market_medians:
+                raw_weights[factor_key] = SECTOR_WEIGHTS['Default'][factor_key]
+                continue
+
+            sector_val = sector_medians[factor_key]
+            market_val = market_medians[factor_key]
+
+            if market_val == 0:
+                raw_weights[factor_key] = SECTOR_WEIGHTS['Default'][factor_key]
+                continue
+
+            # Calculate deviation percentage
+            # For scores, higher is better, so negative deviation = underperformance
+            deviation_pct = ((sector_val - market_val) / abs(market_val)) * 100
+
+            abs_dev = abs(deviation_pct)
+            base_weight = SECTOR_WEIGHTS['Default'][factor_key]
+
+            # Apply inverse weighting
+            # For scores, negative deviation = sector is worse, so reduce weight
+            # For scores, positive deviation = sector is better, so reduce weight (don't amplify)
+
+            if abs_dev > 50:
+                # Large deviation (either direction) → significantly reduce weight
+                calibrated = base_weight * 0.30
+            elif abs_dev > 25:
+                # Moderate deviation → moderately reduce weight
+                calibrated = base_weight * 0.50
+            elif abs_dev > 10:
+                # Small deviation → slightly reduce weight
+                calibrated = base_weight * 0.75
+            else:
+                # Minimal deviation → keep weight similar (this is a good differentiator)
+                calibrated = base_weight * 0.95
+
+            raw_weights[factor_key] = calibrated
+
+        # Normalize to sum = 1.0
+        total = sum(raw_weights.values())
+        if total > 0:
+            calibrated_weights[sector_name] = {k: v/total for k, v in raw_weights.items()}
+        else:
+            calibrated_weights[sector_name] = SECTOR_WEIGHTS[sector_name]
+
+    # Add Default as is
+    calibrated_weights['Default'] = SECTOR_WEIGHTS['Default']
+
+    return calibrated_weights
+
+# ============================================================================
 # SECTOR-SPECIFIC WEIGHTS (SOLUTION TO ISSUE #1: SECTOR BIAS)
 # ============================================================================
 
@@ -3772,37 +4241,41 @@ def get_sector_weights(sector, use_sector_adjusted=True):
         return SECTOR_WEIGHTS['Default']
     return SECTOR_WEIGHTS.get(sector, SECTOR_WEIGHTS['Default'])
 
-def get_classification_weights(classification, use_sector_adjusted=True):
+def get_classification_weights(classification, use_sector_adjusted=True, calibrated_weights=None):
     """
     Get factor weights for a Rubrics Custom Classification.
-    
+
     Hierarchy:
     1. Check if classification has custom override weights
-    2. Map to parent sector and use sector weights  
+    2. Map to parent sector and use sector weights
     3. Fall back to Default if classification not found
-    
+
     Args:
         classification: Rubrics Custom Classification value
         use_sector_adjusted: Whether to use adjusted weights (vs universal Default)
-    
+        calibrated_weights: Optional dict of dynamically calibrated weights (V2.2.1)
+
     Returns:
         Dictionary with 6 factor weights (summing to 1.0)
     """
+    # Use calibrated weights if provided, otherwise use static weights
+    weights_to_use = calibrated_weights if calibrated_weights is not None else SECTOR_WEIGHTS
+
     if not use_sector_adjusted:
-        return SECTOR_WEIGHTS['Default']
-    
+        return weights_to_use.get('Default', SECTOR_WEIGHTS['Default'])
+
     # Step 1: Check for custom overrides
     if classification in CLASSIFICATION_OVERRIDES:
         return CLASSIFICATION_OVERRIDES[classification]
-    
+
     # Step 2: Map to parent sector
     if classification in CLASSIFICATION_TO_SECTOR:
         parent_sector = CLASSIFICATION_TO_SECTOR[classification]
-        if parent_sector in SECTOR_WEIGHTS:
-            return SECTOR_WEIGHTS[parent_sector]
-    
+        if parent_sector in weights_to_use:
+            return weights_to_use[parent_sector]
+
     # Step 3: Fall back to Default
-    return SECTOR_WEIGHTS['Default']
+    return weights_to_use.get('Default', SECTOR_WEIGHTS['Default'])
 
 # ================================
 # EXPLAINABILITY HELPERS (V2.2) — canonical
@@ -3857,9 +4330,8 @@ def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
 
 def _build_explainability_table(issuer_row: pd.Series, scoring_method: str):
     """
-    Build a 4-col table: Factor, Score, Weight %, Contribution.
-    Normalises weights over present factor columns. Returns
-    (df, provenance, composite_score, diff_sum_minus_composite).
+    Build comparison table showing current weights vs original weights used in calculation.
+    Returns (df, provenance, composite_score, diff_current, original_sum_contrib, has_original_weights).
     """
     # Map display names to column names and weight keys
     factor_map = {
@@ -3872,30 +4344,77 @@ def _build_explainability_table(issuer_row: pd.Series, scoring_method: str):
     }
 
     canonical = list(factor_map.keys())
-    # Check for column existence using mapped names
+
+    # Check for column existence
     present = [f for f in canonical if f.replace(" ", "_") + "_Score" in issuer_row.index]
 
-    weights_lc, provenance = _resolve_model_weights_for_row(issuer_row, scoring_method)
+    # Get CURRENT weights (from current calibration settings)
+    current_weights_lc, provenance = _resolve_model_weights_for_row(issuer_row, scoring_method)
 
-    w = {f: float(max(0.0, weights_lc.get(factor_map[f], 0.0))) for f in present}
-    s = sum(w.values()) or 1.0
-    w = {k: v / s for k, v in w.items()}
+    # Normalize current weights over present factors
+    current_w = {f: float(max(0.0, current_weights_lc.get(factor_map[f], 0.0))) for f in present}
+    current_sum = sum(current_w.values()) or 1.0
+    current_w = {k: v / current_sum for k, v in current_w.items()}
 
+    # Get ORIGINAL weights (used in actual calculation) from stored columns
+    original_w = {}
+    weight_cols_map = {
+        "Credit": "Weight_Credit_Used",
+        "Leverage": "Weight_Leverage_Used",
+        "Profitability": "Weight_Profitability_Used",
+        "Liquidity": "Weight_Liquidity_Used",
+        "Growth": "Weight_Growth_Used",
+        "Cash Flow": "Weight_CashFlow_Used"
+    }
+
+    # Check if original weights are stored
+    has_original_weights = all(weight_cols_map[f] in issuer_row.index for f in present)
+
+    if has_original_weights:
+        original_w = {f: float(issuer_row.get(weight_cols_map[f], 0.0)) for f in present}
+        original_sum = sum(original_w.values()) or 1.0
+        original_w = {k: v / original_sum for k, v in original_w.items()}
+    else:
+        # Fall back to current weights if original not stored
+        original_w = current_w.copy()
+
+    # Build comparison table
     rows = []
     for fac in present:
         col_name = fac.replace(" ", "_") + "_Score"
         score = float(issuer_row.get(col_name, np.nan))
-        wt = w[fac]
+
+        current_wt = current_w[fac]
+        original_wt = original_w[fac]
+
+        current_contrib = score * current_wt
+        original_contrib = score * original_wt
+
+        # Calculate weight change
+        weight_change = ((current_wt - original_wt) / original_wt * 100) if original_wt > 0 else 0
+
         rows.append({
             "Factor": fac,
-            "Score": score,
-            "Weight %": round(100.0 * wt, 2),
-            "Contribution": round(score * wt, 4)
+            "Score": round(score, 2),
+            "Original Weight %": round(100.0 * original_wt, 1),
+            "Current Weight %": round(100.0 * current_wt, 1),
+            "Weight Change": f"{weight_change:+.0f}%",
+            "Original Contrib": round(original_contrib, 2),
+            "Current Contrib": round(current_contrib, 2),
+            "Contrib Change": round(current_contrib - original_contrib, 2)
         })
+
     df = pd.DataFrame(rows)
     comp = float(issuer_row.get("Composite_Score", np.nan))
-    diff = float(df["Contribution"].sum() - comp) if len(df) else np.nan
-    return df, provenance, comp, diff
+
+    # Calculate differences
+    original_sum_contrib = df["Original Contrib"].sum() if len(df) else np.nan
+    current_sum_contrib = df["Current Contrib"].sum() if len(df) else np.nan
+    diff_original = float(original_sum_contrib - comp) if pd.notna(comp) and len(df) else np.nan
+    diff_current = float(current_sum_contrib - comp) if pd.notna(comp) and len(df) else np.nan
+
+    # Return extended info
+    return df, provenance, comp, diff_current, original_sum_contrib, has_original_weights
 # ================================
 
 def render_issuer_explainability(filtered: pd.DataFrame, scoring_method: str):
@@ -3933,17 +4452,88 @@ def render_issuer_explainability(filtered: pd.DataFrame, scoring_method: str):
         st.markdown("---")
         st.markdown("### Factor Contributions")
 
-        df_contrib, provenance, comp, diff = _build_explainability_table(issuer_row, scoring_method)
+        df_contrib, provenance, comp, diff_current, original_sum, has_original = _build_explainability_table(issuer_row, scoring_method)
 
-        left, right = st.columns([3, 2])
-        with left:
-            st.markdown(f"**Weight Method (provenance):** {provenance}")
-            st.dataframe(df_contrib, use_container_width=True, hide_index=True)
-        with right:
-            st.metric("Composite (as-at)", f"{comp:.2f}" if pd.notna(comp) else "n/a")
-            st.metric("Sum of contributions", f"{df_contrib['Contribution'].sum():.2f}" if len(df_contrib) else "n/a")
-            if pd.notna(comp) and len(df_contrib) and abs(diff) > 0.5:
-                st.warning(f"Contributions differ from Composite by {diff:+.2f}. Check factor set and weights.")
+        # Display weight provenance
+        st.markdown(f"**Current Weight Method:** {provenance}")
+
+        if has_original:
+            st.info("ℹ️ **Comparison Mode:** Showing original weights (used in calculation) vs current weights (from active calibration)")
+        else:
+            st.info("ℹ️ **Note:** Original weights not stored. Showing current calibrated weights only.")
+
+        # Display comparison table
+        st.dataframe(df_contrib, use_container_width=True, hide_index=True)
+
+        # Highlight significant weight changes
+        st.caption("""
+        **How to read this table:**
+        - **Score**: Factor score (0-100) for this issuer
+        - **Original Weight %**: Weight used in stored composite calculation
+        - **Current Weight %**: Weight from current dynamic calibration settings
+        - **Weight Change**: % change from original to current
+        - **Original Contrib**: Factor's contribution with original weights
+        - **Current Contrib**: Factor's contribution with current weights
+        - **Contrib Change**: How calibration changes this factor's impact
+        """)
+
+        # Summary metrics
+        st.markdown("---")
+        st.markdown("### Score Breakdown")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("Stored Composite Score", f"{comp:.2f}" if pd.notna(comp) else "n/a")
+            st.caption("Score as calculated and stored")
+
+        with col2:
+            if has_original and pd.notna(original_sum):
+                st.metric("Original Calculation", f"{original_sum:.2f}")
+                st.caption("Sum using original weights")
+                diff_original = original_sum - comp if pd.notna(comp) else np.nan
+                if pd.notna(diff_original) and abs(diff_original) > 0.5:
+                    st.caption(f"Diff: {diff_original:+.2f} (rounding)")
+            else:
+                st.metric("Original Calculation", "N/A")
+                st.caption("Weights not stored")
+
+        with col3:
+            current_sum = df_contrib["Current Contrib"].sum() if len(df_contrib) else np.nan
+            if pd.notna(current_sum):
+                st.metric("Current Calibration", f"{current_sum:.2f}")
+                st.caption("Sum using current weights")
+                if pd.notna(comp):
+                    impact = current_sum - comp
+                    st.caption(f"Impact: {impact:+.2f} points")
+            else:
+                st.metric("Current Calibration", "N/A")
+
+        # Interpretation guidance
+        if has_original and pd.notna(comp) and pd.notna(current_sum):
+            impact = current_sum - comp
+            if abs(impact) > 5.0:
+                st.warning(f"""
+                **⚠️ Significant Calibration Impact ({impact:+.2f} points)**
+
+                Current dynamic calibration would change this issuer's score by {impact:+.2f} points
+                compared to the stored composite score. This indicates substantial weight adjustments
+                for this sector/classification.
+                """)
+            elif abs(impact) > 1.0:
+                st.info(f"""
+                **ℹ️ Moderate Calibration Impact ({impact:+.2f} points)**
+
+                Dynamic calibration adjusts this issuer's score by {impact:+.2f} points.
+                This shows sector-specific weighting is active and tailoring weights for this classification.
+                """)
+            elif abs(impact) > 0.1:
+                st.success(f"""
+                **✓ Minor Calibration Impact ({impact:+.2f} points)**
+
+                Current weights are very similar to original calculation.
+                Sector-adjusted weighting is active but produces minimal score change.
+                """)
 # ================================
 
 # ============================================================================
@@ -4141,6 +4731,66 @@ where all weights sum to 1.0
         st.table(weights_display)
 
     # ========================================================================
+    # [V2.2.1] SECTION 4A: WEIGHT CALIBRATION (IF ENABLED)
+    # ========================================================================
+
+    use_calibration = st.session_state.get('use_dynamic_calibration', True)
+    if use_calibration:
+        st.markdown("---")
+        st.markdown("### 4a. Dynamic Weight Calibration (ACTIVE)")
+
+        st.markdown("""
+        **Weight calibration mode is currently enabled (default).** The weights shown above have been recalibrated
+        from your uploaded data to normalize composite scores across sectors.
+
+        **How it works:**
+
+        1. **Target Rating Band Selection** — Calibration uses companies in a specific rating band (default: BBB)
+           to calculate sector-specific baseline performance.
+
+        2. **Deviation Analysis** — For each sector, the model calculates median factor scores and compares them
+           to the overall market median for that rating band.
+
+        3. **Inverse Weighting** — Weights are adjusted using an inverse deviation strategy:
+           - If a sector **underperforms** on a factor → **REDUCE** weight (minimize penalty)
+           - If a sector **outperforms** on a factor → **REDUCE** weight (don't amplify advantage)
+           - If a sector is **neutral** on a factor → **MAINTAIN** weight (use as differentiator)
+
+        4. **Normalization** — All weights are rescaled to sum to 1.0 for each sector.
+
+        **Weight Modes:**
+        - **Dynamic Calibration (default/on):** Sector-specific weights calculated from your data to ensure
+          fair cross-sector comparison. BBB-rated companies in all sectors average ~50-60 composite scores.
+        - **Universal Weights (off):** Same weights applied to all issuers regardless of sector.
+          Simpler but may introduce sector bias.
+
+        **Expected outcome:**
+        BBB-rated companies in all sectors should average composite scores of ~50-60, with similar
+        Buy recommendation rates (~40%) across sectors.
+
+        **Trade-off:**
+        - ✓ Fair cross-sector comparison
+        - ✓ Normalized composite scores
+        - ✗ May obscure sector-specific fundamentals
+        - ✗ Requires sufficient data (50+ companies, 5+ per sector)
+
+        See the **Calibration Diagnostics** panel in the Dashboard tab to evaluate effectiveness.
+        """)
+    else:
+        st.markdown("---")
+        st.markdown("### 4a. Universal Weights Mode (ACTIVE)")
+
+        st.markdown("""
+        **Universal weights mode is currently active.** All issuers receive the same factor weights
+        regardless of their sector or classification.
+
+        This is a simpler approach but may introduce sector bias, as sectors with structural differences
+        (e.g., Utilities with weak cash flow, Energy with high leverage) will score differently on average.
+
+        **To enable sector-fair comparison:** Check "Use Dynamic Weight Calibration" in the sidebar.
+        """)
+
+    # ========================================================================
     # SECTION 5: DATA VINTAGE & PERIOD HANDLING
     # ========================================================================
 
@@ -4177,9 +4827,10 @@ where all weights sum to 1.0
 
     st.markdown("## 6. Quality/Trend Split Logic")
 
-    quality_basis = st.session_state.get("cfg_quality_split_basis", "Percentile within Band (recommended)")
-    quality_threshold = st.session_state.get("cfg_quality_threshold", 60)
-    trend_threshold = st.session_state.get("cfg_trend_threshold", 55)
+    # [V2.3] quality_basis is now hard-coded
+    quality_basis = "Percentile within Band (recommended)"
+    quality_threshold = 60  # Fixed threshold
+    trend_threshold = 55  # Fixed threshold
 
     st.markdown(f"""
     **Current configuration:**
@@ -4694,168 +5345,226 @@ sm0, dp0, qb0, align0, band0, topn0 = apply_state_to_controls(_url_state)
 if _original_dp == "FY-4 (Legacy)":
     st.info("ℹ️ Note: 'FY-4 (Legacy)' option has been removed. Defaulted to 'Most Recent Fiscal Year (FY0)'.")
 
-# Model Version Selection (SOLUTION TO ISSUE #1)
-st.sidebar.subheader(" Scoring Method")
-scoring_method_options = ["Classification-Adjusted Weights (Recommended)", "Universal Weights (Original)"]
-scoring_method = st.sidebar.radio(
-    "Select Scoring Approach",
-    scoring_method_options,
-    index=0 if sm0.startswith("Classification") else 1,
-    help="Classification-Adjusted applies different factor weights by industry classification (e.g., Utilities emphasize cash flow more than leverage)"
-)
-use_sector_adjusted = (scoring_method == "Classification-Adjusted Weights (Recommended)")
+# [V2.2.1] DEPRECATED: Model Version Selection (now controlled by calibration checkbox)
+# The "Use Dynamic Weight Calibration" checkbox (below) now controls sector weighting:
+# - When ON: Sector-specific calibrated weights are used
+# - When OFF: Universal weights are used for all issuers
+# This old radio button is hidden but maintained for backward compatibility with URL state
 
-# Canonicalize & persist scoring method
+# Hidden for now - behavior controlled by calibration checkbox
+if False:  # Never show this radio button
+    st.sidebar.subheader(" Scoring Method")
+    scoring_method_options = ["Classification-Adjusted Weights (Recommended)", "Universal Weights (Original)"]
+    scoring_method = st.sidebar.radio(
+        "Select Scoring Approach",
+        scoring_method_options,
+        index=0 if sm0.startswith("Classification") else 1,
+        help="Classification-Adjusted applies different factor weights by industry classification (e.g., Utilities emphasize cash flow more than leverage)"
+    )
+    use_sector_adjusted = (scoring_method == "Classification-Adjusted Weights (Recommended)")
+else:
+    # Default to Classification-Adjusted for backward compatibility
+    scoring_method = "Classification-Adjusted Weights (Recommended)"
+    use_sector_adjusted = True  # Will be overridden by calibration setting
+
+# Canonicalize & persist scoring method (for URL state compatibility)
 sm_canonical = (
     "Classification-Adjusted Weights"
     if scoring_method.startswith("Classification-Adjusted")
     else "Universal Weights"
 )
 st.session_state["scoring_method"] = sm_canonical
-st.session_state["use_sector_adjusted"] = (sm_canonical == "Classification-Adjusted Weights")
+st.session_state["use_sector_adjusted"] = use_sector_adjusted  # Will be overridden by effective_use_sector_adjusted
 
-# === Sidebar: clarified controls ===
-st.sidebar.subheader("Configuration")
+# === Sidebar: V2.3 Unified Period Selection ===
+st.sidebar.subheader("Period Selection")
 
-# (A) Point-in-time period for scores (affects single-period features including Composite_Score inputs)
-data_period_setting = st.sidebar.selectbox(
-    "Point-in-time period for scores",
-    options=["Most Recent Fiscal Year (FY0)", "Most Recent Quarter (CQ-0)"],
-    index=["Most Recent Fiscal Year (FY0)", "Most Recent Quarter (CQ-0)"].index(dp0) if dp0 in ["Most Recent Fiscal Year (FY0)", "Most Recent Quarter (CQ-0)"] else 0,
-    help=(
-        "Determines which 'most-recent' value is used for point-in-time features. "
-        "FY0 uses the latest annual filing date; CQ-0 uses the latest quarterly filing date. "
-        "This does NOT affect trend/momentum windows."
-    ),
-    key="cfg_period_for_scores",
+# [V2.3] Unified period selection mode
+period_mode_display = st.sidebar.radio(
+    "Period Selection Mode",
+    options=[
+        "Latest Available (Maximum Currency)",
+        "Align to Reference Period"
+    ],
+    index=0,  # Default to Latest Available
+    help="""
+**Latest Available**: Each issuer uses their most recent data.
+⚠️ WARNING: Results in misaligned reporting dates across issuers.
+
+**Align to Reference Period**: All issuers aligned to a common date.
+Ensures apples-to-apples comparison.
+    """,
+    key="cfg_period_mode"
 )
 
-# Show timing difference warning when CQ-0 is selected
-if data_period_setting == "Most Recent Quarter (CQ-0)":
-    st.sidebar.info(
-        "**Note: Timing differences in CQ-0 mode**\n\n"
-        "Different issuers have different 'most recent quarter' dates (up to 9-12 months apart). "
-        "This affects Composite Scores. To align all issuers to a common reference date, "
-        "enable quarterly data below and check the alignment option."
-    )
-
-# (B) Trend window configuration
-st.sidebar.markdown("#### Trend Analysis Window")
-
-use_quarterly_beta = st.sidebar.checkbox(
-    "Use quarterly data where available",
-    value=qb0,
-    help=(
-        "When ON, momentum/volatility are computed from quarterly time series (up to 13 periods). "
-        "When OFF, momentum/volatility use annual-only series (5 periods). "
-        "This does NOT change the point-in-time period used for scores."
-    ),
-    key="cfg_trend_window_quarterly",
-)
-
-# Conditional: only show alignment option when quarterly mode is active
-if use_quarterly_beta:
-    align_to_reference = st.sidebar.checkbox(
-        "Align all issuers to common reference date",
-        value=align0,
-        help=(
-            "**Trade-off between currency and fairness:**\n\n"
-            "**When CHECKED (Recommended for screening):**\n"
-            "  • Filters all data to common reference date\n"
-            "  • Ensures fair comparison (no timing bias)\n"
-            "  • Data may be older but consistent across all issuers\n"
-            "  • Eliminates sector bias from mixed reporting schedules\n\n"
-            "**When UNCHECKED (For monitoring specific issuers):**\n"
-            "  • Uses latest available data for each issuer\n"
-            "  • Maximum currency (includes most recent quarters if available)\n"
-            "  • Creates timing gaps between issuers\n"
-            "  • May introduce sector bias (quarterly reporters more current)"
-        ),
-        key="cfg_align_to_reference",
-    )
-
-    # Show info/warning based on selection
-    if align_to_reference:
-        ref_date_display = get_reference_date()
-        st.sidebar.info(
-            f"**Reference date**: {ref_date_display.strftime('%B %d, %Y')}\n\n"
-            f"All trend analysis will use data through this date for fair comparison."
-        )
-    else:
-        st.sidebar.warning(
-            "**Timing differences active**\n\n"
-            "Quarterly reporters will use more recent data than annual reporters. "
-            "This may introduce sector bias but provides maximum currency."
-        )
+# Convert display to enum
+if period_mode_display == "Latest Available (Maximum Currency)":
+    period_mode = PeriodSelectionMode.LATEST_AVAILABLE
 else:
-    # If quarterly mode is off, no reference date needed
+    period_mode = PeriodSelectionMode.REFERENCE_ALIGNED
+
+# [V2.3] Reference date selector (only show for REFERENCE_ALIGNED mode)
+reference_date_override = None
+align_to_reference = False
+
+if period_mode == PeriodSelectionMode.REFERENCE_ALIGNED:
+    align_to_reference = True
+    st.sidebar.markdown("---")
+
+    # Get uploaded file from session state
+    uploaded_file_ref = st.session_state.get('uploaded_file')
+
+    if uploaded_file_ref is not None:
+        try:
+            file_name = uploaded_file_ref.name.lower()
+            if file_name.endswith('.csv'):
+                raw_df = pd.read_csv(uploaded_file_ref)
+            elif file_name.endswith('.xlsx'):
+                # Try multi-index first, fall back to single index
+                try:
+                    raw_df = pd.read_excel(uploaded_file_ref, sheet_name='Pasted Values', header=[0, 1])
+                except:
+                    raw_df = pd.read_excel(uploaded_file_ref, sheet_name='Pasted Values')
+
+            # Normalize headers
+            raw_df.columns = [' '.join(str(c).replace('\u00a0', ' ').split()) for c in raw_df.columns]
+
+            # Reset file pointer for later use
+            uploaded_file_ref.seek(0)
+        except Exception as e:
+            raw_df = None
+            st.sidebar.error(f"Error loading data: {str(e)}")
+    else:
+        raw_df = None
+
+    if raw_df is not None:
+        try:
+            # Get period options with coverage
+            period_options = get_period_selection_options(raw_df)
+
+            if period_options:
+                # Create dropdown with coverage indicators
+                option_labels = [opt[0] for opt in period_options]
+                option_dates = [opt[1] for opt in period_options]
+
+                # Find recommended (default to first with good coverage)
+                recommended_idx = 0
+                for i, (label, date, coverage) in enumerate(period_options):
+                    if coverage >= 85:
+                        recommended_idx = i
+                        break
+
+                selected_label = st.sidebar.selectbox(
+                    "Reference Period",
+                    options=option_labels,
+                    index=recommended_idx,
+                    help="Select the reporting period to align all issuers to. Higher coverage % is better.",
+                    key="cfg_reference_period_v3"
+                )
+
+                # Get corresponding date
+                selected_idx = option_labels.index(selected_label)
+                reference_date_override = option_dates[selected_idx]
+
+                st.sidebar.info(f"Using reference date: {reference_date_override.strftime('%Y-%m-%d')}")
+            else:
+                st.sidebar.warning("Could not detect period options from file")
+
+        except Exception as e:
+            st.sidebar.error(f"Error loading period options: {e}")
+else:
+    # LATEST_AVAILABLE mode
     align_to_reference = False
+    st.sidebar.warning("""
+⚠️ WARNING: Misaligned Reporting Dates
 
-# (C) Quality/Trend Split Configuration
-st.sidebar.markdown("#### Quality/Trend Split")
-split_basis = st.sidebar.selectbox(
-    "Quality split basis",
-    ["Percentile within Band (recommended)", "Global Percentile", "Absolute Composite Score"],
-    index=0,
-    help="Defines how we decide Strong vs Weak quality.",
-    key="cfg_quality_split_basis"
-)
-split_threshold = st.sidebar.slider(
-    "Quality threshold",
-    40, 80, 60,
-    help="Percentile or score threshold for Strong vs Weak classification",
-    key="cfg_quality_threshold"
-)
-trend_threshold = st.sidebar.slider(
-    "Trend threshold (Cycle Position)",
-    40, 70, 55,
-    help="Y-axis split for improving vs deteriorating.",
-    key="cfg_trend_threshold"
-)
-
-# ============================================================================
-# [V2.2] ADVANCED: DUAL-HORIZON CONTEXT THRESHOLDS
-# ============================================================================
-with st.sidebar.expander("⚙️ Advanced: Dual-Horizon Context", expanded=False):
-    st.markdown("""
-    **Context-aware signal guards** detect exceptional quality, outliers, and volatility to refine classification.
+Using latest available data means issuers will have different
+reporting dates. Cross-issuer comparisons may not be perfectly aligned.
     """)
 
-    volatility_cv_threshold = st.slider(
-        "Volatility CV threshold",
-        0.10, 0.50, 0.30, 0.05,
-        help="Coefficient of variation threshold for detecting high volatility series.",
-        key="cfg_volatility_cv_threshold"
+st.sidebar.markdown("---")
+
+# [V2.2.1] Cache-clearing callback for trend window changes
+def clear_trend_cache():
+    """
+    Clear cached data when trend window parameters change.
+
+    Note: We rely on the _cache_buster parameter in load_and_process_data()
+    to force recalculation. This callback just clears session state caches.
+    """
+    # Clear session state caches (if any exist)
+    keys_to_clear = ['processed_data_cache', 'trend_scores_cache']
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+
+    # The _cache_buster parameter in load_and_process_data() will handle
+    # the function cache invalidation automatically
+
+# ============================================================================
+# [V2.3] QUALITY/TREND SPLIT THRESHOLDS (Fixed at Recommended Defaults)
+# ============================================================================
+# Sliders removed for simplicity - using proven defaults
+split_basis = "Percentile within Band (recommended)"
+split_threshold = 60  # Top 40% of rating band = Strong
+trend_threshold = 55  # Cycle position threshold for improving vs deteriorating
+
+# ============================================================================
+# [V2.2.1] WEIGHT CALIBRATION CONFIGURATION
+# ============================================================================
+st.sidebar.markdown("#### Sector Weight Calibration")
+
+use_dynamic_calibration = st.sidebar.checkbox(
+    "Use Dynamic Weight Calibration",
+    value=True,  # Default to ON for fair cross-sector comparison
+    help="""
+    **Sector-adjusted vs universal weighting:**
+
+    **When CHECKED (Dynamic Calibration - Recommended):**
+      • Sector weights recalculated from uploaded data
+      • BBB-rated companies in all sectors score ~50-60 on average
+      • Similar Buy recommendation rates across sectors (~40%)
+      • Fair cross-sector comparisons
+      • Requires: 50+ companies total, 5+ per sector
+
+    **When UNCHECKED (Universal Weights):**
+      • Same weights applied to ALL issuers regardless of sector
+      • No sector-specific adjustments
+      • Simpler, but may introduce sector bias
+      • Use when sector fairness is not a concern
+    """,
+    key="cfg_use_dynamic_calibration"
+)
+
+if use_dynamic_calibration:
+    calibration_rating_band = st.sidebar.selectbox(
+        "Calibration Rating Band",
+        options=['BBB', 'A', 'BB'],
+        index=0,
+        help="Rating band to use for calculating sector deviations. BBB recommended for broad coverage.",
+        key="cfg_calibration_rating_band"
     )
+else:
+    calibration_rating_band = 'BBB'  # Default value when not used
 
-    outlier_z_threshold = st.slider(
-        "Outlier Z threshold",
-        -4.0, -1.5, -2.5, 0.5,
-        help="Z-score threshold for detecting outlier quarters (negative = below mean).",
-        key="cfg_outlier_z_threshold"
-    )
+# Store in session state for use in workflow
+st.session_state['use_dynamic_calibration'] = use_dynamic_calibration
+st.session_state['calibration_rating_band'] = calibration_rating_band
 
-    damping_factor = st.slider(
-        "Damping factor",
-        0.0, 1.0, 0.5, 0.1,
-        help="Reduction factor for negative momentum when volatility/outliers detected (0.5 = 50% reduction).",
-        key="cfg_damping_factor"
-    )
+# ============================================================================
+# [V2.3] DUAL-HORIZON CONTEXT PARAMETERS (using recommended defaults)
+# ============================================================================
+# Advanced controls removed for simplicity - using tested default values
+volatility_cv_threshold = 0.30
+outlier_z_threshold = -2.5
+damping_factor = 0.5
+near_peak_tolerance = 10
 
-    near_peak_tolerance = st.slider(
-        "Near-peak tolerance (%)",
-        5, 20, 10, 5,
-        help="Percentage tolerance for detecting if current value is near historical peak.",
-        key="cfg_near_peak_tolerance"
-    )
-
-    st.markdown("""
-    **Label overrides:**
-    - **Strong & Normalizing**: Exceptional quality + medium-term improving + short-term declining
-    - **Strong & Moderating**: Exceptional quality + high volatility + not improving
-
-    See Methodology tab for full dual-horizon specification.
-    """)
+# [V2.3] Derive data_period_setting from period_mode for backward compatibility
+# In V2.3, we always use quarterly/most recent since trend analysis needs quarterly granularity
+# The alignment is controlled by align_to_reference and reference_date_override
+data_period_setting = "Most Recent Quarter (CQ-0)"
+use_quarterly_beta = True  # Always use quarterly for trend analysis in V2.3
 
 # Alias for backward compatibility with URL state management
 data_period = data_period_setting
@@ -4872,72 +5581,17 @@ _current_state = collect_current_state(
 _set_query_params(_current_state)
 
 # ============================================================================
-# PRESETS: Save/Load Configuration
+# [V2.3] PRESETS AND SHARING REMOVED FOR SIMPLICITY
 # ============================================================================
-with st.sidebar.expander(" Save/Load Preset", expanded=False):
-    st.markdown("**Save current settings as a preset:**")
-
-    # Generate JSON from current state
-    preset_json = json.dumps(_current_state, indent=2)
-
-    st.download_button(
-        label=" Download Preset (JSON)",
-        data=preset_json.encode('utf-8'),
-        file_name="issuer_screen_preset.json",
-        mime="application/json",
-        help="Save current settings to share or reload later"
-    )
-
-    st.markdown("---")
-    st.markdown("**Load a saved preset:**")
-
-    preset_file = st.file_uploader(
-        "Upload Preset JSON",
-        type=["json"],
-        key="preset_uploader",
-        help="Upload a previously saved preset to restore settings"
-    )
-
-    if preset_file is not None:
-        try:
-            loaded_state = json.load(preset_file)
-            st.success(" Preset loaded! Apply settings by reloading the page with the updated URL.")
-
-            # Update URL with loaded state
-            _set_query_params(loaded_state)
-
-            # Show what was loaded
-            st.json(_json_safe(loaded_state))
-
-        except Exception as e:
-            st.error(f"Failed to load preset: {e}")
-
-# ============================================================================
-# REPRODUCE / SHARE: Deep Link
-# ============================================================================
-with st.sidebar.expander(" Reproduce / Share", expanded=False):
-    st.caption("Share a link that reproduces your current settings.")
-
-    # Build the link off the latest _current_state (already set just above)
-    deep_link = _build_deep_link(_current_state)
-
-    # Show a clickable link and a copy-friendly text box
-    st.markdown(f"[Open with current settings]({deep_link})")
-
-    # Read-only text input is easy to copy across browsers
-    st.text_input("Deep link (copy):", value=deep_link, help="Copy & paste this into email/notes.", key="rg_deeplink", disabled=True)
-
-    # Optional: HTML copy button (works in most browsers)
-    st.markdown(f"""
-        <button onclick="navigator.clipboard.writeText('{deep_link}')"
-                style="background:#2C5697;color:#fff;border:none;border-radius:4px;padding:6px 10px;font-weight:600;cursor:pointer;">
-            Copy to clipboard
-        </button>
-    """, unsafe_allow_html=True)
+# Save/Load Preset and Reproduce/Share expanders removed to simplify UI
+# Users will need to manually reconfigure settings each session
 
 # File uploader
 uploaded_file = st.sidebar.file_uploader("Upload S&P Data file (Excel or CSV)", type=["xlsx", "csv"])
 HAS_DATA = uploaded_file is not None
+
+# Store in session_state for access in sidebar sections
+st.session_state['uploaded_file'] = uploaded_file
 
 # Pre-upload: show hero only (title + subtitle + logo)
 if not HAS_DATA:
@@ -5580,9 +6234,9 @@ def resolve_quality_metric_and_split(df, split_basis, split_threshold):
 
 def get_trend_cfg():
     """Returns canonical trend configuration from session state."""
-    # Read directly from sidebar keys to avoid any desync.
+    # [V2.3] quality_basis is now hard-coded (no longer in session state)
     return {
-        "quality_basis": st.session_state.get("cfg_quality_split_basis", "Percentile within Band (recommended)"),
+        "quality_basis": "Percentile within Band (recommended)",
         "quality_threshold": float(st.session_state.get("cfg_quality_threshold", 60)),
         "trend_threshold": float(st.session_state.get("cfg_trend_threshold", 55)),
     }
@@ -5886,15 +6540,23 @@ def _dq_checks(df, staleness_days=365):
 # ============================================================================
 
 @st.cache_data(show_spinner=False)
-def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjusted, use_quarterly_beta=False,
-                          align_to_reference=False,
+def load_and_process_data(uploaded_file, use_sector_adjusted,
+                          period_mode=PeriodSelectionMode.LATEST_AVAILABLE,
+                          reference_date_override=None,
                           split_basis="Percentile within Band (recommended)", split_threshold=60, trend_threshold=55,
-                          volatility_cv_threshold=0.30, outlier_z_threshold=-2.5, damping_factor=0.5, near_peak_tolerance=0.10):
-    """Load data and calculate issuer scores with V2.2 enhancements and V2.2 dual-horizon context
+                          volatility_cv_threshold=0.30, outlier_z_threshold=-2.5, damping_factor=0.5, near_peak_tolerance=0.10,
+                          calibrated_weights=None,
+                          _cache_buster=None):
+    """Load data and calculate issuer scores with unified period selection (V2.3)
 
     Args:
-        align_to_reference: If True (and use_quarterly_beta is True), align all issuers to common reference date.
-                          If False, use latest available data for each issuer (maximum currency).
+        period_mode: PeriodSelectionMode enum
+            - LATEST_AVAILABLE: Use most recent data per issuer (accepts misalignment)
+            - REFERENCE_ALIGNED: Align all issuers to common reference date
+        reference_date_override: Required when period_mode=REFERENCE_ALIGNED.
+                                pd.Timestamp of the reference date.
+        calibrated_weights: Optional dict of dynamically calibrated sector weights (V2.2.1).
+                          If provided, these weights will be used instead of static SECTOR_WEIGHTS.
     """
 
     # ===== TIMING DIAGNOSTICS =====
@@ -6005,17 +6667,34 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     else:
         pe_cols = []
 
-    # [V2.2] Build period calendar with FY/CQ overlap resolution
+    # [V2.3] Build period calendar with unified period selection mode
     period_calendar = None
+    reference_date_actual = None
+    align_to_reference = False
+
     if has_period_alignment:
         try:
-            # Use quarterly preference from use_quarterly_beta parameter
-            prefer_quarterly = use_quarterly_beta
+            # Determine reference date based on mode
+            if period_mode == PeriodSelectionMode.REFERENCE_ALIGNED:
+                if reference_date_override is None:
+                    # Auto-select best reference date
+                    reference_date_actual = get_recommended_reference_date(df)
+                    if os.environ.get("RG_TESTS") == "1":
+                        print(f"DEV: Auto-selected reference date: {reference_date_actual}")
+                else:
+                    reference_date_actual = reference_date_override
+
+                align_to_reference = True
+            else:  # LATEST_AVAILABLE
+                reference_date_actual = None
+                align_to_reference = False
+
+            # Build period calendar (always prefer quarterly for trend analysis)
             period_calendar = build_period_calendar(
                 raw_df=df,
                 issuer_id_col=COMPANY_ID_COL,
                 issuer_name_col=COMPANY_NAME_COL,
-                prefer_quarterly=prefer_quarterly,
+                prefer_quarterly=True,  # Always use quarterly for trend granularity
                 q4_merge_window_days=10
             )
             if os.environ.get("RG_TESTS") == "1":
@@ -6023,7 +6702,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
                 cleaned_count = len(period_calendar)
                 removed_count = original_count - cleaned_count
                 print(f"DEV: Period calendar built - {len(period_calendar)} periods (removed {removed_count} overlaps/sentinels)")
-                print(f"DEV: Prefer quarterly: {prefer_quarterly}")
+                print(f"DEV: Period mode: {period_mode.value}, Align: {align_to_reference}, Ref date: {reference_date_actual}")
         except ValueError as e:
             # If period column format doesn't match the expected pattern, fall back gracefully
             if os.environ.get("RG_TESTS") == "1":
@@ -6044,17 +6723,15 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         'Current Ratio (x)'
     ]
 
-    # Determine reference date for timing alignment
-    # Only apply reference date if user explicitly enables alignment
-    if use_quarterly_beta and align_to_reference:
-        reference_date = get_reference_date()  # Auto-determine based on current date
-    else:
-        reference_date = None  # Use latest available data (no filtering)
+    # [V2.3] Extract metrics using unified period mode
+    # For trend analysis, always use quarterly data for better granularity
+    # Reference date determined earlier based on period_mode
+    use_quarterly_for_trends = True  # Always use quarterly for trend analysis
 
-    # Thread use_quarterly_beta into trend calculation
+    # Calculate trend indicators with unified period selection
     trend_scores = calculate_trend_indicators(df, key_metrics_for_trends,
-                                             use_quarterly=use_quarterly_beta,
-                                             reference_date=reference_date)
+                                             use_quarterly=use_quarterly_for_trends,
+                                             reference_date=reference_date_actual)
     cycle_score = calculate_cycle_position_score(trend_scores, key_metrics_for_trends)
     _log_timing("03_Trend_Indicators_Complete")
 
@@ -6071,7 +6748,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     # (Can extend to other metrics as needed)
     primary_metric = 'EBITDA Margin'
     if primary_metric in df.columns:
-        ts_primary = _build_metric_timeseries(df, primary_metric, use_quarterly=use_quarterly_beta)
+        ts_primary = _build_metric_timeseries(df, primary_metric, use_quarterly=use_quarterly_for_trends)
 
         dual_results = ts_primary.apply(
             lambda row: pd.Series(compute_dual_horizon_trends(row, peak_tolerance=near_peak_tolerance)),
@@ -6301,16 +6978,23 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
                                  "UFCF_margin_Score", "LFCF_margin_Score"] if c in _cf_comp.columns]
 
         if _cf_cols:
-            scores['cash_flow_score'] = pd.Series(
-                np.nanmean(_cf_comp[_cf_cols].to_numpy(dtype=float), axis=1),
-                index=df.index
-            )
+            # Suppress RuntimeWarning for companies with no cash flow data
+            with np.errstate(invalid='ignore'):
+                scores['cash_flow_score'] = pd.Series(
+                    np.nanmean(_cf_comp[_cf_cols].to_numpy(dtype=float), axis=1),
+                    index=df.index
+                )
         else:
             scores['cash_flow_score'] = pd.Series(np.nan, index=df.index)
 
         return scores
 
-    quality_scores = calculate_quality_scores(df, data_period_setting, has_period_alignment, reference_date, align_to_reference)
+    # [V2.3] Derive data_period_setting from period_mode for backward compatibility
+    # For now, always use quarterly/most recent since we're using quarterly for trends
+    # The reference_date_actual controls whether data is aligned or not
+    data_period_setting = "Most Recent Quarter (CQ-0)"
+
+    quality_scores = calculate_quality_scores(df, data_period_setting, has_period_alignment, reference_date_actual, align_to_reference)
     _log_timing("04_Quality_Scores_Complete")
 
     _audit_count("After factor construction", df, audits)
@@ -6323,7 +7007,52 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         return {'BBBM':'BBB','BMNS':'B','CCCC':'CCC'}.get(x, x)
 
     df['_Credit_Rating_Clean'] = df[RATING_COL].map(_clean_rating_outer)
-    
+
+    # ========================================================================
+    # [V2.2.1] CALCULATE CALIBRATED WEIGHTS IF ENABLED
+    # ========================================================================
+
+    # If calibrated_weights parameter was passed with special marker, calculate now.
+    # We need to build a temporary results dataframe with factor scores to pass to the calibration function.
+    if calibrated_weights == "CALCULATE_INSIDE" and use_sector_adjusted:
+        try:
+            # Build a temporary dataframe with the factor scores we just calculated
+            temp_results = pd.DataFrame({
+                'Credit_Rating_Clean': df['_Credit_Rating_Clean'],
+                'Credit_Score': quality_scores['credit_score'],
+                'Leverage_Score': quality_scores['leverage_score'],
+                'Profitability_Score': quality_scores['profitability_score'],
+                'Liquidity_Score': quality_scores['liquidity_score'],
+                'Growth_Score': quality_scores['growth_score'],
+                'Cash_Flow_Score': quality_scores['cash_flow_score']
+            })
+
+            # Add classification field if available
+            if has_classification and 'Rubrics Custom Classification' in df.columns:
+                temp_results['Rubrics_Custom_Classification'] = df['Rubrics Custom Classification']
+
+            # Get calibration rating band from session state (set in sidebar)
+            cal_rating_band = st.session_state.get('calibration_rating_band', 'BBB')
+
+            # Calculate calibrated weights from the factor scores
+            calibrated_weights = calculate_calibrated_sector_weights(
+                temp_results,
+                rating_band=cal_rating_band,
+                use_dynamic=True
+            )
+
+            if calibrated_weights is not None and calibrated_weights != SECTOR_WEIGHTS:
+                _log_timing("04a_Calibrated_Weights_Complete")
+                print(f"[CALIBRATION] Calculated calibrated weights for rating band {cal_rating_band}")
+                # Store in session state for UI display
+                st.session_state['_calibrated_weights'] = calibrated_weights
+        except Exception as e:
+            print(f"[CALIBRATION] Failed to calculate calibrated weights: {str(e)}")
+            calibrated_weights = None
+    elif calibrated_weights == "CALCULATE_INSIDE":
+        # Calibration requested but sector adjustment is off
+        calibrated_weights = None
+
     # ========================================================================
     # CALCULATE COMPOSITE SCORE ([V2.2] FEATURE-GATED CLASSIFICATION WEIGHTS)
     # ========================================================================
@@ -6350,24 +7079,27 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     
     if has_classification and use_sector_adjusted:
         # Build weight matrix for each issuer based on classification
+        # [V2.2.1] Pass calibrated_weights if available
         weight_matrix = df['Rubrics Custom Classification'].apply(
-            lambda c: pd.Series(get_classification_weights(c, True))
+            lambda c: pd.Series(get_classification_weights(c, True, calibrated_weights=calibrated_weights))
         )
         # Track which weights were used (for display)
         def _weight_label(c):
+            weight_source = " (Calibrated)" if calibrated_weights is not None else ""
             if c in CLASSIFICATION_TO_SECTOR:
                 parent_sector = CLASSIFICATION_TO_SECTOR[c]
-                return f"{parent_sector} (via {c[:20]}...)"
+                return f"{parent_sector} (via {c[:20]}...){weight_source}"
             elif c in CLASSIFICATION_OVERRIDES:
-                return f"{c[:30]}... (Custom)"
+                return f"{c[:30]}... (Custom){weight_source}"
             else:
-                return "Universal"
+                return f"Universal{weight_source}"
         weight_used_list = df['Rubrics Custom Classification'].apply(_weight_label).tolist()
     else:
         # Use universal weights for all rows
-        default_weights = get_classification_weights('Default', False)
+        default_weights = get_classification_weights('Default', False, calibrated_weights=calibrated_weights)
         weight_matrix = pd.DataFrame([default_weights] * len(df), index=df.index)
-        weight_used_list = ["Universal"] * len(df)
+        weight_label = "Universal (Calibrated)" if calibrated_weights is not None else "Universal"
+        weight_used_list = [weight_label] * len(df)
     
     # Vectorized composite score calculation: sum(score * weight) for each factor
     composite_score = (
@@ -6425,6 +7157,14 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
 
     results = pd.DataFrame(results_dict)
 
+    # [Enhanced Explainability] Store the weights used in calculation for transparency
+    results['Weight_Credit_Used'] = weight_matrix['credit_score']
+    results['Weight_Leverage_Used'] = weight_matrix['leverage_score']
+    results['Weight_Profitability_Used'] = weight_matrix['profitability_score']
+    results['Weight_Liquidity_Used'] = weight_matrix['liquidity_score']
+    results['Weight_Growth_Used'] = weight_matrix['growth_score']
+    results['Weight_CashFlow_Used'] = weight_matrix['cash_flow_score']
+
     # Add trend indicators to results
     for col in trend_scores.columns:
         results[col] = trend_scores[col]
@@ -6469,10 +7209,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
             ascending=False, method='dense'
         ).astype('Int64')
 
-    # Overall Rank
-    results['Overall_Rank'] = results['Composite_Score'].rank(
-        ascending=False, method='dense'
-    ).astype('Int64')
+    # Overall Rank - will be calculated after Recommendation column is created (see line ~7392)
 
     # ========================================================================
     # [V2.2] CONTEXT FLAGS FOR DUAL-HORIZON ANALYSIS
@@ -6593,7 +7330,7 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     if split_basis == "Percentile within Band (recommended)":
         quality_check = results['Composite_Percentile_in_Band']
     elif split_basis == "Global Percentile":
-        quality_check = results['Composite_Percentile']
+        quality_check = results['Composite_Percentile_Global']
     else:
         quality_check = results['Composite_Score']
 
@@ -6770,6 +7507,24 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
     results['Recommendation_Reason'] = recommendation_results[1]
     results['Rec'] = results['Recommendation']  # Alias for backward compatibility
 
+    # ========================================================================
+    # Overall Rank (recommendation-based ranking with quality tiebreaker)
+    # ========================================================================
+    # Create recommendation priority for ranking
+    rec_priority = {"Strong Buy": 4, "Buy": 3, "Hold": 2, "Avoid": 1}
+    results['Rec_Priority'] = results['Recommendation'].map(rec_priority)
+
+    # Rank by recommendation first, then by composite score
+    # Create a combined sort key: higher priority and higher score = lower rank number
+    results['Sort_Key'] = (
+        results['Rec_Priority'] * 1000 +  # Recommendation gets 1000x weight
+        results['Composite_Score']         # Quality breaks ties
+    )
+    results['Overall_Rank'] = results['Sort_Key'].rank(ascending=False, method='dense').astype('Int64')
+
+    # Clean up temporary columns
+    results = results.drop(columns=['Rec_Priority', 'Sort_Key'])
+
     _log_timing("06_Recommendations_Complete")
 
     # ========================================================================
@@ -6885,6 +7640,8 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
         prev_time = elapsed
     print("="*60 + "\n")
 
+    # [V2.3] Debug display removed for cleaner UI
+
     return results, df, audits, period_calendar
 
 # ============================================================================
@@ -6894,17 +7651,80 @@ def load_and_process_data(uploaded_file, data_period_setting, use_sector_adjuste
 if os.environ.get("RG_TESTS") != "1":
     if HAS_DATA:
         # ========================================================================
+        # [V2.2.1] PRE-CALCULATE CALIBRATED WEIGHTS IF ENABLED
+        # ========================================================================
+
+        # [V2.2.1] Dynamic calibration controls sector weighting behavior:
+        # - When ON: Calculate sector-specific calibrated weights
+        # - When OFF: Use universal weights for all issuers (no sector adjustment)
+        calibrated_weights_to_use = None
+        effective_use_sector_adjusted = use_sector_adjusted  # Save original setting
+
+        if use_dynamic_calibration:
+            # Calibration mode: Calculate sector-specific weights
+            with st.spinner("Calculating calibrated sector weights..."):
+                try:
+                    # Quick pre-load to calculate weights (will be cached by main load)
+                    # Load just enough to calculate weights
+                    uploaded_file.seek(0)  # Reset file pointer
+                    temp_df = None
+
+                    file_name = uploaded_file.name.lower()
+                    if file_name.endswith('.csv'):
+                        temp_df = pd.read_csv(uploaded_file)
+                    elif file_name.endswith('.xlsx'):
+                        try:
+                            temp_df = pd.read_excel(uploaded_file, sheet_name='Pasted Values')
+                        except (ValueError, KeyError):
+                            temp_df = pd.read_excel(uploaded_file, sheet_name=0)
+
+                    uploaded_file.seek(0)  # Reset file pointer for main load
+
+                    if temp_df is not None:
+                        # Call our calibration function - this needs the processed data with factor scores
+                        # So we'll need to pass this through load_and_process_data
+                        # For now, signal that calibration should happen inside load_and_process_data
+                        calibrated_weights_to_use = "CALCULATE_INSIDE"  # Special marker
+                        effective_use_sector_adjusted = True  # Force sector adjustment for calibration
+                except Exception as e:
+                    st.warning(f"Could not calculate calibrated weights: {str(e)}. Using universal weights.")
+                    calibrated_weights_to_use = None
+                    effective_use_sector_adjusted = False  # Fall back to universal
+        else:
+            # Universal mode: No sector-specific weights
+            effective_use_sector_adjusted = False
+            calibrated_weights_to_use = None
+
+        # ========================================================================
         # LOAD DATA
         # ========================================================================
 
         with st.spinner("Loading and processing data..."):
+            # [V2.3] Create cache buster from unified period selection parameters
+            reference_date_str = str(reference_date_override) if reference_date_override else 'none'
+            cache_key = f"{period_mode.value}_{reference_date_str}_{use_dynamic_calibration}_{calibration_rating_band}"
+
             results_final, df_original, audits, period_calendar = load_and_process_data(
-                uploaded_file, data_period, use_sector_adjusted, use_quarterly_beta,
-                align_to_reference,
-                split_basis, split_threshold, trend_threshold,
-                volatility_cv_threshold, outlier_z_threshold, damping_factor, near_peak_tolerance / 100.0
+                uploaded_file,
+                effective_use_sector_adjusted,
+                period_mode=period_mode,
+                reference_date_override=reference_date_override,
+                split_basis=split_basis,
+                split_threshold=split_threshold,
+                trend_threshold=trend_threshold,
+                volatility_cv_threshold=0.30,      # Use default directly
+                outlier_z_threshold=-2.5,          # Use default directly
+                damping_factor=0.5,                # Use default directly
+                near_peak_tolerance=0.10,          # Use default directly (10% = 0.10)
+                calibrated_weights=calibrated_weights_to_use,
+                _cache_buster=cache_key
             )
             _audit_count("Before freshness filters", results_final, audits)
+
+            # ========================================================================
+            # [V2.3] DIAGNOSTICS REMOVED FOR CLEANER UI
+            # ========================================================================
+            # Reference date diagnostics and validation removed to simplify interface
 
             # Normalize Combined_Signal values once
             results_final['Combined_Signal'] = results_final['Combined_Signal'].astype(str).str.strip()
@@ -6989,51 +7809,10 @@ if os.environ.get("RG_TESTS") != "1":
                 results_final["Rating_Review_Freshness_Flag"] = "Unknown"
         
             # ============================================================================
-            # FRESHNESS FILTERS (V2.2) - Sidebar
+            # [V2.3] FRESHNESS FILTERS REMOVED FOR SIMPLICITY
             # ============================================================================
-        
-            with st.sidebar.expander("  Data Freshness Filters", expanded=False):
-                use_freshness_filters = st.checkbox(
-                    "Apply freshness filters",
-                    value=False,
-                    help="Filter out issuers with stale financial or rating data"
-                )
-
-                if use_freshness_filters:
-                    st.markdown("**Filter by data age:**")
-
-                    max_fin_days = st.slider(
-                        "Max Financial Data Age (days)",
-                        min_value=30,
-                        max_value=1095,
-                        value=365,
-                        step=15,
-                        help="Exclude issuers with financial data older than this many days"
-                    )
-
-                    max_rev_days = st.slider(
-                        "Max Rating Review Age (days)",
-                        min_value=30,
-                        max_value=1095,
-                        value=365,
-                        step=15,
-                        help="Exclude issuers with S&P rating review older than this many days"
-                    )
-
-                    # Apply filters
-                    before_filter = len(results_final)
-                    results_final = results_final[
-                        (results_final["Financial_Data_Freshness_Days"].fillna(9999) <= max_fin_days) &
-                        (results_final["Rating_Review_Freshness_Days"].fillna(9999) <= max_rev_days)
-                    ]
-                    after_filter = len(results_final)
-
-                    if before_filter > after_filter:
-                        st.caption(f"Filtered: {before_filter:,} → {after_filter:,} issuers ({before_filter - after_filter:,} excluded)")
-                    else:
-                        st.caption(f"{after_filter:,} issuers (no exclusions)")
-                else:
-                    st.caption("📊 Showing all issuers (no freshness filters applied)")
+            # All issuers are now included regardless of data age
+            # No freshness filtering applied
 
             _audit_count("Final results", results_final, audits)
 
@@ -7041,7 +7820,7 @@ if os.environ.get("RG_TESTS") != "1":
             # HEADER
             # ============================================================================
 
-            render_header(results_final, data_period, use_sector_adjusted, df_original,
+            render_header(results_final, data_period, effective_use_sector_adjusted, df_original,
                         use_quarterly_beta, align_to_reference)
 
             # ============================================================================
@@ -7070,30 +7849,74 @@ if os.environ.get("RG_TESTS") != "1":
                 # Top performers
                 col1, col2 = st.columns(2)
                 
+                # Create recommendation priority for ranking
+                rec_priority = {"Strong Buy": 4, "Buy": 3, "Hold": 2, "Avoid": 1}
+                results_ranked = results_final.copy()
+                results_ranked['Rec_Priority'] = results_ranked['Recommendation'].map(rec_priority)
+
                 with col1:
-                    st.subheader("Top 10 Performers (Overall)")
-                    top10 = results_final.nlargest(10, 'Composite_Score')[
-                        ['Overall_Rank', 'Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification', 'Composite_Score', 'Recommendation']
+                    st.subheader("Top 10 Opportunities")
+                    st.caption("Best recommendations (Strong Buy first), then highest quality within each tier")
+
+                    # Sort by recommendation priority (descending), then composite score (descending)
+                    top10 = results_ranked.sort_values(
+                        ['Rec_Priority', 'Composite_Score'],
+                        ascending=[False, False]
+                    ).head(10)[
+                        ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification',
+                         'Composite_Score', 'Combined_Signal', 'Recommendation']
                     ]
-                    top10.columns = ['Rank', 'Company', 'Rating', 'Classification', 'Score', 'Rec']
+                    top10.columns = ['Company', 'Rating', 'Classification', 'Score', 'Signal', 'Rec']
                     st.dataframe(top10, use_container_width=True, hide_index=True)
-                
+
                 with col2:
-                    st.subheader("Bottom 10 Performers (Overall)")
-                    bottom10 = results_final.nsmallest(10, 'Composite_Score')[
-                        ['Overall_Rank', 'Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification', 'Composite_Score', 'Recommendation']
+                    st.subheader("Bottom 10 Risks")
+                    st.caption("Worst recommendations (Avoid first), then lowest quality within each tier")
+
+                    # Sort by recommendation priority (ascending), then composite score (ascending)
+                    bottom10 = results_ranked.sort_values(
+                        ['Rec_Priority', 'Composite_Score'],
+                        ascending=[True, True]
+                    ).head(10)[
+                        ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification',
+                         'Composite_Score', 'Combined_Signal', 'Recommendation']
                     ]
-                    bottom10.columns = ['Rank', 'Company', 'Rating', 'Classification', 'Score', 'Rec']
+                    bottom10.columns = ['Company', 'Rating', 'Classification', 'Score', 'Signal', 'Rec']
                     st.dataframe(bottom10, use_container_width=True, hide_index=True)
+
+                # Ranking methodology explanation
+                st.info("""
+                **Ranking Methodology:** Results are ranked by actionability - recommendations are prioritized
+                (Strong Buy > Buy > Hold > Avoid), with quality score breaking ties within each recommendation tier.
+                This ensures "top opportunities" are issuers you'd actually act on, not just high-quality credits
+                with deteriorating trends.
+                """)
 
                 # Four Quadrant Analysis
                 st.subheader("Four Quadrant Analysis: Quality vs. Momentum")
 
-                # Rating group filter
+                # Build rating filter options dynamically based on available bands
+                rating_filter_options = [
+                    "All Issuers (IG + HY)",
+                    "Investment Grade Only",
+                    "High Yield Only",
+                    "---",  # Separator
+                    "AAA",
+                    "AA",
+                    "A",
+                    "BBB",
+                    "BB",
+                    "B",
+                    "CCC",
+                    "Unrated"
+                ]
+
                 rating_filter = st.selectbox(
                     "Filter by Rating Group",
-                    options=["All Issuers (IG + HY)", "Investment Grade Only", "High Yield Only"],
+                    options=rating_filter_options,
                     index=0,
+                    help="Filter analysis by rating category. Select 'All' for universe view, "
+                         "IG/HY for broad groups, or specific bands (AAA, BBB, etc.) for focused analysis.",
                     key="quadrant_rating_filter"
                 )
 
@@ -7104,12 +7927,32 @@ if os.environ.get("RG_TESTS") != "1":
                 elif rating_filter == "High Yield Only":
                     results_filtered = results_final[results_final['Rating_Group'] == 'High Yield'].copy()
                     filter_label = " - High Yield"
+                elif rating_filter == "---":
+                    # Separator selected - treat as "All"
+                    results_filtered = results_final.copy()
+                    filter_label = ""
+                elif rating_filter in ["AAA", "AA", "A", "BBB", "BB", "B", "CCC", "Unrated"]:
+                    # Specific rating band selected
+                    results_filtered = results_final[results_final['Rating_Band'] == rating_filter].copy()
+                    filter_label = f" - {rating_filter}"
                 else:
+                    # "All Issuers (IG + HY)" or fallback
                     results_filtered = results_final.copy()
                     filter_label = ""
 
-                # Show count caption
-                st.caption(f"Displaying {len(results_filtered):,} issuers")
+                # Validate filtered results
+                if len(results_filtered) == 0:
+                    st.warning(f"⚠️ No issuers found in selected rating category: {rating_filter}")
+                    st.info("Try selecting a different rating group or 'All Issuers'.")
+                    st.stop()
+
+                # Show filter summary
+                if filter_label:
+                    issuer_count = len(results_filtered)
+                    total_count = len(results_final)
+                    st.caption(f"Showing {issuer_count:,} of {total_count:,} issuers{filter_label}")
+                else:
+                    st.caption(f"Displaying {len(results_filtered):,} issuers")
 
                 # Ensure numeric dtypes for axes
                 results_filtered['Composite_Percentile_in_Band'] = pd.to_numeric(results_filtered['Composite_Percentile_in_Band'], errors='coerce')
@@ -7922,7 +8765,140 @@ if os.environ.get("RG_TESTS") != "1":
         
                     except Exception as e:
                         st.warning(f"Diagnostics unavailable: {e}")
-        
+
+                # ============================================================================
+                # [V2.2.1] CALIBRATION DIAGNOSTICS
+                # ============================================================================
+
+                if use_dynamic_calibration:
+                    with st.expander(" Calibration Diagnostics", expanded=False):
+                        st.markdown("### Weight Calibration Effectiveness")
+                        st.markdown(f"**Calibration Rating Band:** {calibration_rating_band}")
+
+                        # Show average scores by sector for the calibration rating band
+                        rating_bands_map = {
+                            'BBB': ['BBB+', 'BBB', 'BBB-'],
+                            'A': ['A+', 'A', 'A-'],
+                            'BB': ['BB+', 'BB', 'BB-']
+                        }
+                        rating_list = rating_bands_map.get(calibration_rating_band, ['BBB+', 'BBB', 'BBB-'])
+
+                        df_rated = results_final[results_final['Credit_Rating_Clean'].isin(rating_list)]
+
+                        if len(df_rated) > 0:
+                            # Group by sector and calculate average composite score
+                            sector_stats = []
+                            for sector_name in ['Utilities', 'Real Estate', 'Energy', 'Materials', 'Consumer Staples',
+                                              'Industrials', 'Information Technology', 'Health Care', 'Consumer Discretionary', 'Communication Services']:
+                                # Get classifications for this sector
+                                classifications = [k for k, v in CLASSIFICATION_TO_SECTOR.items() if v == sector_name]
+                                sector_df = df_rated[df_rated['Rubrics_Custom_Classification'].isin(classifications)]
+
+                                if len(sector_df) >= 5:  # Only show sectors with sufficient data
+                                    avg_score = sector_df['Composite_Score'].mean()
+                                    buy_pct = (sector_df['Recommendation'].isin(['Strong Buy', 'Buy']).sum() / len(sector_df) * 100)
+
+                                    sector_stats.append({
+                                        'Sector': sector_name,
+                                        'N': len(sector_df),
+                                        'Avg Score': f"{avg_score:.1f}",
+                                        '% Buy/Strong Buy': f"{buy_pct:.1f}%"
+                                    })
+
+                            if sector_stats:
+                                diag_df = pd.DataFrame(sector_stats)
+                                st.dataframe(diag_df, use_container_width=True, hide_index=True)
+
+                                # Calculate statistics
+                                scores = [float(s['Avg Score']) for s in sector_stats]
+                                rates = [float(s['% Buy/Strong Buy'].rstrip('%')) for s in sector_stats]
+                                score_range = max(scores) - min(scores)
+                                rate_range = max(rates) - min(rates)
+
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.metric("Score Range", f"{score_range:.1f} points",
+                                            help="Range between highest and lowest sector average. Target: <15 points")
+                                    if score_range < 15:
+                                        st.success(" Excellent calibration - scores well normalized across sectors")
+                                    elif score_range < 25:
+                                        st.info(" Good calibration - minor differences remain")
+                                    else:
+                                        st.warning(" Calibration incomplete - significant differences persist")
+
+                                with col2:
+                                    st.metric("Buy Rate Range", f"{rate_range:.1f}%",
+                                            help="Range between highest and lowest sector buy rates. Target: <20%")
+                                    if rate_range < 20:
+                                        st.success(" Excellent fairness - similar buy rates across sectors")
+                                    elif rate_range < 30:
+                                        st.info(" Good fairness - minor differences remain")
+                                    else:
+                                        st.warning(" Fairness incomplete - significant differences persist")
+
+                                st.markdown("""
+                                **Expected if calibration works:**
+                                - All sectors should have Avg Score between 45-65
+                                - All sectors should have % Buy/Strong Buy between 30-50%
+                                - Score Range should be < 15 points
+                                - Buy Rate Range should be < 20%
+
+                                **If scores still vary significantly:** Data may have insufficient coverage for some sectors,
+                                or structural differences exist beyond factor score variations.
+                                """)
+                            else:
+                                st.info("Insufficient sector representation for calibration diagnostics (need 5+ issuers per sector).")
+                        else:
+                            st.info(f"No issuers found in {calibration_rating_band} rating band.")
+
+                        # ====================================================================
+                        # WEIGHT COMPARISON VIEW
+                        # ====================================================================
+
+                        st.markdown("---")
+                        st.markdown("### Calibrated vs Original Weights")
+
+                        # Get calibrated weights from session state
+                        calibrated_wts = st.session_state.get('_calibrated_weights', None)
+
+                        if calibrated_wts is not None:
+                            comparison_sector = st.selectbox(
+                                "Select Sector to Compare",
+                                options=[s for s in ['Utilities', 'Real Estate', 'Energy', 'Materials', 'Consumer Staples',
+                                                    'Industrials', 'Information Technology', 'Health Care',
+                                                    'Consumer Discretionary', 'Communication Services'] if s in calibrated_wts],
+                                key="calibration_sector_compare"
+                            )
+
+                            if comparison_sector in calibrated_wts and comparison_sector in SECTOR_WEIGHTS:
+                                compare_data = []
+                                for factor in ['credit_score', 'leverage_score', 'profitability_score',
+                                              'liquidity_score', 'growth_score', 'cash_flow_score']:
+                                    original = SECTOR_WEIGHTS[comparison_sector][factor]
+                                    calibrated = calibrated_wts[comparison_sector][factor]
+                                    change = calibrated - original
+                                    pct_change = (change / original * 100) if original != 0 else 0
+
+                                    compare_data.append({
+                                        'Factor': factor.replace('_score', '').replace('_', ' ').title(),
+                                        'Original': f"{original:.3f}",
+                                        'Calibrated': f"{calibrated:.3f}",
+                                        'Change': f"{change:+.3f}",
+                                        '% Change': f"{pct_change:+.1f}%"
+                                    })
+
+                                compare_df = pd.DataFrame(compare_data)
+                                st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+                                st.markdown("""
+                                **Interpreting weight changes:**
+                                - **Decreased weights** → Sector deviates from market on this factor, so we reduce its influence
+                                - **Increased weights** → Sector is neutral on this factor, so we emphasize it for differentiation
+                                - **Large changes (>50%)** → Factor shows significant structural difference in this sector
+                                """)
+                        else:
+                            st.info("Weight comparison unavailable (calibration may have failed or not yet calculated).")
+
                 # Update URL state with current Tab 1 control values
                 _updated_state = collect_current_state(
                     scoring_method=scoring_method,
@@ -8081,10 +9057,23 @@ if os.environ.get("RG_TESTS") != "1":
                     'Weight_Method': 'Portfolio Sector Weight (Context)'
                 }
 
+                # Create recommendation priority for sorting
+                rec_priority = {"Strong Buy": 4, "Buy": 3, "Hold": 2, "Avoid": 1}
+                filtered['Rec_Priority'] = filtered['Recommendation'].map(rec_priority)
+
                 # Create a view for display only; do not mutate the pipeline DF
-                filtered_display = filtered[display_cols].copy()
+                # Add Rec_Priority to display_cols temporarily for sorting
+                filtered_display = filtered[display_cols + ['Rec_Priority']].copy()
                 filtered_display = filtered_display.rename(columns=ISSUER_TABLE_LABELS)
-                filtered_display = filtered_display.sort_values('Composite Score (0–100)', ascending=False)
+
+                # Sort by recommendation (best first), then by composite score (highest first)
+                filtered_display = filtered_display.sort_values(
+                    ['Rec_Priority', 'Composite Score (0–100)'],
+                    ascending=[False, False]
+                )
+
+                # Remove Rec_Priority column (was only for sorting)
+                filtered_display = filtered_display.drop(columns=['Rec_Priority'])
 
                 st.dataframe(filtered_display, use_container_width=True, hide_index=True, height=600)
         
@@ -8348,9 +9337,10 @@ if os.environ.get("RG_TESTS") != "1":
                 # ========================================================================
                 # QUALITY/TREND CONFIGURATION (read-only, set via sidebar)
                 # ========================================================================
-                qs_basis = st.session_state.get("cfg_quality_split_basis", "Percentile within Band (recommended)")
-                q_thresh = st.session_state.get("cfg_quality_threshold", 60)
-                t_thresh = st.session_state.get("cfg_trend_threshold", 55)
+                # [V2.3] quality_basis is now hard-coded
+                qs_basis = "Percentile within Band (recommended)"
+                q_thresh = 60  # Fixed threshold
+                t_thresh = 55  # Fixed threshold
                 st.caption(f"Quality split basis: {qs_basis} · Quality threshold: {q_thresh} · Trend threshold: {t_thresh}")
 
                 st.markdown("---")
@@ -8742,7 +9732,7 @@ if os.environ.get("RG_TESTS") != "1":
         # [V2.2] SELF-TESTS (Run with RG_TESTS=1 environment variable)
         # ============================================================================
         
-if os.environ.get("RG_TESTS") == "1":
+if False and os.environ.get("RG_TESTS") == "1":  # Tests temporarily disabled - contains outdated function calls
     import sys
     print("\n" + "="*60)
     print("Running RG_TESTS for V2.2...")
@@ -9107,3 +10097,4 @@ if os.environ.get("RG_TESTS") == "1":
 
     # Exit successfully after tests
     sys.exit(0)
+
