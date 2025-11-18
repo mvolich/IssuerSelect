@@ -12,10 +12,10 @@ from llama_index.llms.openai import OpenAI
 
 
 # ============================================================================
-# IMPORT APP.PY FUNCTIONS
+# IMPORT SHARED UTILITIES (from app_utils to avoid circular imports)
 # ============================================================================
 
-from app import (
+from app_utils import (
     get_from_row,
     resolve_metric_column,
     list_metric_columns,
