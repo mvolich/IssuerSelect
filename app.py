@@ -9563,162 +9563,110 @@ if os.environ.get("RG_TESTS") != "1":
             # ============================================================================
 
             with tab7:
-                st.header("GenAI Credit Report Generator")
+                st.header("Multi-Agent Credit Report")
 
                 st.markdown("""
-                Generate a comprehensive AI-powered credit analysis report for any issuer in your dataset.
-                The report includes profitability analysis, leverage trends, liquidity assessment, and investment recommendations.
+                **Sector-Aware Multi-Agent Analysis** using 5 specialist agents coordinated by a Supervisor.
+
+                - **Architecture:** LlamaIndex AgentWorkflow with Claude Sonnet 4
+                - **Sector Context:** Compares metrics to sector/IG/HY medians
+                - **Weight Awareness:** Respects sector-adjusted and dynamic calibration settings
+                - **Time:** 25-35 seconds per report
                 """)
 
-                # Check if OpenAI is available
-                if not _OPENAI_AVAILABLE:
-                    st.error("OpenAI package is not available. Please install it with: `pip install openai`")
-                    st.stop()
-
-                # Check for API key
-                try:
-                    test_client = _get_openai_client()
-                    st.success("OpenAI API configured successfully")
-                except RuntimeError as e:
-                    st.error(f"{str(e)}")
-                    st.info("""
-                    **To configure OpenAI API:**
-                    1. Add your API key to `.streamlit/secrets.toml`:
-                   OPENAI_API_KEY = "sk-..."
-                    2. Or set as environment variable: `OPENAI_API_KEY`
-                    """)
-                    st.stop()
-
-                st.markdown("---")
-
-                # Issuer selection
-                name_col = resolve_company_name_column(df_original)
-                if name_col is None:
-                    st.error("Cannot find company name column in dataset")
-                    st.stop()
-
-                issuer_list = sorted(df_original[name_col].dropna().unique().tolist())
-
-                col1, col2 = st.columns([3, 1])
-
-                with col1:
-                    selected_issuer = st.selectbox(
+                if results_final is not None and len(results_final) > 0:
+                    company_options = results_final['Company_Name'].dropna().unique().tolist()
+                    selected_company = st.selectbox(
                         "Select Issuer",
-                        options=issuer_list,
-                        help="Choose the company you want to analyze"
+                        options=company_options,
+                        key="multiagent_company"
                     )
 
-                with col2:
-                    st.markdown("<br>", unsafe_allow_html=True)  # Spacing
-                    generate_button = st.button("Generate Report", type="primary", use_container_width=True)
+                    if selected_company:
+                        selected_row = results_final[results_final['Company_Name'] == selected_company].iloc[0]
 
-                # Generate report when button is clicked
-                if generate_button:
-                    with st.spinner(f"Generating credit analysis for {selected_issuer}..."):
-                        try:
-                            # Extract financial data
-                            issuer_data = extract_issuer_financial_data(df_original, selected_issuer)
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("S&P Rating", selected_row.get('Credit_Rating_Clean', 'N/A'))
+                        with col2:
+                            st.metric("Composite Score", f"{selected_row.get('Composite_Score', 0):.1f}")
+                        with col3:
+                            st.metric("Rating Band", selected_row.get('Rating_Band', 'N/A'))
+                        with col4:
+                            classification = selected_row.get('Rubrics_Custom_Classification', 'N/A')
+                            st.metric("Classification", classification[:20] + "..." if len(classification) > 20 else classification)
 
-                            # Check if we have sufficient data
-                            if not issuer_data["financial_data"]:
-                                st.warning(f"No financial data found for {selected_issuer}. Cannot generate report.")
-                                st.stop()
+                        st.subheader("Factor Scores")
+                        factor_cols = st.columns(6)
+                        factor_data = [
+                            ('Credit', 'Credit_Score'),
+                            ('Leverage', 'Leverage_Score'),
+                            ('Profitability', 'Profitability_Score'),
+                            ('Liquidity', 'Liquidity_Score'),
+                            ('Growth', 'Growth_Score'),
+                            ('Cash Flow', 'Cash_Flow_Score')
+                        ]
 
-                            # Generate the report
-                            report_text = generate_credit_report(issuer_data)
+                        for col, (name, key) in zip(factor_cols, factor_data):
+                            score = selected_row.get(key, 0)
+                            col.metric(name, f"{score:.1f}")
 
-                            # Display the report
-                            st.markdown("---")
-                            st.markdown(f"## Credit Analysis Report: {selected_issuer}")
+                        st.markdown("---")
 
-                            # Show company info in columns
-                            info_col1, info_col2, info_col3 = st.columns(3)
-                            with info_col1:
-                                st.metric("S&P Rating", issuer_data["company_info"]["rating"])
-                            with info_col2:
-                                st.metric("Sector", issuer_data["company_info"]["sector"])
-                            with info_col3:
-                                st.metric("Country", issuer_data["company_info"]["country"])
+                        if st.button("Generate Multi-Agent Credit Report", type="primary"):
+                            claude_key = st.secrets.get("CLAUDE_API_KEY") or st.secrets.get("claude_key")
+                            openai_key = st.secrets.get("OPENAI_API_KEY") or st.secrets.get("api_key")
 
-                            st.markdown("---")
+                            if not claude_key and not openai_key:
+                                st.error("⚠️ No API keys found. Add CLAUDE_API_KEY or OPENAI_API_KEY to .streamlit/secrets.toml")
+                            else:
+                                with st.spinner("Generating multi-agent report... (25-35 seconds)"):
+                                    try:
+                                        from multi_agent_credit import generate_multiagent_credit_report
 
-                            # Display the AI-generated report
-                            st.markdown(report_text)
+                                        factor_scores = {
+                                            'credit_score': selected_row.get('Credit_Score', 50),
+                                            'leverage_score': selected_row.get('Leverage_Score', 50),
+                                            'profitability_score': selected_row.get('Profitability_Score', 50),
+                                            'liquidity_score': selected_row.get('Liquidity_Score', 50),
+                                            'growth_score': selected_row.get('Growth_Score', 50),
+                                            'cash_flow_score': selected_row.get('Cash_Flow_Score', 50)
+                                        }
 
-                            st.markdown("---")
+                                        # Get current settings
+                                        use_sector = st.session_state.get('scoring_method') == 'Classification-Adjusted Scoring'
+                                        calibrated = st.session_state.get('_calibrated_weights')
 
-                            # Download button
-                            from datetime import datetime
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            filename = f"{selected_issuer.replace(' ', '_')}_credit_report_{timestamp}.md"
+                                        report_markdown = generate_multiagent_credit_report(
+                                            row=selected_row,
+                                            df=results_final,
+                                            composite_score=selected_row.get('Composite_Score', 50),
+                                            factor_scores=factor_scores,
+                                            rating_band=selected_row.get('Rating_Band', 'BBB'),
+                                            company_name=selected_company,
+                                            rating=selected_row.get('Credit_Rating_Clean', 'NR'),
+                                            classification=selected_row.get('Rubrics_Custom_Classification', 'Unknown'),
+                                            use_sector_adjusted=use_sector,
+                                            calibrated_weights=calibrated,
+                                            api_key=openai_key,
+                                            claude_key=claude_key
+                                        )
 
-                            st.download_button(
-                                label="Download Report (Markdown)",
-                                data=report_text,
-                                file_name=filename,
-                                mime="text/markdown",
-                                use_container_width=False
-                            )
+                                        st.markdown("---")
+                                        st.markdown(report_markdown)
 
-                            # Show disclaimer
-                            st.info("""
-                            **Disclaimer:** This report is generated by AI and should be used for informational purposes only.
-                            Always conduct your own due diligence and consult with qualified professionals before making investment decisions.
-                            """)
+                                        st.download_button(
+                                            label="Download Report (Markdown)",
+                                            data=report_markdown,
+                                            file_name=f"{selected_company.replace(' ', '_')}_MultiAgent_Credit_Report.md",
+                                            mime="text/markdown"
+                                        )
 
-                        except ValueError as e:
-                            st.error(f"Error: {str(e)}")
-                        except RuntimeError as e:
-                            st.error(f"OpenAI API Error: {str(e)}")
-                            st.info("Please check your API key configuration and try again.")
-                        except Exception as e:
-                            st.error(f"Unexpected error: {str(e)}")
-                            st.exception(e)
-
+                                    except Exception as e:
+                                        st.error(f"❌ Error: {str(e)}")
+                                        st.exception(e)
                 else:
-                    # Show instructions when no report has been generated
-                    st.info("""
-                    **How to use:**
-                    1. Select an issuer from the dropdown above
-                    2. Click "Generate Report" to create an AI-powered credit analysis
-                    3. Review the comprehensive report covering profitability, leverage, liquidity, and risks
-                    4. Download the report in Markdown format for your records
-
-                    **What's included in the report:**
-                    - Executive Summary
-                    - Profitability Analysis (margins, ROE, ROA)
-                    - Leverage Analysis (Debt/EBITDA trends)
-                    - Liquidity & Coverage Analysis
-                    - Credit Strengths
-                    - Credit Risks & Concerns
-                    - Rating Outlook & Recommendations
-                    """)
-
-                    # Show sample of available data
-                    st.markdown("### Data Availability Preview")
-                    if selected_issuer:
-                        try:
-                            sample_data = extract_issuer_financial_data(df_original, selected_issuer)
-
-                            col_a, col_b = st.columns(2)
-                            with col_a:
-                                st.markdown("**Company Information:**")
-                                for key, value in sample_data["company_info"].items():
-                                    st.text(f"{key.title()}: {value}")
-
-                            with col_b:
-                                st.markdown("**Available Metrics:**")
-                                metric_count = len(sample_data["financial_data"])
-                                st.text(f"Total metrics: {metric_count}")
-                                if sample_data["financial_data"]:
-                                    for metric in list(sample_data["financial_data"].keys())[:5]:
-                                        periods = len(sample_data["financial_data"][metric])
-                                        st.text(f"• {metric}: {periods} periods")
-                                    if metric_count > 5:
-                                        st.text(f"... and {metric_count - 5} more")
-
-                        except Exception as e:
-                            st.warning(f"Could not load preview: {str(e)}")
+                    st.info("📊 Upload data and run analysis first.")
 
             st.markdown("---")
             st.markdown("""
