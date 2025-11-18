@@ -4,366 +4,343 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Issuer Credit Screening Model V2.0** - A Streamlit-based application for analyzing corporate credit quality using a 6-factor composite scoring system with sector-adjusted weights, dual-horizon trend analysis, PCA-based cohort clustering, and AI-powered credit report generation.
+This is a **Streamlit-based credit analytics application** (V2.3) for evaluating fixed-income issuers using a 6-factor composite scoring model with trend analysis. The application processes financial data from Excel/CSV files and generates issuer rankings, visualizations, and AI-powered credit analysis.
+
+**Main file:** `app.py` (~9,500 lines)
+
+**Key V2.3 Features:**
+- Unified period selection system (Latest Available vs Reference Aligned)
+- Recommendation-based ranking (prioritizes Strong Buy > Buy > Hold > Avoid)
+- Enhanced issuer explainability (shows original weights vs current calibration)
+- Simplified UI (removed advanced debug controls)
 
 ## Running the Application
 
 ```bash
-# Set environment for testing (disables Streamlit UI initialization)
-set RG_TESTS=1
-
-# Run application (normal mode)
+# Run the Streamlit app
 streamlit run app.py
 
-# Run embedded test suite
-set RG_TESTS=1 && python app.py
-
-# Run GenAI patch tests
-python test_genai_patches.py
+# Run tests (environment variable gates test execution)
+set RG_TESTS=1
+python app.py
 ```
 
-## Architecture
+The application expects Excel (.xlsx) or CSV files with financial data. It looks for a 'Pasted Values' sheet in Excel files by default, falling back to the first sheet if not found.
 
-### Single-File Structure
-The entire application is contained in `app.py` (~8100 lines). This is intentional for deployment simplicity to Streamlit Cloud.
+## Architecture Overview
 
-### Tab Structure (7 tabs)
+### Core Pipeline (11 stages)
 
-1. **Dashboard** - Model overview and key insights
-2. **Issuer Search** - Search and filter issuers
-3. **Rating Group Analysis** - IG vs HY cohort analysis
-4. **Classification Analysis** - Sector-specific analysis
-5. **Trend Analysis** - Dual-horizon trend metrics
-6. **Methodology** - Complete model documentation
-7. **GenAI Credit Report** - AI-powered credit analysis reports
+1. **Data Upload & Validation** - Validates core columns (Company ID, Name, S&P Rating)
+2. **Period Parsing** - Extracts fiscal year (FY) and calendar quarter (CQ) dates from "Period Ended" columns
+3. **Metric Extraction** - Pulls most recent values per user's data period setting
+4. **Factor Scoring** - Transforms raw metrics into 0-100 scores for 6 factors
+5. **Weight Resolution** - Applies Universal or Sector-Adjusted weights (stores original weights for explainability)
+6. **Composite Score** - Weighted average → single 0-100 quality metric
+7. **Trend Overlay** - Calculates Cycle Position Score from time-series momentum
+8. **Signal Assignment** - Classifies into 4 quadrants (Strong/Weak × Improving/Deteriorating)
+9. **Recommendation** - Percentile-based bands with guardrails (Strong Buy, Buy, Hold, Avoid)
+10. **Overall Rank** - Recommendation-based ranking (Strong Buy first, then quality within tier)
+11. **Visualization & Export** - Charts, leaderboards, AI analysis
 
-### Core Scoring System
+### Six-Factor Model
 
-**6 Factor Scores** (each 0-100):
-1. `credit_score` - Based on S&P rating mapped to numeric scale
-2. `leverage_score` - Net Debt / EBITDA (inverse scoring)
-3. `profitability_score` - EBITDA Margin
-4. `liquidity_score` - Current Ratio
-5. `growth_score` - Revenue CAGR (multi-period trend)
-6. `cash_flow_score` - Free Cash Flow / Total Debt
+The core scoring system evaluates issuers on:
 
-**Raw Scores** (V2.0):
-- `Raw_Quality_Score` - Composite of quality factors
-- `Raw_Trend_Score` - Composite of trend indicators
+1. **Credit Score** - S&P LT Issuer Rating (100%)
+2. **Leverage Score** - Net Debt/EBITDA (40%), Interest Coverage (30%), Debt/Capital (20%), Total Debt/EBITDA (10%)
+3. **Profitability Score** - EBITDA Margin, ROA, Net Margin
+4. **Liquidity Score** - Current Ratio, Cash/Total Debt
+5. **Growth Score** - Revenue CAGR, EBITDA growth (multi-period trend)
+6. **Cash Flow Score** - OCF/Revenue, OCF/Debt, UFCF margin, LFCF margin
 
-**Composite Score**: Weighted average of the 6 factors (0-100 scale).
+Each factor is scored 0-100. Higher is better (leverage is inverted).
 
-### Weight Resolution System
+### Weighting System
 
-Factor weights vary by issuer classification following this hierarchy:
+Two weighting modes:
 
-1. **CLASSIFICATION_OVERRIDES** - Custom weights for specific classifications
-2. **CLASSIFICATION_TO_SECTOR** - Maps 30+ classifications to 10 parent sectors
-3. **SECTOR_WEIGHTS** - Sector-specific factor weights
-4. **Default weights** - Universal fallback if no classification provided
+- **Universal Weights** - Equal treatment across all sectors (Default: credit 20%, leverage 20%, profitability 20%, liquidity 10%, growth 15%, cash flow 15%)
+- **Sector-Adjusted Weights** - Custom weights per GICS sector (e.g., Utilities emphasize cash flow 30%, credit 25%)
 
-Example: "Software and Services" → "Information Technology" sector → uses IT sector weights (high growth/cash flow emphasis, lower leverage weight).
+Dynamic calibration (V2.2.1) can calculate sector-specific weights from BBB-rated issuers to optimize classification accuracy.
 
-### Period Classification System
+### Period Selection System (V2.3)
 
-Data columns use suffix notation:
-- **Base column** (e.g., "EBITDA Margin") = most recent period
-- **Historical periods** (e.g., "EBITDA Margin.1", ".2", ".3", ".4") = prior periods
-- **Quarterly data** (optional): ".5" through ".12"
+**Unified Period Selection** replaces separate controls with two coherent modes:
 
-The system automatically classifies periods as FY (fiscal year) or CQ (calendar quarter) based on:
-1. **Period Ended column dates** (preferred method) - Uses `parse_period_ended_cols()` and `period_cols_by_kind()`
-2. **Fallback heuristic**: Month-based classification (December → FY, other → CQ)
+1. **Latest Available (Maximum Currency)**
+   - Uses most recent quarter (CQ-0) for quality scores
+   - Uses quarterly data for trend analysis
+   - Maximizes data freshness
+   - Each issuer uses their latest available data
 
-**Key features**:
-- Handles non-December fiscal year ends (June 30, September 30, etc.)
-- Filters 1900 sentinel dates automatically
-- Robust parsing of Excel serial dates and malformed data
-- Consistent classification across application and GenAI reports
+2. **Align to Reference Period**
+   - Aligns all issuers to a common reference date
+   - Enables true apples-to-apples comparison
+   - User selects reference quarter with coverage indicators
+   - Shows data coverage % for each available period
 
-**Key functions**:
-- `parse_period_ended_cols()` - Parse and sort period columns by actual dates
-- `period_cols_by_kind()` - Classify periods as FY or CQ based on date spacing
-- `_metric_series_for_row()` - Extract time series with proper period classification
-- `get_most_recent_column()` - Resolve correct column based on data period setting
+**Period Types:**
+- **FY (Fiscal Year)** - Annual data (columns: base, .1, .2, .3, .4)
+- **CQ (Calendar Quarter)** - Quarterly data (columns: base, .1-.12)
 
-### Trend Analysis (Dual-Horizon)
+**Key Features:**
+- **Auto Reference Date** - Recommends optimal reference date based on current date and reporting lags
+- **FY/CQ Overlap Resolution** - Handles Q4 overlaps (CQ preferred when dates match within 10-day window)
+- **Sentinel Date Handling** - Filters invalid dates (1900-01-01 used as missing data marker)
+- **Coverage Indicators** - Shows % of issuers with data for each period
 
-Two modes controlled by `use_quarterly_beta`:
-- **Annual mode** (False): Uses base + .1-.4 periods (5 FY periods)
-- **Quarterly mode** (True): Uses base + .1-.12 periods (13 periods if available)
+## Key Functions & Architecture
 
-**Dual-Horizon System** (V2.0):
-- **Medium-term trend** (3-5 periods): Primary direction indicator
-- **Short-term trend** (1-2 periods): Recent momentum indicator
-- **Context-aware signals**: Combined analysis produces refined signals like "Strong & Normalizing", "Weak & Deteriorating"
+### Data Loading & Validation
 
-### Data Validation
+- `load_and_process_data()` - Main entry point, cached with Streamlit (@st.cache_data)
+- `validate_core()` - Validates required columns with flexible alias matching
+- `parse_period_ended_cols()` - Extracts "Period Ended" columns
+- `build_period_calendar()` - Creates FY/CQ calendar with overlap resolution
 
-**Required columns** (flexible name matching via aliases):
-- Company Name/ID (COMPANY_NAME_ALIASES, COMPANY_ID_ALIASES)
-- S&P LT Issuer Credit Rating (RATING_ALIASES)
+### Column Resolution System
 
-**Optional features** (gated by REQ_FOR):
-- `classification`: Requires "Rubrics Custom Classification" column
-- `country_region`: Requires "Country" and "Region" columns
-- `period_alignment`: Requires "Period Ended" column
+Flexible column matching using aliases:
+- `resolve_column()` - Generic alias resolver
+- `resolve_rating_column()` - Finds S&P rating column
+- `resolve_company_id_column()` - Finds company identifier
+- `resolve_company_name_column()` - Finds company name
+- `resolve_metric_column()` - Finds metric columns with numbered suffixes
 
-Functions `resolve_column()` and `validate_core()` handle robust column name matching (case-insensitive, handles NBSP, extra spaces).
+### Metric Extraction
 
-### PCA Visualization
+- `get_most_recent_column()` - Extracts single-period values (respects data_period_setting)
+- `_build_metric_timeseries()` - Builds time series for trend analysis
+- `_batch_extract_metrics()` - Bulk metric extraction with period alignment support
+- `_metric_series_for_row()` - Row-level metric extraction with FY/CQ preference
 
-Creates 2D PCA plots showing:
-- Investment Grade (IG) vs High Yield (HY) clustering
-- Uses 6 factor scores as input features
-- RobustScaler normalization before PCA
-- Subsamples to 2000 points max for performance
+### Scoring System
 
-### GenAI Credit Report (New in V2.0)
+- `compute_raw_scores_v2()` - Main scoring function (generates all 6 factor scores)
+- `_cf_components_dataframe()` - Cash flow component calculations
+- `_cash_flow_component_scores()` - Cash flow factor scoring with clipping and scaling
+- `assign_rating_band()` - Maps S&P ratings to IG/HY bands
 
-AI-powered credit analysis using OpenAI GPT-4 Turbo. Requires API key in `.streamlit/secrets.toml`:
+### Trend Analysis
+
+- `calculate_trend_indicators()` - Dual-horizon trend metrics (momentum, volatility, proximity to peak)
+- `compute_dual_horizon_trends()` - Calculates short/long-term momentum
+- `calculate_cycle_position_score()` - Converts trends into single 0-100 score
+- `robust_slope()` - Median-based slope calculation (outlier-resistant)
+
+### Weight Resolution
+
+- `get_sector_weights()` - Returns weights for a sector
+- `get_classification_weights()` - Returns weights for classification (supports calibrated weights)
+- `calculate_calibrated_sector_weights()` - V2.2.1 dynamic calibration
+- `_resolve_model_weights_for_row()` - Row-level weight resolution
+
+### Signal Generation
+
+- `build_buckets_v2()` - Assigns issuers to 4 quality-trend quadrants
+- `_detect_signal()` - Determines signal based on thresholds
+- `_compute_quality_metrics()` - Splits dataset into High/Low quality
+
+### Ranking System (V2.3)
+
+**Recommendation-Based Ranking** prioritizes actionability over pure quality:
+
+- **Overall_Rank calculation** (Line ~7377-7393) - Uses recommendation priority first, then composite score
+- **Recommendation priority mapping**: `{"Strong Buy": 4, "Buy": 3, "Hold": 2, "Avoid": 1}`
+- **Sort logic**: Higher priority + higher score = lower rank number (Rank 1 = best)
+- **Applied in**:
+  - Dashboard "Top 10 Opportunities" (shows mostly Strong Buy/Buy)
+  - Dashboard "Bottom 10 Risks" (shows mostly Avoid/Hold)
+  - Issuer Search results table (Strong Buy at top)
+
+**Benefits:**
+- Top performers are actionable opportunities (not just high-quality deteriorating credits)
+- Rankings align with investment decisions
+- Incorporates both quality AND trend momentum
+
+### Visualization
+
+- `render_pca_scatter_ig_hy()` - PCA-based issuer map (IG/HY split)
+- `compute_pca_ig_hy()` - Factor score PCA reduction
+- `build_band_leaderboard()` - Top N issuers by rating band
+- `render_issuer_explainability()` - Enhanced issuer-level breakdown with weight comparison (V2.3)
+- `_build_explainability_table()` - Builds comparison table showing original vs current weights
+
+### AI Analysis (Optional - requires OpenAI API key)
+
+- `render_ai_analysis_chat()` - Interactive AI analyst interface
+- `extract_issuer_financial_data()` - Extracts data for LLM prompt
+- `build_credit_analysis_prompt()` - Generates structured credit analysis prompt
+- `generate_credit_report()` - Produces professional credit report
+- `assemble_issuer_context()` - Packages issuer data for AI
+- `assemble_classification_context()` - Packages sector/classification data for AI
+
+AI requires OpenAI API key in `.streamlit/secrets.toml`:
 ```toml
 OPENAI_API_KEY = "sk-..."
 ```
 
-**Key Functions**:
-- `extract_issuer_financial_data()` (app.py:774-891) - Extracts 11 financial metrics with full time series
-- `build_credit_analysis_prompt()` (app.py:894-985) - Builds structured prompt for OpenAI
-- `generate_credit_report()` (app.py:988-1021) - Calls GPT-4 Turbo API
+### Reference Date System
 
-**Metrics Extracted**:
-1. EBITDA Margin
-2. Total Debt / EBITDA (x)
-3. Net Debt / EBITDA
-4. EBITDA / Interest Expense (x)
-5. Current Ratio (x)
-6. Quick Ratio (x)
-7. Return on Equity
-8. Return on Assets
-9. Total Revenues
-10. Total Debt
-11. Cash and Short-Term Investments
+- `get_reference_date()` - Auto-determines appropriate reference date based on current date and reporting lags
+- `calculate_reference_date_coverage()` - Calculates % of issuers with data for each quarter
+- `build_dynamic_period_labels()` - Generates user-friendly period labels (e.g., "Q4 2024 (87% coverage)")
 
-**Report Structure** (7 sections):
-1. Executive Summary
-2. Profitability Analysis
-3. Leverage Analysis
-4. Liquidity & Coverage Analysis
-5. Credit Strengths (3-4 points)
-6. Credit Risks & Concerns (3-4 points)
-7. Rating Outlook & Recommendation
+### Enhanced Issuer Explainability (V2.3)
 
-**Features**:
-- Uses robust FY/CQ classification (handles non-December fiscal years)
-- Automatic period type detection (FY vs CQ)
-- Filters 1900 sentinel dates
-- Data availability preview before generation
-- Downloadable markdown reports
-- Cost: ~$0.05-0.07 per report
+**Shows both original and current weights for full transparency:**
 
-### Metric Aliases System
+**Weight Storage** (Line ~7035-7041):
+- Stores 6 weight columns during composite score calculation
+- `Weight_Credit_Used`, `Weight_Leverage_Used`, `Weight_Profitability_Used`, `Weight_Liquidity_Used`, `Weight_Growth_Used`, `Weight_CashFlow_Used`
+- Preserves original weights used in calculation for comparison
 
-**METRIC_ALIASES dictionary** (app.py:170-187) maps canonical metric names to common variations:
-- Handles vendor data inconsistencies
-- Case-insensitive matching
-- Used throughout application for robust column resolution
+**Comparison Table** (Function: `_build_explainability_table`):
+- **8 columns**: Factor, Score, Original Weight %, Current Weight %, Weight Change, Original Contrib, Current Contrib, Contrib Change
+- Shows side-by-side comparison of weights used in calculation vs current calibration settings
+- Calculates percentage change in weights and contribution impact
 
-**Helper Functions**:
-- `resolve_metric_column()` - Find metric column using aliases
-- `list_metric_columns()` - Get base + all suffixed columns for a metric
-- `get_from_row()` - Row-level safe getter honoring aliases
+**Display Features** (Function: `render_issuer_explainability`):
+- **Three-metric breakdown**: Stored Composite, Original Calculation, Current Calibration
+- **Smart interpretation**:
+  - ⚠️ Warning for significant impact (>5 points)
+  - ℹ️ Info for moderate impact (1-5 points)
+  - ✓ Success for minor impact (<1 point)
+- **Educational captions** explaining how to read the comparison table
+- **Graceful fallback** if original weights not stored
+
+**Benefits:**
+- Users see exactly how dynamic calibration affects each issuer
+- Validates calculation correctness (original should match stored composite)
+- Shows which factors benefit from sector-specific weighting
+- Clear cause-and-effect between weight changes and score impact
 
 ## Testing
 
-Embedded test suite runs when `RG_TESTS=1` environment variable is set.
+Tests are gated by `RG_TESTS` environment variable. Set to "1" to enable:
 
-**Test coverage** (12 tests total):
-1. Period classification with labeled dates
-2. 1900 sentinel date handling
-3. Classification weight validation (all sum to 1.0)
-4. CQ exclusion from FY series
-5. Annual value extraction for Interest Coverage
-6. Rating group classification (IG vs HY)
-7. Column alias resolution and canonicalization
-8. Date-based period selection
-9. Quarterly vs annual trend window selection
-10. Period vs trend window control separation
-11. FY/CQ overlap de-duplication (CQ preferred)
-12. Non-December FY classification in LLM extractor
-
-**Additional Test Suites**:
-- `test_patches.py` - Surgical patches verification (44 tests)
-- `test_genai_patches.py` - GenAI FY/CQ classification tests (3 tests)
-
-Run tests:
 ```bash
-set RG_TESTS=1 && python app.py
-python test_patches.py
-python test_genai_patches.py
+set RG_TESTS=1
+python app.py
 ```
 
-## State Management
+Tests validate:
+- Period selection (FY vs CQ)
+- Metric extraction with reference dates
+- Sentinel date filtering
+- Overlap de-duplication (FY/CQ)
+- Trend window behavior
+- LLM extractor FY/CQ classification
 
-**URL Query Parameters**:
-- `scoring_method` - Universal or Classification-Adjusted
-- `data_period` - FY0, CQ-0, or trailing periods
-- `use_quarterly_beta` - Trend window mode
-- `classification_filter`, `band_filter`, `region_filter`
-- `min_score`, `max_score`
+Tests run at module level (after function definitions, before Streamlit execution).
 
-Functions:
-- `collect_current_state()` - Capture current UI state
-- `apply_state_to_controls()` - Restore state from dict
-- `_build_deep_link()` - Generate shareable URL
+## Important Constants
 
-**Presets**: Saved in `st.session_state.presets` as JSON-serializable dicts.
+```python
+# Rating aliases (flexible column matching)
+RATING_ALIASES = ["S&P LT Issuer Rating", "S&P Rating", ...]
 
-## Key Data Flow
+# Company ID aliases
+COMPANY_ID_ALIASES = ["Company ID", "Issuer ID", ...]
 
-1. **Upload** → `load_and_process_data()`
-2. **Column validation** → `validate_core()`
-3. **Period parsing** → `parse_period_ended_cols()`
-4. **Period classification** → `period_cols_by_kind()` (FY vs CQ)
-5. **Metric extraction** → `get_most_recent_column()` per user's data period setting
-6. **Trend calculation** → Dual-horizon trend indicators (medium-term + short-term)
-7. **Weight resolution** → `get_classification_weights()`
-8. **Scoring** → Raw quality/trend scores + composite score
-9. **Signal derivation** → Context-aware signals (V2.0)
-10. **Rating band assignment** → `assign_rating_band()`
-11. **Display** → Filters → PCA → Leaderboards → GenAI Reports
+# Company name aliases
+COMPANY_NAME_ALIASES = ["Company Name", "Issuer Name", ...]
+```
 
-## React-Safe Table Rendering
+## Caching Strategy
 
-**Migration to st.table** (V2.0):
-- Replaced `st.dataframe()` with `st.table()` for diagnostics tables
-- Eliminates React ChunkLoadError
-- All data converted to strings before rendering
-- Simplified data structures (counts vs complex strings)
+- `@st.cache_data` on `load_and_process_data()` - includes `_cache_buster` parameter to force recalculation when key parameters change
+- Cache key includes: `use_quarterly_beta`, `align_to_reference`, `reference_date_override`, `use_dynamic_calibration`, `calibration_rating_band`
 
-**Key Locations**:
-- Diagnostics table rendering
-- Evidence table rendering
-- Global data health display
+## File Structure
 
-## Code Style Notes
+```
+experiment/
+├── app.py                    # Main application (~10k lines)
+├── archive/
+│   └── app.py               # Previous version
+├── .streamlit/
+│   └── secrets.toml         # OpenAI API key (not tracked)
+└── __pycache__/
+```
 
-- **Testing mode**: Many sections check `os.environ.get("RG_TESTS")` to disable UI code during tests
-- **Caching**: `@st.cache_data` on `load_and_process_data()` for performance
-- **Version markers**: Code sections tagged with `[V2.0]` comments
-- **No emojis**: Professional appearance, emojis removed in V2.0
-- **Robust error handling**: Graceful fallbacks throughout
+## Key UI Controls (Streamlit Sidebar)
 
-## Common Modifications
+### V2.3 Simplified Interface
 
-**Adding a new sector**:
-1. Add entry to `SECTOR_WEIGHTS`
-2. Update `CLASSIFICATION_TO_SECTOR` mapping if needed
+**Core Settings:**
+- **Scoring Method** - Universal vs Sector-Adjusted weights
+- **Period Selection Mode** - Latest Available (Maximum Currency) vs Align to Reference Period
+  - When "Align to Reference Period" selected: Reference Date dropdown with coverage indicators
+  - Auto-recommends optimal reference date based on current date
+- **Dynamic Calibration** - Optional BBB-based weight optimization (when Sector-Adjusted enabled)
+- **Rating Filter** - All Issuers / Investment Grade / High Yield / Specific bands (AAA, AA, A, BBB, BB, B, CCC, Unrated)
 
-**Adding a new factor**:
-1. Extract metric in `load_and_process_data()`
-2. Calculate score (0-100 scale)
-3. Add to all sector weight dicts (must sum to 1.0)
-4. Update composite score calculation
-5. Update `_factor_score_columns()` for PCA
+**Fixed Parameters (V2.3):**
+- Quality/Trend split thresholds: **60/55** (hardcoded at recommended defaults)
+- Split basis: **Percentile within Band** (hardcoded)
+- Dual-horizon context: **volatility_cv=0.30, outlier_z=-2.5, damping=0.5, near_peak_tolerance=10**
 
-**Modifying rating bands**:
-- Edit `RATING_BANDS` dict
-- Used by `assign_rating_band()` function
+**Removed in V2.3** (UI simplification):
+- Advanced Dual-Horizon Context expander
+- Save/Load Preset controls
+- Reproduce/Share configuration expander
+- Data Freshness Filters
+- DEBUG displays
+- Quality/Trend threshold sliders
+- Split basis dropdown
+- V2.3 Parameters info box
+- DIAGNOSTICS expander
 
-**Adding metrics to GenAI reports**:
-1. Add to `metrics_to_extract` list in `extract_issuer_financial_data()`
-2. Add to `METRIC_ALIASES` if needed for column resolution
-3. Update prompt in `build_credit_analysis_prompt()` if needed
+## Column Naming Conventions
 
-## Important Functions Reference
+- Base metric: `"EBITDA Margin"`
+- Historical periods: `"EBITDA Margin.1"`, `"EBITDA Margin.2"`, etc.
+- Period dates: `"Period Ended"`, `"Period Ended.1"`, `"Period Ended.2"`, etc.
 
-**Period Classification**:
-- `parse_period_ended_cols()` - Parse period dates
-- `period_cols_by_kind()` - Classify FY vs CQ by date spacing
-- `_find_period_cols()` - Map suffix to period column
+Numbering:
+- `.1` = most recent period
+- `.2`, `.3`, `.4` = earlier periods
+- FY typically uses base + .1-.4 (5 annual periods)
+- CQ typically uses base + .1-.12 (13 quarterly periods)
 
-**Metric Resolution**:
-- `resolve_metric_column()` - Find metric using aliases
-- `list_metric_columns()` - Get base + suffixed columns
-- `_metric_series_for_row()` - Extract time series with period types
+## Performance Considerations
 
-**GenAI Functions**:
-- `extract_issuer_financial_data()` - Extract financial data for one issuer
-- `build_credit_analysis_prompt()` - Build OpenAI prompt
-- `generate_credit_report()` - Call GPT-4 Turbo API
+- Main bottleneck: Period calendar construction and metric extraction
+- File size: Designed for datasets with 100s-1000s of issuers
+- Timing diagnostics embedded in `load_and_process_data()` (prints to console when RG_TESTS=1)
 
-**Data Validation**:
-- `resolve_column()` - Generic column alias resolver
-- `validate_core()` - Validate required columns
-- `resolve_company_name_column()` - Find company name column
-- `resolve_rating_column()` - Find rating column
+## Version History Notes
 
-**Diagnostics**:
-- `generate_data_diagnostics_v2()` - Per-issuer data quality report
-- `generate_global_data_health_v2()` - Dataset-wide health metrics
-- `build_issuer_evidence_table()` - Evidence table for AI reports
+- **V2.3** - Current version (Major UI/UX improvements)
+  - **Unified Period Selection**: Consolidated 4 separate controls into 2-mode system (Latest Available vs Reference Aligned)
+  - **Recommendation-Based Ranking**: Overall_Rank now prioritizes Strong Buy > Buy > Hold > Avoid (instead of pure composite score)
+  - **Enhanced Explainability**: Shows original weights vs current weights with 8-column comparison table
+  - **UI Simplification**: Removed 9+ advanced/debug controls, hardcoded recommended defaults
+  - **Fixed Recommendation Priorities**: Correctly maps Strong Buy, Buy, Hold, Avoid (removed incorrect "Sell")
+  - **Dashboard Improvements**: "Top 10 Opportunities" and "Bottom 10 Risks" with Combined_Signal column
 
-## Dependencies
+- **V2.2** - Period alignment, reference dates, and FY/CQ overlap resolution
+- **V2.2.1** - Dynamic calibration for sector-specific weights
+- Prior versions stored in `archive/`
 
-Core:
-- streamlit
-- pandas
-- numpy
-- plotly (graph_objects, express)
-- sklearn (RobustScaler, PCA)
-- dateutil (parser)
+## Important V2.3 Implementation Notes
 
-Optional:
-- openai (for GenAI credit report feature)
+### Recommendation System
+- **Four recommendations only**: Strong Buy, Buy, Hold, Avoid (NO "Sell")
+- **Priority mapping used in 3 locations**:
+  1. Overall_Rank calculation (line ~7381)
+  2. Dashboard Top/Bottom 10 (line ~7720)
+  3. Issuer Search sorting (line ~8928)
 
-## Performance Notes
+### Period Selection
+- **Two enums**: `PeriodSelectionMode` (LATEST_AVAILABLE, REFERENCE_ALIGNED) and `PeriodType` (ANNUAL, QUARTERLY)
+- **Function signature change**: `load_and_process_data()` now uses `period_mode` instead of separate `data_period_setting`, `use_quarterly_beta`, `align_to_reference` parameters
+- **Backward compatibility**: Legacy variables derived from `period_mode` for compatibility with existing code
 
-- **File size**: ~8100 lines (single-file architecture)
-- **Dataset handling**: Optimized for 100-5000 issuers
-- **PCA**: Subsamples to 2000 points for performance
-- **Caching**: Data loading and processing cached via `@st.cache_data`
-- **GenAI reports**: ~5-15 seconds per report (OpenAI API latency)
-
-## Recent Changes (V2.0)
-
-1. **GenAI Credit Report Tab**
-   - AI-powered credit analysis using GPT-4 Turbo
-   - Replaces legacy AI Analysis tab
-   - Professional 7-section reports
-   - Downloadable markdown format
-
-2. **Robust FY/CQ Classification**
-   - Handles non-December fiscal year ends
-   - Uses `parse_period_ended_cols()` for accuracy
-   - Graceful fallback to month heuristic
-   - Consistent across application
-
-3. **React-Safe Rendering**
-   - Migrated to `st.table()` from `st.dataframe()`
-   - Simplified data structures
-   - Eliminated ChunkLoadError issues
-
-4. **Version Standardization**
-   - All version references now "V2.0"
-   - Updated header, comments, documentation
-
-5. **Enhanced Testing**
-   - 12 RG_TESTS (up from 11)
-   - Added non-December FY classification test
-   - Additional GenAI patch test suite
-
-## Known Issues / Edge Cases
-
-1. **Non-calendar fiscal years**: Now handled correctly via robust period classification
-2. **1900 sentinel dates**: Automatically filtered out
-3. **Excel serial dates**: Handled via `pd.to_datetime(..., errors="coerce")`
-4. **Missing Period Ended columns**: Graceful fallback to suffix-based indexing
-5. **React serialization**: Resolved via st.table migration and string conversion
-
-## Documentation Files
-
-- `CLAUDE.md` - This file
-- `GENAI_CREDIT_REPORT_TAB.md` - Comprehensive GenAI feature documentation
-- `GENAI_PATCHES_SUMMARY.md` - FY/CQ classification enhancement details
-- `ST_TABLE_MIGRATION.md` - React-safe table rendering documentation
-- Various other technical documentation files for specific patches
+### Enhanced Explainability
+- **6 new columns** in results DataFrame: `Weight_*_Used` columns store original weights
+- **Function signature change**: `_build_explainability_table()` returns 6 values instead of 4
+- **Comparison display**: Shows impact of dynamic calibration with before/after weights
