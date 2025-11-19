@@ -405,7 +405,7 @@ def get_period_type_for_date(period_calendar, company_id, target_date):
 # [V2.2] Only configure Streamlit if not running tests
 if os.environ.get("RG_TESTS") != "1":
     st.set_page_config(
-        page_title="Issuer Credit Screening Model V2.2",
+        page_title="Issuer Credit Screening Model V3.0",
         layout="wide",
         page_icon="https://rubricsam.com/wp-content/uploads/2021/01/cropped-rubrics-logo-tight.png",
     )
@@ -426,7 +426,7 @@ def render_header(results_final=None, data_period=None, use_sector_adjusted=Fals
     st.markdown("""
     <div class="rb-header">
       <div class="rb-title">
-        <h1>Issuer Credit Screening Model V2.2</h1>
+        <h1>Issuer Credit Screening Model V3.0</h1>
         <div class="rb-sub">6-Factor Composite Scoring with Sector Adjustment & Trend Analysis</div>
       </div>
       <div class="rb-logo">
@@ -3665,9 +3665,9 @@ def _cf_components_dataframe(df: pd.DataFrame, data_period_setting: str, has_per
         'Capital Expenditure',
         'Capital Expenditures',
         'CAPEX',
+        'Revenue',
         'Total Revenues',
         'Total Revenue',
-        'Revenue',
         'Total Debt',
         'Levered Free Cash Flow',
         'Free Cash Flow'
@@ -3682,8 +3682,8 @@ def _cf_components_dataframe(df: pd.DataFrame, data_period_setting: str, has_per
     capex = metrics.get('Capital Expenditure', metrics.get('Capital Expenditures',
             metrics.get('CAPEX', pd.Series(np.nan, index=df.index))))
 
-    rev = metrics.get('Total Revenues', metrics.get('Total Revenue',
-          metrics.get('Revenue', pd.Series(np.nan, index=df.index))))
+    rev = metrics.get('Revenue', metrics.get('Total Revenues',
+          metrics.get('Total Revenue', pd.Series(np.nan, index=df.index))))
 
     debt = metrics.get('Total Debt', pd.Series(np.nan, index=df.index))
 
@@ -3929,6 +3929,14 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
     """
     Calculate sector weights that normalize scores across sectors.
 
+    V3.0 REDESIGN: Two-mode system with UNIVERSAL_WEIGHTS as single source of truth
+
+    MODE 1 (use_dynamic=False):
+        Returns universal weights for ALL sectors (no sector differentiation)
+
+    MODE 2 (use_dynamic=True):
+        Starts from UNIVERSAL_WEIGHTS and applies data-driven sector neutralization
+
     Methodology: Inverse Deviation Weighting
     - If sector underperforms on factor → REDUCE weight (minimize penalty)
     - If sector outperforms on factor → REDUCE weight (don't amplify advantage)
@@ -3937,14 +3945,22 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
     Args:
         df: DataFrame with factor scores and classifications
         rating_band: Rating level to calibrate on (default 'BBB' for broad IG)
-        use_dynamic: If True, calculate from uploaded data. If False, use pre-computed.
+        use_dynamic: If True, calculate from uploaded data. If False, use universal weights.
 
     Returns:
         dict: Sector name -> {factor: weight} mappings, normalized to sum=1.0
     """
     if not use_dynamic:
-        # Return pre-computed weights (for performance/stability)
-        return SECTOR_WEIGHTS  # Falls back to current weights
+        # MODE 1: Return universal weights for all sectors (no differentiation)
+        # Get all unique sectors from CLASSIFICATION_TO_SECTOR
+        all_sectors = set(CLASSIFICATION_TO_SECTOR.values())
+        universal_for_all = {}
+        for sector in all_sectors:
+            universal_for_all[sector] = UNIVERSAL_WEIGHTS.copy()
+        universal_for_all['Default'] = UNIVERSAL_WEIGHTS.copy()
+        return universal_for_all
+
+    # MODE 2: Data-driven calibration starting from universal base
 
     # Define rating bands
     rating_bands = {
@@ -3964,12 +3980,24 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
             break
 
     if rating_col is None:
-        return SECTOR_WEIGHTS
+        # Fallback to universal weights for all sectors
+        all_sectors = set(CLASSIFICATION_TO_SECTOR.values())
+        universal_for_all = {}
+        for sector in all_sectors:
+            universal_for_all[sector] = UNIVERSAL_WEIGHTS.copy()
+        universal_for_all['Default'] = UNIVERSAL_WEIGHTS.copy()
+        return universal_for_all
 
     df_rated = df[df[rating_col].isin(target_ratings)].copy()
 
     if len(df_rated) < 50:  # Insufficient data
-        return SECTOR_WEIGHTS
+        # Fallback to universal weights for all sectors
+        all_sectors = set(CLASSIFICATION_TO_SECTOR.values())
+        universal_for_all = {}
+        for sector in all_sectors:
+            universal_for_all[sector] = UNIVERSAL_WEIGHTS.copy()
+        universal_for_all['Default'] = UNIVERSAL_WEIGHTS.copy()
+        return universal_for_all
 
     # Map factor scores to their column names
     factor_score_cols = {
@@ -3990,7 +4018,13 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
             break
 
     if class_field is None:
-        return SECTOR_WEIGHTS
+        # Fallback to universal weights for all sectors
+        all_sectors = set(CLASSIFICATION_TO_SECTOR.values())
+        universal_for_all = {}
+        for sector in all_sectors:
+            universal_for_all[sector] = UNIVERSAL_WEIGHTS.copy()
+        universal_for_all['Default'] = UNIVERSAL_WEIGHTS.copy()
+        return universal_for_all
 
     # Calculate market medians (for this rating band)
     market_medians = {}
@@ -4003,10 +4037,10 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
     # Calculate sector-specific weights
     calibrated_weights = {}
 
-    for sector_name in SECTOR_WEIGHTS.keys():
-        if sector_name == 'Default':
-            continue
+    # Get all unique sectors
+    all_sectors = set(CLASSIFICATION_TO_SECTOR.values())
 
+    for sector_name in all_sectors:
         # Get classifications for this sector
         sector_classifications = [k for k, v in CLASSIFICATION_TO_SECTOR.items()
                                  if v == sector_name]
@@ -4015,7 +4049,8 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
         sector_df = df_rated[df_rated[class_field].isin(sector_classifications)]
 
         if len(sector_df) < 5:  # Insufficient data for this sector
-            calibrated_weights[sector_name] = SECTOR_WEIGHTS[sector_name]
+            # Use universal weights as fallback
+            calibrated_weights[sector_name] = UNIVERSAL_WEIGHTS.copy()
             continue
 
         # Calculate sector medians
@@ -4031,39 +4066,53 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
 
         for factor_key in factor_score_cols.keys():
             if factor_key not in sector_medians or factor_key not in market_medians:
-                raw_weights[factor_key] = SECTOR_WEIGHTS['Default'][factor_key]
+                # Use universal weight as base
+                raw_weights[factor_key] = UNIVERSAL_WEIGHTS[factor_key]
                 continue
 
             sector_val = sector_medians[factor_key]
             market_val = market_medians[factor_key]
 
             if market_val == 0:
-                raw_weights[factor_key] = SECTOR_WEIGHTS['Default'][factor_key]
+                # Use universal weight as base
+                raw_weights[factor_key] = UNIVERSAL_WEIGHTS[factor_key]
                 continue
 
             # Calculate deviation percentage
             # For scores, higher is better, so negative deviation = underperformance
             deviation_pct = ((sector_val - market_val) / abs(market_val)) * 100
 
-            abs_dev = abs(deviation_pct)
-            base_weight = SECTOR_WEIGHTS['Default'][factor_key]
+            # START FROM UNIVERSAL BASE (same for all sectors)
+            base_weight = UNIVERSAL_WEIGHTS[factor_key]
 
-            # Apply inverse weighting
-            # For scores, negative deviation = sector is worse, so reduce weight
-            # For scores, positive deviation = sector is better, so reduce weight (don't amplify)
+            # SECTOR NEUTRALIZATION LOGIC
+            # Any deviation (+ or -) means this factor reflects sector structure
+            # → REDUCE weight to remove sector bias
+            # Only neutral factors should drive cross-sector comparisons
+
+            abs_dev = abs(deviation_pct)
 
             if abs_dev > 50:
-                # Large deviation (either direction) → significantly reduce weight
+                # Extreme deviation → this is pure sector characteristic
+                calibrated = base_weight * 0.15
+            elif abs_dev > 30:
+                # Large deviation → strongly sector-driven
                 calibrated = base_weight * 0.30
-            elif abs_dev > 25:
-                # Moderate deviation → moderately reduce weight
+            elif abs_dev > 20:
+                # Moderate deviation → significantly sector-driven
                 calibrated = base_weight * 0.50
             elif abs_dev > 10:
-                # Small deviation → slightly reduce weight
-                calibrated = base_weight * 0.75
+                # Small deviation → moderately sector-driven
+                calibrated = base_weight * 0.70
+            elif abs_dev > 5:
+                # Minor deviation → slightly sector-driven
+                calibrated = base_weight * 0.85
             else:
-                # Minimal deviation → keep weight similar (this is a good differentiator)
-                calibrated = base_weight * 0.95
+                # Neutral (±5%) → pure issuer differentiation
+                calibrated = base_weight * 1.00
+
+            # Cap weights to prevent extreme values
+            calibrated = min(max(calibrated, 0.01), 0.45)
 
             raw_weights[factor_key] = calibrated
 
@@ -4072,10 +4121,11 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
         if total > 0:
             calibrated_weights[sector_name] = {k: v/total for k, v in raw_weights.items()}
         else:
-            calibrated_weights[sector_name] = SECTOR_WEIGHTS[sector_name]
+            # Use universal weights as fallback
+            calibrated_weights[sector_name] = UNIVERSAL_WEIGHTS.copy()
 
-    # Add Default as is
-    calibrated_weights['Default'] = SECTOR_WEIGHTS['Default']
+    # Add Default using universal weights
+    calibrated_weights['Default'] = UNIVERSAL_WEIGHTS.copy()
 
     return calibrated_weights
 
@@ -4083,97 +4133,25 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
 # SECTOR-SPECIFIC WEIGHTS (SOLUTION TO ISSUE #1: SECTOR BIAS)
 # ============================================================================
 
-SECTOR_WEIGHTS = {
-    'Utilities': {
-        'credit_score': 0.25,
-        'leverage_score': 0.12,
-        'profitability_score': 0.15,
-        'liquidity_score': 0.08,
-        'growth_score': 0.10,
-        'cash_flow_score': 0.30
-    },
-    'Real Estate': {
-        'credit_score': 0.20,
-        'leverage_score': 0.15,
-        'profitability_score': 0.15,
-        'liquidity_score': 0.12,
-        'growth_score': 0.13,
-        'cash_flow_score': 0.25
-    },
-    'Energy': {
-        'credit_score': 0.18,
-        'leverage_score': 0.25,
-        'profitability_score': 0.12,
-        'liquidity_score': 0.15,
-        'growth_score': 0.08,
-        'cash_flow_score': 0.22
-    },
-    'Materials': {
-        'credit_score': 0.20,
-        'leverage_score': 0.23,
-        'profitability_score': 0.15,
-        'liquidity_score': 0.12,
-        'growth_score': 0.10,
-        'cash_flow_score': 0.20
-    },
-    'Industrials': {
-        'credit_score': 0.20,
-        'leverage_score': 0.20,
-        'profitability_score': 0.22,
-        'liquidity_score': 0.10,
-        'growth_score': 0.13,
-        'cash_flow_score': 0.15
-    },
-    'Information Technology': {
-        'credit_score': 0.18,
-        'leverage_score': 0.25,
-        'profitability_score': 0.25,
-        'liquidity_score': 0.08,
-        'growth_score': 0.18,
-        'cash_flow_score': 0.06
-    },
-    'Health Care': {
-        'credit_score': 0.20,
-        'leverage_score': 0.22,
-        'profitability_score': 0.23,
-        'liquidity_score': 0.10,
-        'growth_score': 0.12,
-        'cash_flow_score': 0.13
-    },
-    'Consumer Staples': {
-        'credit_score': 0.25,
-        'leverage_score': 0.18,
-        'profitability_score': 0.22,
-        'liquidity_score': 0.08,
-        'growth_score': 0.08,
-        'cash_flow_score': 0.19
-    },
-    'Consumer Discretionary': {
-        'credit_score': 0.18,
-        'leverage_score': 0.23,
-        'profitability_score': 0.20,
-        'liquidity_score': 0.13,
-        'growth_score': 0.15,
-        'cash_flow_score': 0.11
-    },
-    'Communication Services': {
-        'credit_score': 0.22,
-        'leverage_score': 0.18,
-        'profitability_score': 0.18,
-        'liquidity_score': 0.10,
-        'growth_score': 0.12,
-        'cash_flow_score': 0.20
-    },
-    # Default for unmapped sectors
-    'Default': {
-        'credit_score': 0.20,
-        'leverage_score': 0.20,
-        'profitability_score': 0.20,
-        'liquidity_score': 0.10,
-        'growth_score': 0.15,
-        'cash_flow_score': 0.15
-    }
+# ============================================================================
+# UNIVERSAL BASE WEIGHTS (V3.0 - SINGLE SOURCE OF TRUTH)
+# ============================================================================
+# This is the ONLY weight definition in the system.
+# Used as:
+# 1. Starting point for dynamic calibration (when enabled)
+# 2. Final weights for all sectors (when calibration disabled)
+
+UNIVERSAL_WEIGHTS = {
+    'credit_score': 0.20,
+    'leverage_score': 0.20,
+    'profitability_score': 0.20,
+    'liquidity_score': 0.10,
+    'growth_score': 0.15,
+    'cash_flow_score': 0.15
 }
+
+# IMPORTANT: The old SECTOR_WEIGHTS dictionary has been removed.
+# All weight logic now flows through UNIVERSAL_WEIGHTS and dynamic calibration.
 
 # ============================================================================
 # RUBRICS CUSTOM CLASSIFICATION MAPPING
@@ -4246,49 +4224,54 @@ CLASSIFICATION_OVERRIDES = {
 def get_sector_weights(sector, use_sector_adjusted=True):
     """
     Returns weight dictionary for a given sector.
-    Falls back to Default if sector not found or if sector adjustment disabled.
-    
+
+    V3.0 REDESIGN: Always returns universal weights
+
     DEPRECATED: Use get_classification_weights() for Rubrics Custom Classifications
+    Note: This function now only returns UNIVERSAL_WEIGHTS regardless of sector.
+    For sector-specific calibrated weights, use the calibration system.
     """
-    if not use_sector_adjusted:
-        return SECTOR_WEIGHTS['Default']
-    return SECTOR_WEIGHTS.get(sector, SECTOR_WEIGHTS['Default'])
+    # Always return universal weights (sector differentiation happens via calibration)
+    return UNIVERSAL_WEIGHTS.copy()
 
 def get_classification_weights(classification, use_sector_adjusted=True, calibrated_weights=None):
     """
     Get factor weights for a Rubrics Custom Classification.
 
+    V3.0 REDESIGN: Universal weights as base, calibrated weights when enabled
+
     Hierarchy:
-    1. Check if classification has custom override weights
-    2. Map to parent sector and use sector weights
-    3. Fall back to Default if classification not found
+    1. If calibration disabled (no calibrated_weights): Return universal weights
+    2. Check if classification has custom override weights
+    3. Map to parent sector and use calibrated sector weights
+    4. Fall back to universal weights if classification not found
 
     Args:
         classification: Rubrics Custom Classification value
-        use_sector_adjusted: Whether to use adjusted weights (vs universal Default)
-        calibrated_weights: Optional dict of dynamically calibrated weights (V2.2.1)
+        use_sector_adjusted: Whether to use adjusted weights (vs universal)
+        calibrated_weights: Optional dict of dynamically calibrated weights (V3.0)
 
     Returns:
         Dictionary with 6 factor weights (summing to 1.0)
     """
-    # Use calibrated weights if provided, otherwise use static weights
-    weights_to_use = calibrated_weights if calibrated_weights is not None else SECTOR_WEIGHTS
+    # MODE 1: If calibration disabled, return universal weights
+    if not use_sector_adjusted or calibrated_weights is None:
+        return UNIVERSAL_WEIGHTS.copy()
 
-    if not use_sector_adjusted:
-        return weights_to_use.get('Default', SECTOR_WEIGHTS['Default'])
+    # MODE 2: Use calibrated weights (data-driven sector adjustments)
 
     # Step 1: Check for custom overrides
     if classification in CLASSIFICATION_OVERRIDES:
         return CLASSIFICATION_OVERRIDES[classification]
 
-    # Step 2: Map to parent sector
+    # Step 2: Map to parent sector and use calibrated weights
     if classification in CLASSIFICATION_TO_SECTOR:
         parent_sector = CLASSIFICATION_TO_SECTOR[classification]
-        if parent_sector in weights_to_use:
-            return weights_to_use[parent_sector]
+        if parent_sector in calibrated_weights:
+            return calibrated_weights[parent_sector]
 
-    # Step 3: Fall back to Default
-    return weights_to_use.get('Default', SECTOR_WEIGHTS['Default'])
+    # Step 3: Fall back to universal weights
+    return UNIVERSAL_WEIGHTS.copy()
 
 # ================================
 # EXPLAINABILITY HELPERS (V2.2) — canonical
@@ -4303,7 +4286,7 @@ def _resolve_text_field(row: pd.Series, candidates):
 def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
     """
     Return (weights_dict, provenance_str) with sector/classification precedence.
-    Keys: lowercase matching SECTOR_WEIGHTS (credit_score, leverage_score,
+    Keys: lowercase matching UNIVERSAL_WEIGHTS (credit_score, leverage_score,
           profitability_score, liquidity_score, growth_score, cash_flow_score)
     """
     UNIVERSAL = {"credit_score": 0.20, "leverage_score": 0.20, "profitability_score": 0.20,
@@ -4324,12 +4307,8 @@ def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str):
     except Exception:
         pass
 
-    # 2) Sector map
-    try:
-        if sec and sec in SECTOR_WEIGHTS:
-            return SECTOR_WEIGHTS[sec], f"Sector-Adjusted via sector='{sec}'"
-    except Exception:
-        pass
+    # 2) Sector map (V3.0: Now handled via calibration system)
+    # Legacy sector lookup removed - use calibration system for sector-specific weights
 
     # 3) Classification map
     try:
@@ -4605,7 +4584,7 @@ def render_methodology_tab(df_original: pd.DataFrame, results_final: pd.DataFram
         df_original: Original uploaded DataFrame
         results_final: Final results DataFrame with scores and signals
     """
-    st.markdown("# Model Methodology (V2.2)")
+    st.markdown("# Model Methodology (V3.0)")
     st.markdown("*Programmatically Generated Specification — All values reflect current configuration*")
     st.markdown("---")
 
@@ -4696,28 +4675,34 @@ where all weights sum to 1.0
         Example: "Software and Services" → "Information Technology" sector weights.
         """)
 
-        # Build weights table for all sectors
-        weights_rows = []
-        for sector_name in sorted(SECTOR_WEIGHTS.keys()):
-            weights = SECTOR_WEIGHTS[sector_name]
-            weights_rows.append({
-                "Sector": sector_name,
-                "Credit": f"{weights['credit_score']:.2f}",
-                "Leverage": f"{weights['leverage_score']:.2f}",
-                "Profitability": f"{weights['profitability_score']:.2f}",
-                "Liquidity": f"{weights['liquidity_score']:.2f}",
-                "Growth": f"{weights['growth_score']:.2f}",
-                "Cash Flow": f"{weights['cash_flow_score']:.2f}",
-                "Sum": f"{sum(weights.values()):.2f}"
-            })
+        # Get calibrated weights from session state if available
+        calibrated_weights = st.session_state.get('_calibrated_weights', None)
 
-        weights_df = pd.DataFrame(weights_rows)
-        st.dataframe(weights_df, use_container_width=True, height=400)
+        if calibrated_weights:
+            # Build weights table for all calibrated sectors
+            weights_rows = []
+            for sector_name in sorted(calibrated_weights.keys()):
+                weights = calibrated_weights[sector_name]
+                weights_rows.append({
+                    "Sector": sector_name,
+                    "Credit": f"{weights['credit_score']:.2f}",
+                    "Leverage": f"{weights['leverage_score']:.2f}",
+                    "Profitability": f"{weights['profitability_score']:.2f}",
+                    "Liquidity": f"{weights['liquidity_score']:.2f}",
+                    "Growth": f"{weights['growth_score']:.2f}",
+                    "Cash Flow": f"{weights['cash_flow_score']:.2f}",
+                    "Sum": f"{sum(weights.values()):.2f}"
+                })
+
+            weights_df = pd.DataFrame(weights_rows)
+            st.dataframe(weights_df, use_container_width=True, height=400)
+        else:
+            st.info("Calibrated weights not yet calculated. Upload data to see sector-specific weights.")
 
     else:
         st.markdown("**Universal Weights Mode:** Same weights for all issuers regardless of sector.")
 
-        default_weights = SECTOR_WEIGHTS['Default']
+        default_weights = UNIVERSAL_WEIGHTS
         weights_display = pd.DataFrame([{
             "Factor": "Credit Score",
             "Weight": f"{default_weights['credit_score']:.2f}"
@@ -5061,7 +5046,7 @@ ELSE:
     st.markdown("## 10. Export Methodology")
 
     # Build markdown export
-    export_md = f"""# Issuer Credit Screening Model - Methodology Specification (V2.2)
+    export_md = f"""# Issuer Credit Screening Model - Methodology Specification (V3.0)
 
 *Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}*
 
@@ -5105,11 +5090,16 @@ where all weights sum to 1.0
     if use_sector_adjusted:
         export_md += "| Sector | Credit | Leverage | Profitability | Liquidity | Growth | Cash Flow | Sum |\n"
         export_md += "|--------|--------|----------|---------------|-----------|--------|-----------|-----|\n"
-        for sector_name in sorted(SECTOR_WEIGHTS.keys()):
-            w = SECTOR_WEIGHTS[sector_name]
-            export_md += f"| {sector_name} | {w['credit_score']:.2f} | {w['leverage_score']:.2f} | {w['profitability_score']:.2f} | {w['liquidity_score']:.2f} | {w['growth_score']:.2f} | {w['cash_flow_score']:.2f} | {sum(w.values()):.2f} |\n"
+        # Get calibrated weights from session state if available
+        calibrated_weights = st.session_state.get('_calibrated_weights', None)
+        if calibrated_weights:
+            for sector_name in sorted(calibrated_weights.keys()):
+                w = calibrated_weights[sector_name]
+                export_md += f"| {sector_name} | {w['credit_score']:.2f} | {w['leverage_score']:.2f} | {w['profitability_score']:.2f} | {w['liquidity_score']:.2f} | {w['growth_score']:.2f} | {w['cash_flow_score']:.2f} | {sum(w.values()):.2f} |\n"
+        else:
+            export_md += "| (Calibrated weights not yet calculated) | - | - | - | - | - | - | - |\n"
     else:
-        dw = SECTOR_WEIGHTS['Default']
+        dw = UNIVERSAL_WEIGHTS
         export_md += "| Factor | Weight |\n|--------|--------|\n"
         for fk in ['credit_score', 'leverage_score', 'profitability_score',
                    'liquidity_score', 'growth_score', 'cash_flow_score']:
@@ -5613,6 +5603,750 @@ if not HAS_DATA:
 # ============================================================================
 # DATA LOADING & PROCESSING FUNCTIONS
 # ============================================================================
+
+# ============================================================================
+# GENAI CREDIT REPORT - DATA EXTRACTION PIPELINE (V3.0)
+# ============================================================================
+
+def extract_raw_financials_from_input(df_original: pd.DataFrame, company_name: str) -> dict:
+    """
+    Extract ALL relevant raw financial metrics directly from input spreadsheet.
+    This is the SOURCE OF TRUTH for actual company fundamentals.
+
+    Args:
+        df_original: The raw input DataFrame (from uploaded Excel file)
+        company_name: Name of company to analyze
+
+    Returns:
+        dict: Complete raw financial profile with all metrics from spreadsheet
+    """
+
+    # Find the company row
+    try:
+        company_row = df_original[df_original['Company Name'] == company_name]
+    except Exception as e:
+        return {"error": f"Error finding company: {str(e)}. Company name: '{company_name}' (type: {type(company_name)}), Column dtype: {df_original['Company Name'].dtype}"}
+
+    if len(company_row) == 0:
+        return {"error": f"Company '{company_name}' not found in input data"}
+
+    row = company_row.iloc[0]
+
+    # Helper function to safely get values
+    def safe_get(column_name, default=None):
+        try:
+            val = row.get(column_name)
+            if pd.isna(val):
+                return default
+            return val
+        except:
+            return default
+
+    def safe_get_numeric(column_name, default=None):
+        """Get numeric value, converting strings like 'NM' to None"""
+        try:
+            val = row.get(column_name)
+            if pd.isna(val):
+                return default
+            # If it's already numeric, return it
+            if isinstance(val, (int, float)):
+                return val
+            # If it's a string, try to convert to numeric
+            if isinstance(val, str):
+                try:
+                    return pd.to_numeric(val)
+                except (ValueError, TypeError):
+                    # Conversion failed (e.g., 'NM', 'N/A'), return default
+                    return default
+            return val
+        except:
+            return default
+
+    # Extract ALL financial metrics from the spreadsheet
+    raw_data = {
+        "company_info": {
+            "name": safe_get('Company Name'),
+            "ticker": safe_get('Ticker'),
+            "country": safe_get('Country'),
+            "region": safe_get('Region'),
+            "sector": safe_get('Sector'),
+            "industry": safe_get('Industry'),
+            "industry_group": safe_get('Industry Group'),
+            "classification": safe_get('Rubrics Custom Classification'),
+            "sp_rating": safe_get('S&P Credit Rating'),
+            "sp_rating_clean": safe_get('_Credit_Rating_Clean'),
+            "rating_date": safe_get('S&P Last Review Date'),
+            "market_cap": safe_get('Market Capitalization'),
+        },
+
+        # PROFITABILITY METRICS (directly from spreadsheet)
+        "profitability": {
+            "ebitda_margin": safe_get_numeric('EBITDA Margin'),
+            "ebit_margin": safe_get_numeric('EBIT Margin'),
+            "operating_margin": safe_get_numeric('Operating Margin'),
+            "net_margin": safe_get_numeric('Net Margin'),
+            "roe": safe_get_numeric('Return on Equity'),
+            "roa": safe_get_numeric('Return on Assets'),
+            "roic": safe_get_numeric('Return on Invested Capital'),
+        },
+
+        # LEVERAGE METRICS (directly from spreadsheet)
+        "leverage": {
+            "total_debt": safe_get_numeric('Total Debt'),
+            "net_debt": safe_get_numeric('Net Debt'),
+            "total_equity": safe_get_numeric('Total Common Equity'),
+            "total_debt_ebitda": safe_get_numeric('Total Debt / EBITDA (x)'),
+            "net_debt_ebitda": safe_get_numeric('Net Debt / EBITDA'),
+            "total_debt_equity": safe_get_numeric('Total Debt/Equity (x)'),
+            "total_debt_capital": safe_get_numeric('Total Debt / Total Capital (%)'),
+        },
+
+        # COVERAGE METRICS (directly from spreadsheet)
+        "coverage": {
+            "ebitda_interest": safe_get_numeric('EBITDA/ Interest Expense (x)'),  # NO space before /
+            "ebit_interest": safe_get_numeric('EBIT/ Interest Expense (x)'),      # NO space before /
+            "interest_expense": safe_get_numeric('Interest Expense'),
+        },
+
+        # LIQUIDITY METRICS (directly from spreadsheet)
+        "liquidity": {
+            "current_ratio": safe_get_numeric('Current Ratio (x)'),
+            "quick_ratio": safe_get_numeric('Quick Ratio (x)'),
+            "cash_st_investments": safe_get_numeric('Cash and Short-Term Investments'),
+            "current_assets": safe_get_numeric('Current Assets'),
+            "current_liabilities": safe_get_numeric('Current Liabilities'),
+            "working_capital": safe_get_numeric('Working Capital'),
+        },
+
+        # GROWTH METRICS (directly from spreadsheet)
+        "growth": {
+            "revenue_1y_growth": safe_get_numeric('Total Revenues, 1 Year Growth'),
+            "revenue_3y_cagr": safe_get_numeric('Total Revenues, 3 Yr. CAGR'),
+            "ebitda_3y_cagr": safe_get_numeric('EBITDA, 3 Years CAGR'),
+            "total_revenues": safe_get_numeric('Total Revenues'),
+            "ebitda": safe_get_numeric('EBITDA'),
+        },
+
+        # CASH FLOW METRICS (directly from spreadsheet - corrected column names)
+        "cash_flow": {
+            "cfo": safe_get_numeric('Cash from Ops.'),              # Corrected: 'Ops.' not 'Operations'
+            "capex": safe_get_numeric('Capital Expenditure'),       # Corrected: singular not plural
+            "fcf": safe_get_numeric('Unlevered Free Cash Flow'),   # Corrected: full column name
+            "cfo_total_debt": None,  # Will calculate below if not in spreadsheet
+            "fcf_total_debt": None,  # Will calculate below if not in spreadsheet
+        },
+
+        # BALANCE SHEET (for context)
+        "balance_sheet": {
+            "total_assets": safe_get_numeric('Total Assets'),
+            "total_liabilities": safe_get_numeric('Total Liabilities'),
+        },
+
+        # PERIOD INFORMATION
+        "data_period": {
+            "latest_period": safe_get('Period Ended'),
+        }
+    }
+
+    # ========================================================================
+    # CALCULATE DERIVED RATIOS (if not directly available in spreadsheet)
+    # ========================================================================
+
+    # Calculate CFO/Total Debt ratio (as percentage)
+    if raw_data['cash_flow']['cfo_total_debt'] is None:
+        cfo = raw_data['cash_flow']['cfo']
+        total_debt = raw_data['leverage']['total_debt']
+        if cfo is not None and total_debt is not None:
+            try:
+                cfo_val = float(cfo)
+                debt_val = float(total_debt)
+                if debt_val != 0:
+                    raw_data['cash_flow']['cfo_total_debt'] = (cfo_val / abs(debt_val)) * 100
+            except (ValueError, TypeError, ZeroDivisionError):
+                pass
+
+    # Calculate FCF/Total Debt ratio (as percentage)
+    if raw_data['cash_flow']['fcf_total_debt'] is None:
+        fcf = raw_data['cash_flow']['fcf']
+        total_debt = raw_data['leverage']['total_debt']
+        if fcf is not None and total_debt is not None:
+            try:
+                fcf_val = float(fcf)
+                debt_val = float(total_debt)
+                if debt_val != 0:
+                    raw_data['cash_flow']['fcf_total_debt'] = (fcf_val / abs(debt_val)) * 100
+            except (ValueError, TypeError, ZeroDivisionError):
+                pass
+
+    return raw_data
+
+
+def calculate_peer_context(df_original: pd.DataFrame, raw_financials: dict) -> dict:
+    """
+    Calculate peer medians and percentile rankings.
+    Essential for understanding relative credit strength.
+
+    Args:
+        df_original: Raw input DataFrame
+        raw_financials: Raw financial data from extract_raw_financials_from_input()
+
+    Returns:
+        dict: Peer comparison context with medians and percentiles
+    """
+
+    classification = raw_financials['company_info']['classification']
+    rating = raw_financials['company_info']['sp_rating_clean']
+
+    # Check for missing or NaN values (handle None, empty string, NaN)
+    def is_valid_value(val):
+        """Check if value is valid (not None, not NaN, not empty string)"""
+        if val is None:
+            return False
+        try:
+            if pd.isna(val):
+                return False
+        except (TypeError, ValueError):
+            pass  # pd.isna() failed, value is likely a valid string
+        if isinstance(val, str) and val.strip() == '':
+            return False
+        return True
+
+    if not is_valid_value(classification):
+        return {"error": "Missing classification information"}
+    if not is_valid_value(rating):
+        return {"error": "Missing rating information"}
+
+    # Get sector peers (same Rubrics Custom Classification)
+    # Use fillna to handle NaN, then convert to string for safe comparison
+    try:
+        classification_col = df_original['Rubrics Custom Classification'].fillna('').astype(str)
+        sector_peers = df_original[classification_col == str(classification)].copy()
+    except Exception as e:
+        return {"error": f"Error filtering sector peers: {str(e)}. Classification: {classification} (type: {type(classification)}), Column dtype: {df_original['Rubrics Custom Classification'].dtype}"}
+
+    # Get rating peers (same cleaned rating)
+    # Use fillna to handle NaN, then convert to string for safe comparison
+    try:
+        rating_col = df_original['_Credit_Rating_Clean'].fillna('').astype(str)
+        rating_peers = df_original[rating_col == str(rating)].copy()
+    except Exception as e:
+        return {"error": f"Error filtering rating peers: {str(e)}. Rating: {rating} (type: {type(rating)}), Column dtype: {df_original['_Credit_Rating_Clean'].dtype}"}
+
+    # Helper function to calculate percentile
+    def calc_percentile(value, peer_series, higher_is_better=True):
+        """Calculate percentile rank (0-100)"""
+        if pd.isna(value) or value is None:
+            return None
+        peer_values = pd.to_numeric(peer_series, errors='coerce').dropna()
+        if len(peer_values) == 0:
+            return None
+        if higher_is_better:
+            return round((peer_values < value).sum() / len(peer_values) * 100, 1)
+        else:
+            return round((peer_values > value).sum() / len(peer_values) * 100, 1)
+
+    # Calculate sector medians
+    sector_medians = {}
+    sector_percentiles = {}
+
+    metrics_to_compare = {
+        'ebitda_margin': ('EBITDA Margin', True),
+        'roe': ('Return on Equity', True),
+        'roa': ('Return on Assets', True),
+        'total_debt_ebitda': ('Total Debt / EBITDA (x)', False),  # Lower is better
+        'net_debt_ebitda': ('Net Debt / EBITDA', False),
+        'current_ratio': ('Current Ratio (x)', True),
+        'quick_ratio': ('Quick Ratio (x)', True),
+        'ebitda_interest': ('EBITDA/ Interest Expense (x)', True),  # NO space before /
+        'revenue_1y_growth': ('Total Revenues, 1 Year Growth', True),
+        'revenue_3y_cagr': ('Total Revenues, 3 Yr. CAGR', True),
+    }
+
+    for metric_key, (col_name, higher_is_better) in metrics_to_compare.items():
+        if col_name in sector_peers.columns:
+            # Convert to numeric, coercing errors (like 'NM') to NaN
+            numeric_values = pd.to_numeric(sector_peers[col_name], errors='coerce')
+            sector_medians[metric_key] = numeric_values.median()
+
+            # Get company value
+            if metric_key in ['ebitda_margin', 'roe', 'roa']:
+                company_value = raw_financials['profitability'].get(metric_key)
+            elif metric_key in ['total_debt_ebitda', 'net_debt_ebitda']:
+                company_value = raw_financials['leverage'].get(metric_key)
+            elif metric_key in ['current_ratio', 'quick_ratio']:
+                company_value = raw_financials['liquidity'].get(metric_key)
+            elif metric_key == 'ebitda_interest':
+                company_value = raw_financials['coverage'].get(metric_key)
+            elif metric_key in ['revenue_1y_growth', 'revenue_3y_cagr']:
+                company_value = raw_financials['growth'].get(metric_key)
+            else:
+                company_value = None
+
+            if company_value is not None:
+                sector_percentiles[metric_key] = calc_percentile(
+                    company_value,
+                    sector_peers[col_name],
+                    higher_is_better
+                )
+
+    # Calculate rating peer medians and percentiles
+    rating_medians = {}
+    rating_percentiles = {}
+
+    for metric_key, (col_name, higher_is_better) in metrics_to_compare.items():
+        if col_name in rating_peers.columns:
+            # Convert to numeric, coercing errors (like 'NM') to NaN
+            numeric_values = pd.to_numeric(rating_peers[col_name], errors='coerce')
+            rating_medians[metric_key] = numeric_values.median()
+
+            # Get company value (same logic as above)
+            if metric_key in ['ebitda_margin', 'roe', 'roa']:
+                company_value = raw_financials['profitability'].get(metric_key)
+            elif metric_key in ['total_debt_ebitda', 'net_debt_ebitda']:
+                company_value = raw_financials['leverage'].get(metric_key)
+            elif metric_key in ['current_ratio', 'quick_ratio']:
+                company_value = raw_financials['liquidity'].get(metric_key)
+            elif metric_key == 'ebitda_interest':
+                company_value = raw_financials['coverage'].get(metric_key)
+            elif metric_key in ['revenue_1y_growth', 'revenue_3y_cagr']:
+                company_value = raw_financials['growth'].get(metric_key)
+            else:
+                company_value = None
+
+            if company_value is not None:
+                rating_percentiles[metric_key] = calc_percentile(
+                    company_value,
+                    rating_peers[col_name],
+                    higher_is_better
+                )
+
+    peer_context = {
+        "sector_comparison": {
+            "classification": classification,
+            "peer_count": len(sector_peers),
+            "medians": sector_medians,
+            "percentiles": sector_percentiles,
+        },
+        "rating_comparison": {
+            "rating": rating,
+            "peer_count": len(rating_peers),
+            "medians": rating_medians,
+            "percentiles": rating_percentiles,
+        }
+    }
+
+    return peer_context
+
+
+def extract_model_outputs(results_df: pd.DataFrame, company_name: str,
+                         use_sector_adjusted: bool, calibrated_weights: dict = None) -> dict:
+    """
+    Extract model scores, rankings, and contextual information from app.py results.
+    This provides CONTEXT for interpreting the scores.
+
+    Args:
+        results_df: The results DataFrame from app.py (after scoring)
+        company_name: Name of company to analyze
+        use_sector_adjusted: Whether sector-adjusted scoring is enabled
+        calibrated_weights: The calibrated weight dictionary (if dynamic calibration on)
+
+    Returns:
+        dict: Complete model output profile with scores and interpretation context
+    """
+
+    # Find the company in results
+    try:
+        company_result = results_df[results_df['Company_Name'] == company_name]
+    except Exception as e:
+        return {"error": f"Error finding company in results: {str(e)}. Company name: '{company_name}' (type: {type(company_name)}), Column dtype: {results_df['Company_Name'].dtype}"}
+
+    if len(company_result) == 0:
+        return {"error": f"Company '{company_name}' not found in results"}
+
+    result = company_result.iloc[0]
+
+    # Get classification and sector
+    classification = result.get('Rubrics_Custom_Classification')
+    sector = CLASSIFICATION_TO_SECTOR.get(classification, 'Default')
+
+    # Get the actual weights used for this company
+    if use_sector_adjusted and calibrated_weights is not None:
+        weights_used = calibrated_weights.get(sector, UNIVERSAL_WEIGHTS)
+        weights_source = f"Dynamic Calibration ({sector})"
+    else:
+        weights_used = UNIVERSAL_WEIGHTS
+        weights_source = "Universal (No sector adjustment)" if not use_sector_adjusted else "Universal (Calibration error)"
+
+    model_outputs = {
+        "overall_metrics": {
+            "composite_score": result.get('Composite_Score'),
+            "rating_band": result.get('Rating_Band'),
+            "signal": result.get('Combined_Signal'),
+            "recommendation": result.get('Recommendation'),
+        },
+
+        "factor_scores": {
+            "credit_score": result.get('Credit_Score'),
+            "leverage_score": result.get('Leverage_Score'),
+            "profitability_score": result.get('Profitability_Score'),
+            "liquidity_score": result.get('Liquidity_Score'),
+            "growth_score": result.get('Growth_Score'),
+            "cash_flow_score": result.get('Cash_Flow_Score'),
+        },
+
+        "quality_vs_trend": {
+            "quality_score": result.get('Quality_Score'),
+            "trend_score": result.get('Trend_Score'),
+        },
+
+        "weights_applied": {
+            "credit_weight": weights_used.get('credit_score'),
+            "leverage_weight": weights_used.get('leverage_score'),
+            "profitability_weight": weights_used.get('profitability_score'),
+            "liquidity_weight": weights_used.get('liquidity_score'),
+            "growth_weight": weights_used.get('growth_score'),
+            "cash_flow_weight": weights_used.get('cash_flow_score'),
+            "source": weights_source,
+        },
+
+        "sector_context": {
+            "classification": classification,
+            "sector": sector,
+            "calibration_enabled": use_sector_adjusted,
+        },
+
+        "scoring_methodology": {
+            "critical_note": "CRITICAL: Model scores represent RELATIVE POSITIONING after sector calibration, NOT absolute credit quality. Low scores can reflect 'average within advantaged sector', not weak fundamentals. ALWAYS check raw metrics first."
+        }
+    }
+
+    return model_outputs
+
+
+def prepare_genai_credit_report_data(
+    df_original: pd.DataFrame,
+    results_df: pd.DataFrame,
+    company_name: str,
+    use_sector_adjusted: bool,
+    calibrated_weights: dict = None
+) -> dict:
+    """
+    MASTER FUNCTION: Combines all data sources for GenAI credit report.
+
+    This is the function that should be called from the UI when user
+    requests a credit report.
+
+    Args:
+        df_original: Raw input spreadsheet data (the uploaded Excel file)
+        results_df: Model scoring results from app.py
+        company_name: Company to analyze
+        use_sector_adjusted: Whether sector calibration is enabled
+        calibrated_weights: Dynamic calibration weights (if enabled)
+
+    Returns:
+        dict: Complete data package for GenAI with raw metrics, model scores, and peer context
+    """
+
+    try:
+        # Step 1: Get raw financials from input spreadsheet (SOURCE OF TRUTH)
+        raw_financials = extract_raw_financials_from_input(df_original, company_name)
+
+        if "error" in raw_financials:
+            return raw_financials
+
+        # Step 2: Get model outputs from app.py (CONTEXT)
+        model_outputs = extract_model_outputs(
+            results_df,
+            company_name,
+            use_sector_adjusted,
+            calibrated_weights
+        )
+
+        if "error" in model_outputs:
+            return model_outputs
+
+        # Step 3: Calculate peer comparisons (RELATIVE POSITIONING)
+        peer_context = calculate_peer_context(df_original, raw_financials)
+
+        if "error" in peer_context:
+            return peer_context
+
+        # Step 4: Combine everything
+        complete_data = {
+            "company_name": company_name,
+
+            # PRIMARY DATA: Raw financials from spreadsheet
+            "raw_financials": raw_financials,
+
+            # CONTEXT DATA: Model scores and weights
+            "model_outputs": model_outputs,
+
+            # COMPARISON DATA: Peer medians and percentiles
+            "peer_context": peer_context,
+
+            # METADATA
+            "data_sources": {
+                "raw_metrics": "Input spreadsheet (source of truth)",
+                "model_scores": "app.py scoring engine (context only)",
+                "peer_data": "Calculated from input spreadsheet",
+            },
+
+            "generation_timestamp": pd.Timestamp.now().isoformat(),
+
+            "calibration_info": {
+                "sector_adjusted": use_sector_adjusted,
+                "dynamic_calibration": calibrated_weights is not None,
+                "weights_source": model_outputs['weights_applied']['source'],
+            }
+        }
+
+        return complete_data
+
+    except Exception as e:
+        return {"error": f"Error preparing data: {str(e)}"}
+
+
+def build_comprehensive_credit_prompt(data: dict) -> str:
+    """
+    Build GenAI prompt with clear data hierarchy and interpretation guidance.
+    Emphasizes raw metrics over model scores.
+
+    Args:
+        data: Complete data package from prepare_genai_credit_report_data()
+
+    Returns:
+        str: Formatted prompt for LLM
+    """
+
+    raw = data['raw_financials']
+    model = data['model_outputs']
+    peers = data['peer_context']
+
+    # Helper function to format metric safely
+    def fmt(value, decimals=2, suffix=''):
+        if value is None or pd.isna(value):
+            return "N/A"
+        if suffix == '%':
+            return f"{value:.{decimals}f}%"
+        elif suffix == 'x':
+            return f"{value:.{decimals}f}x"
+        elif suffix == 'B':
+            return f"${value/1000:.1f}B"
+        else:
+            return f"{value:.{decimals}f}"
+
+    prompt = f"""# CREDIT ANALYSIS REPORT: {data['company_name']}
+
+You are generating a professional credit analysis report. You have access to THREE data sources with a CLEAR HIERARCHY:
+
+## DATA SOURCE #1: RAW FINANCIAL METRICS (PRIMARY - SOURCE OF TRUTH)
+
+These come directly from the input spreadsheet and represent ACTUAL company fundamentals.
+Use these metrics as the FOUNDATION of your analysis.
+
+### Company Profile
+- Name: {raw['company_info']['name']}
+- Ticker: {raw['company_info']['ticker']}
+- S&P Rating: {raw['company_info']['sp_rating']}
+- Classification: {raw['company_info']['classification']}
+- Sector: {raw['company_info']['sector']}
+
+### Profitability (Actual Metrics from Spreadsheet)
+- EBITDA Margin: {fmt(raw['profitability']['ebitda_margin'], 2, '%')}
+- Return on Equity: {fmt(raw['profitability']['roe'], 2, '%')}
+- Return on Assets: {fmt(raw['profitability']['roa'], 2, '%')}
+- Operating Margin: {fmt(raw['profitability']['operating_margin'], 2, '%')}
+
+### Leverage (Actual Metrics from Spreadsheet)
+- Total Debt/EBITDA: {fmt(raw['leverage']['total_debt_ebitda'], 2, 'x')}
+- Net Debt/EBITDA: {fmt(raw['leverage']['net_debt_ebitda'], 2, 'x')}
+- Total Debt: {fmt(raw['leverage']['total_debt'], 1, 'B')}
+- Total Debt/Equity: {fmt(raw['leverage']['total_debt_equity'], 2, 'x')}
+
+### Coverage (Actual Metrics from Spreadsheet)
+- EBITDA/Interest Expense: {fmt(raw['coverage']['ebitda_interest'], 2, 'x')}
+
+### Liquidity (Actual Metrics from Spreadsheet)
+- Current Ratio: {fmt(raw['liquidity']['current_ratio'], 2, 'x')}
+- Quick Ratio: {fmt(raw['liquidity']['quick_ratio'], 2, 'x')}
+- Cash & ST Investments: {fmt(raw['liquidity']['cash_st_investments'], 1, 'B')}
+
+### Growth (Actual Metrics from Spreadsheet)
+- Revenue Growth (1Y): {fmt(raw['growth']['revenue_1y_growth'], 2, '%')}
+- Revenue CAGR (3Y): {fmt(raw['growth']['revenue_3y_cagr'], 2, '%')}
+
+### Cash Flow (Actual Metrics from Spreadsheet)
+- Operating Cash Flow: {fmt(raw['cash_flow']['cfo'], 1, 'B')}
+- Free Cash Flow: {fmt(raw['cash_flow']['fcf'], 1, 'B')}
+- CFO/Total Debt: {fmt(raw['cash_flow']['cfo_total_debt'], 2, '%')}
+
+---
+
+## DATA SOURCE #2: PEER COMPARISONS (CRITICAL CONTEXT)
+
+These show how the company compares to sector peers and rating peers.
+Use these to determine if metrics are "strong", "average", or "weak".
+
+### Sector Peer Comparison ({peers['sector_comparison']['classification']})
+Peer Count: {peers['sector_comparison']['peer_count']} companies
+
+| Metric | Company Value | Sector Median | Percentile |
+|--------|---------------|---------------|------------|
+| EBITDA Margin | {fmt(raw['profitability']['ebitda_margin'], 2, '%')} | {fmt(peers['sector_comparison']['medians'].get('ebitda_margin'), 2, '%')} | {fmt(peers['sector_comparison']['percentiles'].get('ebitda_margin'), 0)}%ile |
+| ROE | {fmt(raw['profitability']['roe'], 2, '%')} | {fmt(peers['sector_comparison']['medians'].get('roe'), 2, '%')} | {fmt(peers['sector_comparison']['percentiles'].get('roe'), 0)}%ile |
+| Total Debt/EBITDA | {fmt(raw['leverage']['total_debt_ebitda'], 2, 'x')} | {fmt(peers['sector_comparison']['medians'].get('total_debt_ebitda'), 2, 'x')} | {fmt(peers['sector_comparison']['percentiles'].get('total_debt_ebitda'), 0)}%ile |
+| Current Ratio | {fmt(raw['liquidity']['current_ratio'], 2, 'x')} | {fmt(peers['sector_comparison']['medians'].get('current_ratio'), 2, 'x')} | {fmt(peers['sector_comparison']['percentiles'].get('current_ratio'), 0)}%ile |
+
+### Rating Peer Comparison ({peers['rating_comparison']['rating']})
+Peer Count: {peers['rating_comparison']['peer_count']} companies
+
+| Metric | Company Value | Rating Median | Percentile |
+|--------|---------------|---------------|------------|
+| EBITDA Margin | {fmt(raw['profitability']['ebitda_margin'], 2, '%')} | {fmt(peers['rating_comparison']['medians'].get('ebitda_margin'), 2, '%')} | {fmt(peers['rating_comparison']['percentiles'].get('ebitda_margin'), 0)}%ile |
+| ROE | {fmt(raw['profitability']['roe'], 2, '%')} | {fmt(peers['rating_comparison']['medians'].get('roe'), 2, '%')} | {fmt(peers['rating_comparison']['percentiles'].get('roe'), 0)}%ile |
+| Total Debt/EBITDA | {fmt(raw['leverage']['total_debt_ebitda'], 2, 'x')} | {fmt(peers['rating_comparison']['medians'].get('total_debt_ebitda'), 2, 'x')} | {fmt(peers['rating_comparison']['percentiles'].get('total_debt_ebitda'), 0)}%ile |
+| Current Ratio | {fmt(raw['liquidity']['current_ratio'], 2, 'x')} | {fmt(peers['rating_comparison']['medians'].get('current_ratio'), 2, 'x')} | {fmt(peers['rating_comparison']['percentiles'].get('current_ratio'), 0)}%ile |
+
+**INTERPRETATION GUIDE:**
+- Percentile >75%: Strong/Exceptional (for positive metrics) or Weak (for leverage - higher percentile = lower leverage = better)
+- Percentile 50-75%: Above Average
+- Percentile 25-50%: Below Average
+- Percentile <25%: Weak (for positive metrics) or Strong (for leverage)
+
+---
+
+## DATA SOURCE #3: MODEL SCORES (SUPPLEMENTARY CONTEXT ONLY)
+
+{model['scoring_methodology']['critical_note']}
+
+### Model Scores (0-100 scale, relative positioning after sector calibration)
+- Composite Score: {fmt(model['overall_metrics']['composite_score'], 1)}/100
+- Profitability Score: {fmt(model['factor_scores']['profitability_score'], 1)}/100
+- Leverage Score: {fmt(model['factor_scores']['leverage_score'], 1)}/100
+- Liquidity Score: {fmt(model['factor_scores']['liquidity_score'], 1)}/100
+- Growth Score: {fmt(model['factor_scores']['growth_score'], 1)}/100
+- Cash Flow Score: {fmt(model['factor_scores']['cash_flow_score'], 1)}/100
+- Credit Score: {fmt(model['factor_scores']['credit_score'], 1)}/100
+
+### Model Context
+- Signal: {model['overall_metrics']['signal']}
+- Recommendation: {model['overall_metrics']['recommendation']}
+- Weights Applied: {model['weights_applied']['source']}
+- Sector: {model['sector_context']['sector']}
+
+### Understanding Model Scores (CRITICAL)
+
+**Example of CORRECT Interpretation:**
+If Profitability Score = 38.7 BUT EBITDA Margin = 28.17% (97th percentile):
+WRONG: "Low profitability score indicates weak earnings"
+CORRECT: "EBITDA margin of 28.17% is exceptional (97th percentile vs sector). The moderate profitability score of 38.7 reflects sector calibration adjusting for this classification's structural profitability advantages. The model deweights profitability to avoid sector bias in cross-sector comparisons."
+
+**Key Principle:** Model scores are for relative RANKING within a universe, not absolute credit assessment.
+
+---
+
+## YOUR TASK: GENERATE CREDIT ANALYSIS REPORT
+
+### Analysis Hierarchy (MUST FOLLOW THIS ORDER):
+
+1. **START WITH RAW METRICS (Data Source #1)**
+   - What are the actual EBITDA margin, leverage ratios, liquidity ratios?
+   - State these numbers explicitly
+
+2. **ADD PEER CONTEXT (Data Source #2)**
+   - How do metrics compare to sector median?
+   - How do they compare to rating peer median?
+   - What percentile is the company in?
+
+3. **MAKE ASSESSMENT**
+   - If percentile >75%: "Strong" or "Exceptional"
+   - If better than rating peer median: Note as credit strength
+   - If worse than rating peer median: Note as credit concern
+   - If metric is below median BUT percentile shows >50%: The distribution is right-skewed, company is still above average
+
+4. **EXPLAIN MODEL SCORES (Data Source #3) - LAST**
+   - If raw metrics strong BUT model score low: Explain sector calibration effect
+   - If raw metrics weak AND model score low: Confirm fundamental weakness
+   - DO NOT use model scores to override what raw metrics show
+
+### Report Structure:
+
+**Executive Summary**
+- Brief overview based on raw metrics and peer comparisons
+- Synthesize absolute credit quality
+- 3-4 sentences max
+
+**Profitability Analysis (Score: X/100)**
+- Start with actual metrics: "EBITDA margin of X%, ROE of Y%"
+- Compare to peers: "vs sector median of A%, rating median of B%"
+- State percentiles: "placing company in Xth percentile"
+- Assess: "This represents [strong/weak/average] profitability"
+- Then explain: "The profitability score of X reflects [sector calibration context]"
+
+**Leverage Analysis (Score: X/100)**
+- Follow same structure as profitability
+- Remember: lower leverage = better credit quality
+
+**Liquidity Analysis (Score: X/100)**
+- Follow same structure
+- Current ratio >1.5x generally considered adequate for IG
+
+**Coverage Analysis**
+- State EBITDA/Interest coverage
+- Compare to thresholds (>3x = comfortable, 2-3x = adequate, <2x = tight)
+
+**Cash Flow Analysis (Score: X/100)**
+- State CFO, FCF, CFO/Debt ratio
+- Assess cash generation strength
+
+**Growth Analysis (Score: X/100)**
+- State revenue growth rates
+- Context: is growth positive/negative, accelerating/decelerating?
+
+**Credit Strengths**
+- List 3-5 genuine strengths with supporting data
+- Must be backed by percentiles >60% or better than rating peers
+
+**Credit Risks & Concerns**
+- List 3-5 genuine concerns with supporting data
+- Must be backed by percentiles <40% or worse than rating peers
+
+**Rating Outlook & Investment Recommendation**
+- Based on peer comparison: count metrics better/worse than rating peer median
+- If 70%+ metrics better than rating peers: Rating appropriate or conservative
+- If 70%+ metrics worse: Rating at risk
+- Provide outlook (Stable/Negative/Positive) with rationale
+- Investment recommendation: Overweight/Neutral/Underweight with rationale
+
+### CRITICAL RULES (MUST FOLLOW):
+
+NEVER say: "Profitability score of X indicates weak earnings"
+ALWAYS say: "EBITDA margin of X% (Yth percentile) indicates [strong/weak] profitability. The profitability score of Z reflects [context]."
+
+NEVER interpret model scores without first stating raw metrics
+ALWAYS state raw metric → peer comparison → percentile → assessment → then model score context
+
+NEVER recommend rating change without showing metrics worse than rating peers
+ALWAYS compare multiple metrics to rating peer median before assessing rating risk
+
+NEVER call fundamentals "weak" when percentiles show >60%
+ALWAYS align qualitative language with percentile rankings
+
+NEVER use phrases like "low score suggests" or "score indicates"
+ALWAYS say "actual metric of X (percentile Y) shows [assessment]"
+
+### Formatting:
+- Use clear section headers
+- Include specific numbers in every claim
+- Cite percentiles frequently
+- Keep sections concise (3-5 sentences each)
+- Use bullet points for strengths/risks lists
+
+Generate the comprehensive credit analysis report now, following all instructions above.
+"""
+
+    return prompt
+
 
 def get_most_recent_column(df, base_metric, data_period_setting):
     """
@@ -6568,8 +7302,8 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
             - REFERENCE_ALIGNED: Align all issuers to common reference date
         reference_date_override: Required when period_mode=REFERENCE_ALIGNED.
                                 pd.Timestamp of the reference date.
-        calibrated_weights: Optional dict of dynamically calibrated sector weights (V2.2.1).
-                          If provided, these weights will be used instead of static SECTOR_WEIGHTS.
+        calibrated_weights: Optional dict of dynamically calibrated sector weights (V3.0).
+                          If provided, sector-specific weights used; otherwise UNIVERSAL_WEIGHTS.
     """
 
     # ===== TIMING DIAGNOSTICS =====
@@ -6787,6 +7521,72 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
     # CALCULATE QUALITY SCORES ([V2.2] ANNUAL-ONLY DEFAULT)
     # ========================================================================
 
+    def _calculate_factor_score_with_renormalization(
+        components: np.ndarray,
+        weights: np.ndarray,
+        min_components: int = 1,
+        factor_name: str = ""
+    ) -> tuple:
+        """
+        Calculate factor score with automatic weight renormalization for missing data.
+
+        Args:
+            components: 2D array (n_issuers × n_components) of component scores
+            weights: 1D array of component weights (must sum to 1.0)
+            min_components: Minimum number of non-missing components required
+            factor_name: Name of factor (for data quality column naming)
+
+        Returns:
+            tuple of (scores, data_completeness, components_used_count)
+        """
+        # Ensure components is 2D (issuers × components)
+        if components.ndim == 1:
+            components = components.reshape(-1, 1)
+
+        n_issuers, n_components = components.shape
+
+        # Validate weights
+        assert len(weights) == n_components, f"{factor_name}: Weights must match number of components"
+        assert abs(weights.sum() - 1.0) < 0.001, f"{factor_name}: Weights must sum to 1.0"
+
+        # Identify missing components
+        mask = np.isnan(components)
+
+        # Count available components per issuer
+        components_available = (~mask).sum(axis=1)
+
+        # Calculate effective weights (zero out missing components)
+        weights_2d = np.broadcast_to(weights, (n_issuers, n_components))
+        effective_weights = np.where(mask, 0.0, weights_2d)
+        weight_sums = effective_weights.sum(axis=1, keepdims=True)
+
+        # Renormalize weights
+        normalized_weights = np.where(
+            weight_sums > 0,
+            effective_weights / weight_sums,
+            0.0
+        )
+
+        # Calculate weighted scores
+        weighted_components = components * normalized_weights
+        raw_scores = np.nansum(weighted_components, axis=1)
+
+        # Apply minimum component threshold
+        final_scores = np.where(
+            components_available >= min_components,
+            raw_scores,
+            np.nan
+        )
+
+        # Calculate data completeness
+        data_completeness = components_available / n_components
+
+        return (
+            pd.Series(final_scores),
+            pd.Series(data_completeness),
+            pd.Series(components_available, dtype=int)
+        )
+
     def calculate_quality_scores(df, data_period_setting, has_period_alignment, reference_date=None, align_to_reference=False):
         """
         Calculate quality scores for all issuers.
@@ -6881,7 +7681,7 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
             - <1.0x: Critical (0-10 points)
             """
             if pd.isna(cov):
-                return 50  # Neutral if missing
+                return np.nan  # Don't score if data missing
 
             if cov >= 8.0:
                 return 90 + min(10, (cov - 8) / 2)
@@ -6902,7 +7702,8 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
 
         # Component 1: Net Debt / EBITDA (40%)
         net_debt_ebitda = metrics['Net Debt / EBITDA']
-        net_debt_ebitda = net_debt_ebitda.where(net_debt_ebitda >= 0, other=20.0).fillna(20.0).clip(upper=20.0)
+        # Keep only valid positive values, let negatives and missing be NaN
+        net_debt_ebitda = net_debt_ebitda.where(net_debt_ebitda >= 0, other=np.nan).clip(upper=20.0)
         part1 = (np.minimum(net_debt_ebitda, 3.0)/3.0)*60.0
         part2 = (np.maximum(net_debt_ebitda-3.0, 0.0)/5.0)*40.0
         raw_penalty = np.minimum(part1+part2, 100.0)
@@ -6913,43 +7714,42 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
 
         # Component 3: Total Debt / Total Capital (20%)
         debt_capital = metrics['Total Debt / Total Capital (%)']
-        debt_capital = debt_capital.fillna(50).clip(0, 100)
+        # Don't fill missing with 50%, just clip valid values
+        debt_capital = debt_capital.clip(0, 100)
         debt_cap_score = np.clip(100 - debt_capital, 0, 100)
 
         # Component 4: Total Debt / EBITDA (10%)
         debt_ebitda = metrics['Total Debt / EBITDA (x)']
-        debt_ebitda = debt_ebitda.where(debt_ebitda >= 0, other=20.0).fillna(20.0).clip(upper=20.0)
+        # Keep only valid positive values, let negatives and missing be NaN
+        debt_ebitda = debt_ebitda.where(debt_ebitda >= 0, other=np.nan).clip(upper=20.0)
         part1_td = (np.minimum(debt_ebitda, 3.0)/3.0)*60.0
         part2_td = (np.maximum(debt_ebitda-3.0, 0.0)/5.0)*40.0
         raw_penalty_td = np.minimum(part1_td+part2_td, 100.0)
         debt_ebitda_score = np.clip(100.0 - raw_penalty_td, 0.0, 100.0)
 
-        # Option A weights: ND/EBITDA 40%, Coverage 30%, Debt/Cap 20%, TD/EBITDA 10%
-        # Row-wise normalization to handle missing components
-        comps = np.array([
+        # Leverage Score with renormalization using unified function
+        leverage_components = np.column_stack([
             net_debt_score,
             interest_coverage_score,
             debt_cap_score,
-            debt_ebitda_score,
-        ], dtype=float).T  # Transpose to get rows for each issuer
+            debt_ebitda_score
+        ])
 
-        w = np.array([0.40, 0.30, 0.20, 0.10], dtype=float)
+        leverage_weights = np.array([0.40, 0.30, 0.20, 0.10])
 
-        # Calculate effective weights per row (zero out NaN components)
-        mask = np.isnan(comps)
-        w_eff = np.where(mask, 0.0, w)
-        denom = w_eff.sum(axis=1)
+        leverage_score, leverage_completeness, leverage_components_used = \
+            _calculate_factor_score_with_renormalization(
+                leverage_components,
+                leverage_weights,
+                min_components=2,  # Require at least 2 of 4 components
+                factor_name="Leverage"
+            )
 
-        # Weighted sum with normalization
-        leverage_scores = np.where(
-            denom > 0,
-            np.nansum(comps * w, axis=1) / denom,
-            np.nan
-        )
+        scores['leverage_score'] = leverage_score
+        scores['leverage_data_completeness'] = leverage_completeness
+        scores['leverage_components_used'] = leverage_components_used
 
-        scores['leverage_score'] = pd.Series(leverage_scores, index=df.index)
-
-        # Profitability ([V2.2] Annual-only)
+        # Profitability ([V2.2] Annual-only) with renormalization
         roe = _pct_to_100(metrics['Return on Equity'])
         ebitda_margin = _pct_to_100(metrics['EBITDA Margin'])
         roa = _pct_to_100(metrics['Return on Assets'])
@@ -6960,19 +7760,57 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         roa_score = np.clip(roa * 5, 0, 100)
         ebit_score = np.clip(ebit_margin * 2, 0, 100)
 
-        scores['profitability_score'] = (roe_score * 0.3 + margin_score * 0.3 +
-                                         roa_score * 0.2 + ebit_score * 0.2)
+        profitability_components = np.column_stack([
+            roe_score,
+            margin_score,
+            roa_score,
+            ebit_score
+        ])
 
-        # Liquidity ([V2.2] Annual-only)
-        current_ratio = metrics['Current Ratio (x)'].clip(lower=0)
-        quick_ratio = metrics['Quick Ratio (x)'].clip(lower=0)
+        profitability_weights = np.array([0.30, 0.30, 0.20, 0.20])
+
+        profitability_score, profitability_completeness, profitability_components_used = \
+            _calculate_factor_score_with_renormalization(
+                profitability_components,
+                profitability_weights,
+                min_components=2,  # Require at least 2 of 4 components
+                factor_name="Profitability"
+            )
+
+        scores['profitability_score'] = profitability_score
+        scores['profitability_data_completeness'] = profitability_completeness
+        scores['profitability_components_used'] = profitability_components_used
+
+        # Liquidity ([V2.2] Annual-only) with renormalization
+        # Don't clip NaN to 0 - preserve NaN for missing data
+        current_ratio = metrics['Current Ratio (x)']
+        current_ratio = current_ratio.where(current_ratio >= 0, other=np.nan)
+        quick_ratio = metrics['Quick Ratio (x)']
+        quick_ratio = quick_ratio.where(quick_ratio >= 0, other=np.nan)
 
         current_score = np.clip((current_ratio/3.0)*100.0, 0, 100)
         quick_score = np.clip((quick_ratio/2.0)*100.0, 0, 100)
 
-        scores['liquidity_score'] = current_score * 0.6 + quick_score * 0.4
+        liquidity_components = np.column_stack([
+            current_score,
+            quick_score
+        ])
 
-        # Growth ([V2.2] Annual-only)
+        liquidity_weights = np.array([0.60, 0.40])
+
+        liquidity_score, liquidity_completeness, liquidity_components_used = \
+            _calculate_factor_score_with_renormalization(
+                liquidity_components,
+                liquidity_weights,
+                min_components=1,  # Require at least 1 of 2 components
+                factor_name="Liquidity"
+            )
+
+        scores['liquidity_score'] = liquidity_score
+        scores['liquidity_data_completeness'] = liquidity_completeness
+        scores['liquidity_components_used'] = liquidity_components_used
+
+        # Growth ([V2.2] Annual-only) with renormalization
         rev_growth_1y = _pct_to_100(metrics['Total Revenues, 1 Year Growth'])
         rev_cagr_3y = _pct_to_100(metrics['Total Revenues, 3 Yr. CAGR'])
         ebitda_cagr_3y = _pct_to_100(metrics['EBITDA, 3 Years CAGR'])
@@ -6981,24 +7819,54 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         rev_3y_score = np.clip((rev_cagr_3y + 10) * 2, 0, 100)
         ebitda_3y_score = np.clip((ebitda_cagr_3y + 10) * 2, 0, 100)
 
-        scores['growth_score'] = rev_3y_score * 0.4 + rev_1y_score * 0.3 + ebitda_3y_score * 0.3
+        growth_components = np.column_stack([
+            rev_3y_score,
+            rev_1y_score,
+            ebitda_3y_score
+        ])
 
-        # Cash Flow ([v3 - DataFrame-level with alias-aware batch extraction] Annual-only)
-        # Compute 4 equal-weighted components: OCF/Revenue, OCF/Debt, UFCF margin, LFCF margin
-        # Each clipped globally then min-max scaled to 0-100; average available components
+        growth_weights = np.array([0.40, 0.30, 0.30])
+
+        growth_score, growth_completeness, growth_components_used = \
+            _calculate_factor_score_with_renormalization(
+                growth_components,
+                growth_weights,
+                min_components=2,  # Require at least 2 of 3 components
+                factor_name="Growth"
+            )
+
+        scores['growth_score'] = growth_score
+        scores['growth_data_completeness'] = growth_completeness
+        scores['growth_components_used'] = growth_components_used
+
+        # Cash Flow ([v3] Annual-only) - enhance with data quality tracking
         _cf_comp = _cash_flow_component_scores(df, data_period_setting, has_period_alignment, ref_date_for_extraction)
         _cf_cols = [c for c in ["OCF_to_Revenue_Score", "OCF_to_Debt_Score",
                                  "UFCF_margin_Score", "LFCF_margin_Score"] if c in _cf_comp.columns]
 
+        # Filter to only columns that have at least some valid data
+        _cf_cols = [c for c in _cf_cols if _cf_comp[c].notna().sum() > 0]
+
         if _cf_cols:
-            # Suppress RuntimeWarning for companies with no cash flow data
+            cf_array = _cf_comp[_cf_cols].to_numpy(dtype=float)
+
+            # Count available components per issuer
+            cf_components_available = (~np.isnan(cf_array)).sum(axis=1)
+
+            # Calculate mean only if minimum threshold met
+            min_cf_components = 2  # Require at least 2 of 4 components
+
             with np.errstate(invalid='ignore'):
-                scores['cash_flow_score'] = pd.Series(
-                    np.nanmean(_cf_comp[_cf_cols].to_numpy(dtype=float), axis=1),
-                    index=df.index
-                )
+                cf_scores = np.nanmean(cf_array, axis=1)
+                cf_scores = np.where(cf_components_available >= min_cf_components, cf_scores, np.nan)
+
+            scores['cash_flow_score'] = pd.Series(cf_scores, index=df.index)
+            scores['cash_flow_data_completeness'] = pd.Series(cf_components_available / len(_cf_cols), index=df.index)
+            scores['cash_flow_components_used'] = pd.Series(cf_components_available, index=df.index, dtype=int)
         else:
             scores['cash_flow_score'] = pd.Series(np.nan, index=df.index)
+            scores['cash_flow_data_completeness'] = pd.Series(0.0, index=df.index)
+            scores['cash_flow_components_used'] = pd.Series(0, index=df.index, dtype=int)
 
         return scores
 
@@ -7054,7 +7922,7 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
                 use_dynamic=True
             )
 
-            if calibrated_weights is not None and calibrated_weights != SECTOR_WEIGHTS:
+            if calibrated_weights is not None:
                 _log_timing("04a_Calibrated_Weights_Complete")
                 print(f"[CALIBRATION] Calculated calibrated weights for rating band {cal_rating_band}")
                 # Store in session state for UI display
@@ -7072,20 +7940,9 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
 
     qs = quality_scores.copy()
 
-    # Fill missing values with classification/global medians
-    if has_classification and 'Rubrics Custom Classification' in df.columns:
-        classification_meds = qs.join(df['Rubrics Custom Classification']).groupby('Rubrics Custom Classification').transform('median')
-        qs = qs.fillna(classification_meds)
-    qs = qs.fillna(qs.median(numeric_only=True))
-
-    # Final fallback to defaults
-    default_scores = {
-        'credit_score': 50.0, 'leverage_score': 50.0, 'profitability_score': 50.0,
-        'liquidity_score': 50.0, 'growth_score': 50.0, 'cash_flow_score': 50.0
-    }
-    for col, default_val in default_scores.items():
-        if col in qs.columns:
-            qs[col] = qs[col].fillna(default_val)
+    # Don't fill missing factor scores with arbitrary defaults
+    # Keep them as NaN - composite calculation will handle via renormalization
+    # (No median filling, no default filling - let missing data stay missing)
 
     # [V2.2] Calculate composite score - use classification weights only if available
     # OPTIMIZED: Vectorized calculation instead of iterrows()
@@ -7114,15 +7971,51 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         weight_label = "Universal (Calibrated)" if calibrated_weights is not None else "Universal"
         weight_used_list = [weight_label] * len(df)
     
-    # Vectorized composite score calculation: sum(score * weight) for each factor
-    composite_score = (
-        qs['credit_score'] * weight_matrix['credit_score'] +
-        qs['leverage_score'] * weight_matrix['leverage_score'] +
-        qs['profitability_score'] * weight_matrix['profitability_score'] +
-        qs['liquidity_score'] * weight_matrix['liquidity_score'] +
-        qs['growth_score'] * weight_matrix['growth_score'] +
-        qs['cash_flow_score'] * weight_matrix['cash_flow_score']
-    )
+    # Calculate composite with renormalization for missing factors
+    # This ensures we only weight factors that have valid scores
+
+    # Get factor score columns
+    factor_cols = ['credit_score', 'leverage_score', 'profitability_score',
+                   'liquidity_score', 'growth_score', 'cash_flow_score']
+
+    # For each issuer, calculate composite with renormalization
+    composite_scores_list = []
+    composite_completeness_list = []
+
+    for idx in qs.index:
+        factor_values = qs.loc[idx, factor_cols].values
+
+        # Get weights for this issuer (from classification or default)
+        if has_classification and use_sector_adjusted:
+            classification = df.loc[idx, 'Rubrics Custom Classification']
+            factor_weights_dict = get_classification_weights(classification, True, calibrated_weights=calibrated_weights)
+            factor_weights = np.array([factor_weights_dict[col] for col in factor_cols])
+        else:
+            # Default weights from weight_matrix
+            factor_weights = np.array([weight_matrix.loc[idx, col] for col in factor_cols])
+
+        # Identify available factors
+        available_mask = ~np.isnan(factor_values)
+        n_available = available_mask.sum()
+
+        if n_available >= 4:  # Require at least 4 of 6 factors
+            # Renormalize weights
+            effective_weights = factor_weights * available_mask
+            effective_weights = effective_weights / effective_weights.sum()
+
+            # Calculate composite
+            composite = np.nansum(factor_values * effective_weights)
+            completeness = n_available / 6
+        else:
+            composite = np.nan
+            completeness = n_available / 6
+
+        composite_scores_list.append(composite)
+        composite_completeness_list.append(completeness)
+
+    # Create composite score series
+    composite_score = pd.Series(composite_scores_list, index=qs.index)
+    qs['composite_data_completeness'] = composite_completeness_list
     _log_timing("05_Composite_Score_Complete")
 
     # ========================================================================
@@ -7149,6 +8042,27 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
 
     # Add Cash_Flow_Score (matches verification pattern)
     results_dict['Cash_Flow_Score'] = quality_scores['cash_flow_score']
+
+    # Add data quality indicators for each factor
+    results_dict['Leverage_Data_Completeness'] = quality_scores.get('leverage_data_completeness', 1.0)
+    results_dict['Leverage_Components_Used'] = quality_scores.get('leverage_components_used', 4)
+
+    results_dict['Profitability_Data_Completeness'] = quality_scores.get('profitability_data_completeness', 1.0)
+    results_dict['Profitability_Components_Used'] = quality_scores.get('profitability_components_used', 4)
+
+    results_dict['Liquidity_Data_Completeness'] = quality_scores.get('liquidity_data_completeness', 1.0)
+    results_dict['Liquidity_Components_Used'] = quality_scores.get('liquidity_components_used', 2)
+
+    results_dict['Growth_Data_Completeness'] = quality_scores.get('growth_data_completeness', 1.0)
+    results_dict['Growth_Components_Used'] = quality_scores.get('growth_components_used', 3)
+
+    results_dict['Cash_Flow_Data_Completeness'] = quality_scores.get('cash_flow_data_completeness', 1.0)
+    results_dict['Cash_Flow_Components_Used'] = quality_scores.get('cash_flow_components_used', 4)
+
+    results_dict['Credit_Data_Completeness'] = 1.0  # Credit is always single component
+
+    # Add overall composite data completeness
+    results_dict['Composite_Data_Completeness'] = quality_scores.get('composite_data_completeness', 1.0)
 
     # [V2.2] Add optional columns if available
     if 'Ticker' in df.columns:
@@ -8466,19 +9380,19 @@ Create a COMPLETE, professional credit report with ALL sections below.
 
 ### Specialist Agent Analyses
 
-#### ⭐ Profitability Analysis (Score: {f_scores.get('profitability_score', 50):.1f}/100)
+#### Profitability Analysis (Score: {f_scores.get('profitability_score', 50):.1f}/100)
 {prof_analysis}
 
-#### 📊 Leverage Analysis (Score: {f_scores.get('leverage_score', 50):.1f}/100)
+#### Leverage Analysis (Score: {f_scores.get('leverage_score', 50):.1f}/100)
 {lev_analysis}
 
-#### 💧 Liquidity Analysis (Score: {f_scores.get('liquidity_score', 50):.1f}/100)
+#### Liquidity Analysis (Score: {f_scores.get('liquidity_score', 50):.1f}/100)
 {liq_analysis}
 
-#### 💰 Cash Flow Analysis (Score: {f_scores.get('cash_flow_score', 50):.1f}/100)
+#### Cash Flow Analysis (Score: {f_scores.get('cash_flow_score', 50):.1f}/100)
 {cf_analysis}
 
-#### 📈 Growth Analysis (Score: {f_scores.get('growth_score', 50):.1f}/100)
+#### Growth Analysis (Score: {f_scores.get('growth_score', 50):.1f}/100)
 {gr_analysis}
 
 ---
@@ -8492,7 +9406,7 @@ Synthesize the specialist findings:
 - **Cash Flow** ({f_scores.get('cash_flow_score', 50):.1f}/100): Key themes from analysis above
 - **Growth** ({f_scores.get('growth_score', 50):.1f}/100): Key themes from analysis above
 
-Use emojis (⭐ strengths 70+, ⚠️ moderate 50-69, 🚨 weaknesses <50).
+Indicate strengths (70+), moderate performance (50-69), and weaknesses (<50) in your analysis.
 
 ### Credit Strengths
 Extract 3-4 key positives from specialist analyses:
@@ -8873,6 +9787,15 @@ if os.environ.get("RG_TESTS") != "1":
         # LOAD DATA
         # ========================================================================
 
+        # Clear cached calibrated weights from session state when calibration is off
+        if not use_dynamic_calibration:
+            if '_calibrated_weights' in st.session_state:
+                del st.session_state['_calibrated_weights']
+            if 'last_calibration_state' in st.session_state:
+                del st.session_state['last_calibration_state']
+            # Force Streamlit to clear the cache when calibration toggle changes
+            st.cache_data.clear()
+
         with st.spinner("Loading and processing data..."):
             # [V2.3] Create cache buster from unified period selection parameters
             reference_date_str = str(reference_date_override) if reference_date_override else 'none'
@@ -9175,7 +10098,7 @@ if os.environ.get("RG_TESTS") != "1":
                     title=f'Credit Quality vs. Trend Momentum{filter_label}',
                     labels={
                         x_col: x_axis_label,
-                        "Cycle_Position_Score": "Improving ← Trend → Deteriorating"
+                        "Cycle_Position_Score": "Deteriorating ← Trend → Improving"
                     }
                 )
 
@@ -9349,9 +10272,9 @@ if os.environ.get("RG_TESTS") != "1":
                         else:
                             return "Credit Dimension"
 
-                    # Generate interpretive names for each PC
+                    # Use simple PC labels
                     n_components_to_show = min(3, loadings.shape[0])
-                    pc_names = [interpret_pc_name(loadings[i], feature_names) for i in range(n_components_to_show)]
+                    pc_names = [f"PC{i+1}" for i in range(n_components_to_show)]
 
                     # ========================================================================
                     # SECTION 1: RADAR CHARTS (LEFT) + 3D PLOT (RIGHT)
@@ -10044,11 +10967,12 @@ if os.environ.get("RG_TESTS") != "1":
                                 key="calibration_sector_compare"
                             )
 
-                            if comparison_sector in calibrated_wts and comparison_sector in SECTOR_WEIGHTS:
+                            if comparison_sector in calibrated_wts:
                                 compare_data = []
                                 for factor in ['credit_score', 'leverage_score', 'profitability_score',
                                               'liquidity_score', 'growth_score', 'cash_flow_score']:
-                                    original = SECTOR_WEIGHTS[comparison_sector][factor]
+                                    # V3.0: Compare against universal base weights
+                                    original = UNIVERSAL_WEIGHTS[factor]
                                     calibrated = calibrated_wts[comparison_sector][factor]
                                     change = calibrated - original
                                     pct_change = (change / original * 100) if original != 0 else 0
@@ -10733,30 +11657,41 @@ if os.environ.get("RG_TESTS") != "1":
                 render_methodology_tab(df_original, results_final)
         
             # ============================================================================
-            # TAB 7: GENAI CREDIT REPORT
+            # TAB 7: GENAI CREDIT REPORT (V3.0 - REDESIGNED DUAL-PIPELINE)
             # ============================================================================
 
             with tab7:
                 st.header("AI Credit Report")
 
-                st.markdown("""
-                **Comprehensive Credit Analysis** using Claude Sonnet 4 or GPT-4o.
-
-                - **Single LLM Call:** Fast generation (10-30 seconds) with complete analysis
-                - **Raw Financial Data:** Analyzes actual metrics from spreadsheet (EBITDA margin, ROA, leverage ratios, cash flow metrics, etc.)
-                - **Sector-Aware:** Respects sector-adjusted weights and dynamic calibration settings
-                - **Structured Output:** Executive Summary, Factor Analyses, Credit Strengths/Risks, Rating Outlook
+                st.info("""
+                **New in V3.0:** Reports now analyze actual financial metrics from the input spreadsheet,
+                compare to sector and rating peers, and provide proper context for model scores.
                 """)
 
-                if results_final is not None and len(results_final) > 0:
-                    company_options = results_final['Company_Name'].dropna().unique().tolist()
-                    selected_company = st.selectbox(
-                        "Select Issuer",
-                        options=company_options,
-                        key="multiagent_company"
-                    )
+                if results_final is not None and len(results_final) > 0 and df_original is not None:
+
+                    # Company selection
+                    company_options = sorted(results_final['Company_Name'].dropna().unique().tolist())
+
+                    col1, col2 = st.columns([3, 1])
+
+                    with col1:
+                        selected_company = st.selectbox(
+                            "Select Issuer for Credit Analysis",
+                            options=company_options,
+                            key="genai_company_select"
+                        )
+
+                    with col2:
+                        generate_button = st.button(
+                            "Generate Report",
+                            type="primary",
+                            use_container_width=True,
+                            key="genai_generate"
+                        )
 
                     if selected_company:
+                        # Display quick metrics
                         selected_row = results_final[results_final['Company_Name'] == selected_company].iloc[0]
 
                         col1, col2, col3, col4 = st.columns(4)
@@ -10770,83 +11705,127 @@ if os.environ.get("RG_TESTS") != "1":
                             classification = selected_row.get('Rubrics_Custom_Classification', 'N/A')
                             st.metric("Classification", classification[:20] + "..." if len(classification) > 20 else classification)
 
-                        st.subheader("Factor Scores")
-                        factor_cols = st.columns(6)
-                        factor_data = [
-                            ('Credit', 'Credit_Score'),
-                            ('Leverage', 'Leverage_Score'),
-                            ('Profitability', 'Profitability_Score'),
-                            ('Liquidity', 'Liquidity_Score'),
-                            ('Growth', 'Growth_Score'),
-                            ('Cash Flow', 'Cash_Flow_Score')
-                        ]
+                    if generate_button and selected_company:
+                        with st.spinner(f"Generating comprehensive credit report for {selected_company}..."):
+                            try:
+                                # Get calibration state from session
+                                use_sector_adjusted = st.session_state.get('scoring_method') == 'Classification-Adjusted Scoring'
+                                calibrated_weights = st.session_state.get('_calibrated_weights')
 
-                        for col, (name, key) in zip(factor_cols, factor_data):
-                            score = selected_row.get(key, 0)
-                            col.metric(name, f"{score:.1f}")
+                                # STEP 1: Gather complete data from both sources
+                                st.write("Extracting financial data from input spreadsheet...")
+                                complete_data = prepare_genai_credit_report_data(
+                                    df_original=df_original,  # Raw input spreadsheet
+                                    results_df=results_final,  # Model outputs
+                                    company_name=selected_company,
+                                    use_sector_adjusted=use_sector_adjusted,
+                                    calibrated_weights=calibrated_weights
+                                )
 
-                        st.markdown("---")
+                                if "error" in complete_data:
+                                    st.error(f"Error: {complete_data['error']}")
+                                else:
+                                    # STEP 2: Build comprehensive prompt
+                                    st.write("Building analysis prompt...")
+                                    prompt = build_comprehensive_credit_prompt(complete_data)
 
-                        if st.button("Generate AI Credit Report", type="primary"):
-                            claude_key = st.secrets.get("CLAUDE_API_KEY") or st.secrets.get("claude_key")
-                            openai_key = st.secrets.get("OPENAI_API_KEY") or st.secrets.get("api_key")
+                                    # STEP 3: Generate report using OpenAI
+                                    st.write("Generating analysis with AI...")
 
-                            if not claude_key and not openai_key:
-                                st.error("⚠️ No API keys found. Add CLAUDE_API_KEY or OPENAI_API_KEY to .streamlit/secrets.toml")
-                            else:
-                                with st.spinner("Generating AI credit report..."):
-                                    try:
-                                        factor_scores = {
-                                            'credit_score': selected_row.get('Credit_Score', 50),
-                                            'leverage_score': selected_row.get('Leverage_Score', 50),
-                                            'profitability_score': selected_row.get('Profitability_Score', 50),
-                                            'liquidity_score': selected_row.get('Liquidity_Score', 50),
-                                            'growth_score': selected_row.get('Growth_Score', 50),
-                                            'cash_flow_score': selected_row.get('Cash_Flow_Score', 50)
-                                        }
+                                    import openai
 
-                                        # Get current settings
-                                        use_sector = st.session_state.get('scoring_method') == 'Classification-Adjusted Scoring'
-                                        calibrated = st.session_state.get('_calibrated_weights')
+                                    client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-                                        # Use streamlined single-LLM approach (faster)
-                                        report_markdown = generate_streamlined_credit_report(
-                                            row=selected_row,
-                                            df=results_final,
-                                            composite_score=selected_row.get('Composite_Score', 50),
-                                            factor_scores=factor_scores,
-                                            rating_band=selected_row.get('Rating_Band', 'BBB'),
-                                            company_name=selected_company,
-                                            rating=selected_row.get('Credit_Rating_Clean', 'NR'),
-                                            classification=selected_row.get('Rubrics_Custom_Classification', 'Unknown'),
-                                            use_sector_adjusted=use_sector,
-                                            calibrated_weights=calibrated,
-                                            api_key=openai_key,
-                                            claude_key=claude_key
-                                        )
+                                    response = client.chat.completions.create(
+                                        model="gpt-4-turbo-preview",
+                                        messages=[
+                                            {"role": "system", "content": "You are a professional credit analyst generating comprehensive credit reports."},
+                                            {"role": "user", "content": prompt}
+                                        ],
+                                        max_tokens=4000,
+                                        temperature=0.3
+                                    )
 
-                                        st.markdown("---")
+                                    report = response.choices[0].message.content
 
-                                        # Display comprehensive report (includes specialist analyses as sections)
-                                        st.markdown(report_markdown)
+                                    st.markdown("---")
 
-                                        st.download_button(
-                                            label="Download Credit Report (Markdown)",
-                                            data=report_markdown,
-                                            file_name=f"{selected_company.replace(' ', '_')}_Credit_Report.md",
-                                            mime="text/markdown"
-                                        )
+                                    # STEP 4: Display report
+                                    st.markdown(report)
 
-                                    except Exception as e:
-                                        st.error(f"❌ Error: {str(e)}")
-                                        st.exception(e)
+                                    # Download button
+                                    st.download_button(
+                                        label="📥 Download Report",
+                                        data=report,
+                                        file_name=f"{selected_company.replace(' ', '_')}_Credit_Report_{pd.Timestamp.now().strftime('%Y%m%d')}.md",
+                                        mime="text/markdown"
+                                    )
+
+                                    # STEP 5: Provide data transparency
+                                    with st.expander("View Source Data Used in Analysis"):
+
+                                        st.subheader("1. Raw Financial Metrics (from Input Spreadsheet)")
+                                        st.caption("This is the source of truth for actual company fundamentals")
+
+                                        # Display in organized tabs
+                                        data_tab1, data_tab2, data_tab3, data_tab4 = st.tabs([
+                                            "Company Info",
+                                            "Profitability & Leverage",
+                                            "Liquidity & Coverage",
+                                            "Growth & Cash Flow"
+                                        ])
+
+                                        with data_tab1:
+                                            st.json(complete_data['raw_financials']['company_info'])
+
+                                        with data_tab2:
+                                            col1, col2 = st.columns(2)
+                                            with col1:
+                                                st.write("**Profitability:**")
+                                                st.json(complete_data['raw_financials']['profitability'])
+                                            with col2:
+                                                st.write("**Leverage:**")
+                                                st.json(complete_data['raw_financials']['leverage'])
+
+                                        with data_tab3:
+                                            col1, col2 = st.columns(2)
+                                            with col1:
+                                                st.write("**Liquidity:**")
+                                                st.json(complete_data['raw_financials']['liquidity'])
+                                            with col2:
+                                                st.write("**Coverage:**")
+                                                st.json(complete_data['raw_financials']['coverage'])
+
+                                        with data_tab4:
+                                            col1, col2 = st.columns(2)
+                                            with col1:
+                                                st.write("**Growth:**")
+                                                st.json(complete_data['raw_financials']['growth'])
+                                            with col2:
+                                                st.write("**Cash Flow:**")
+                                                st.json(complete_data['raw_financials']['cash_flow'])
+
+                                        st.subheader("2. Peer Comparisons")
+                                        st.caption("Context for understanding relative credit strength")
+                                        st.json(complete_data['peer_context'])
+
+                                        st.subheader("3. Model Scores (Contextual)")
+                                        st.caption("Relative positioning scores - use with caution")
+                                        st.json(complete_data['model_outputs'])
+
+                            except Exception as e:
+                                st.error(f"Error generating report: {str(e)}")
+                                with st.expander("View Error Details"):
+                                    import traceback
+                                    st.code(traceback.format_exc())
+
                 else:
-                    st.info("📊 Upload data and run analysis first.")
+                    st.warning("Please load data and run the scoring model first (see Data Upload & Scoring tabs)")
 
             st.markdown("---")
             st.markdown("""
         <div style='text-align: center; color: #4c566a; padding: 20px;'>
-            <p><strong>Issuer Credit Screening Model V2.2</strong></p>
+            <p><strong>Issuer Credit Screening Model V3.0</strong></p>
             <p>© 2025 Rubrics Asset Management | Annual-Only Default + Minimal Identifiers</p>
         </div>
         """, unsafe_allow_html=True)
@@ -10858,7 +11837,7 @@ if os.environ.get("RG_TESTS") != "1":
 if False and os.environ.get("RG_TESTS") == "1":  # Tests temporarily disabled - contains outdated function calls
     import sys
     print("\n" + "="*60)
-    print("Running RG_TESTS for V2.2...")
+    print("Running RG_TESTS for V3.0...")
     print("="*60 + "\n")
     import sys
 
@@ -11215,7 +12194,7 @@ if False and os.environ.get("RG_TESTS") == "1":  # Tests temporarily disabled - 
     print("  OK non-December FY recognized as FY in LLM extractor")
 
     print("\n" + "="*60)
-    print("SUCCESS: ALL RG_TESTS PASSED for V2.2 (12 tests)")
+    print("SUCCESS: ALL RG_TESTS PASSED for V3.0 (12 tests)")
     print("="*60 + "\n")
 
     # Exit successfully after tests
