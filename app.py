@@ -1323,13 +1323,14 @@ def format_diagnostic_report_text(report: IssuerDiagnosticReport) -> str:
     lines.append("SECTION 4: RAW INPUT DATA (from Excel)")
     lines.append("=" * 80)
     lines.append("# These are the SOURCE values - exactly as they appear in the input file")
+    lines.append("# NOTE: All monetary values are in THOUSANDS (e.g., 1000000 = $1 billion)")
     lines.append("")
     
     for category, values in report.raw_inputs.items():
         lines.append(f"{category}:")
         for field, value in values.items():
             if pd.notna(value):
-                lines.append(f"  {field}: {value:,.0f}")
+                lines.append(f"  {field}: {value:,.0f} (thousands)")
             else:
                 lines.append(f"  {field}: N/A")
         lines.append("")
@@ -2799,17 +2800,17 @@ METRIC_REGISTRY = {
     'levered_fcf': {
         'canonical': 'Levered Free Cash Flow',
         'aliases': ['Levered Free Cash Flow', 'Free Cash Flow'],
-        'type': 'calc', 'unit': 'M', 'higher_is_better': True,
+        'type': 'calc', 'unit': 'K', 'higher_is_better': True,
     },
     'free_cash_flow': {
         'canonical': 'Levered Free Cash Flow',
         'aliases': ['Levered Free Cash Flow'],
-        'type': 'calc', 'unit': 'M', 'higher_is_better': True,
+        'type': 'calc', 'unit': 'K', 'higher_is_better': True,
     },
     'unlevered_fcf': {
         'canonical': 'Unlevered Free Cash Flow',
         'aliases': ['Unlevered Free Cash Flow'],
-        'type': 'calc', 'unit': 'M', 'higher_is_better': True,
+        'type': 'calc', 'unit': 'K', 'higher_is_better': True,
     },
     'levered_fcf_margin': {
         'canonical': 'Levered Free Cash Flow Margin',
@@ -2824,7 +2825,7 @@ METRIC_REGISTRY = {
     'operating_cash_flow': {
         'canonical': 'Cash from Ops.',
         'aliases': ['Cash from Ops.', 'Cash from Operations', 'Operating Cash Flow', 'Cash from Ops', 'Net Cash Provided by Operating Activities'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
 
     # GROWTH
@@ -2868,129 +2869,129 @@ METRIC_REGISTRY = {
     'total_debt': {
         'canonical': 'Total Debt',
         'aliases': ['Total Debt'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
     'net_debt': {
         'canonical': 'Net Debt',
         'aliases': ['Net Debt'],
-        'type': 'calc', 'unit': 'M', 'higher_is_better': False,
+        'type': 'calc', 'unit': 'K', 'higher_is_better': False,
     },
     'ebitda': {
         'canonical': 'EBITDA',
         'aliases': ['EBITDA'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'ebit': {
         'canonical': 'EBIT',
         'aliases': ['EBIT', 'Operating Income'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'operating_income': {
         'canonical': 'EBIT',
         'aliases': ['EBIT'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'revenue': {
         'canonical': 'Total Revenues',
         'aliases': ['Total Revenues', 'Total Revenue', 'Revenue'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'total_revenues': {
         'canonical': 'Total Revenues',
         'aliases': ['Total Revenues'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'interest_expense': {
         'canonical': 'Interest Expense',
         'aliases': ['Interest Expense', 'Interest Expense, net', 'Net Interest Expense'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': False,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': False,
     },
     'net_income': {
         'canonical': 'Net Income',
         'aliases': ['Net Income'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'cash': {
         'canonical': 'Cash & Short-term Investments',
         'aliases': ['Cash & Short-term Investments', 'Cash and Short-Term Investments', 'Cash & ST Investments', 'Cash and Equivalents'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'cash_equivalents': {
         'canonical': 'Cash & Short-term Investments',
         'aliases': ['Cash & Short-term Investments'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'total_assets': {
         'canonical': 'Total Assets',
         'aliases': ['Total Assets'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
     'equity': {
         'canonical': 'Total Common Equity',
         'aliases': ['Total Common Equity', 'Total Equity'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'total_equity': {
         'canonical': 'Total Common Equity',
         'aliases': ['Total Common Equity'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': True,
     },
     'capital_expenditure': {
         'canonical': 'Capital Expenditure',
         'aliases': ['Capital Expenditure', 'CapEx'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
     'capex': {
         'canonical': 'Capital Expenditure',
         'aliases': ['Capital Expenditure'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
     'market_cap': {
         'canonical': 'Market Capitalization',
         'aliases': ['Market Capitalization'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
 
     # BALANCE SHEET
     'current_assets': {
         'canonical': 'Current Assets',
         'aliases': ['Current Assets'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
     'current_liabilities': {
         'canonical': 'Current Liabilities',
         'aliases': ['Current Liabilities'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
     'total_liabilities': {
         'canonical': 'Total Liabilities',
         'aliases': ['Total Liabilities'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': False,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': False,
     },
     'long_term_debt': {
         'canonical': 'Long-Term Debt',
         'aliases': ['Long-Term Debt'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': False,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': False,
     },
     'short_term_debt': {
         'canonical': 'Short-Term Debt',
         'aliases': ['Short-Term Debt'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': False,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': False,
     },
     'accounts_receivable': {
         'canonical': 'Accounts Receivable',
         'aliases': ['Accounts Receivable'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
     'inventory': {
         'canonical': 'Inventory',
         'aliases': ['Inventory'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
     'accounts_payable': {
         'canonical': 'Accounts Payable',
         'aliases': ['Accounts Payable'],
-        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+        'type': 'raw', 'unit': 'K', 'higher_is_better': None,
     },
 
     # EFFICIENCY
@@ -3082,6 +3083,34 @@ def format_metric_value(value, metric_key):
     elif unit == 'x':
         return f"{value:.2f}x"
     return f"{value:,.2f}"
+
+def format_monetary_value_for_display(value: float, metric_name: str = "") -> str:
+    """
+    Format monetary values from thousands to human-readable format.
+    
+    Args:
+        value: Raw value in thousands (as stored in CIQ data)
+        metric_name: Optional metric name for context
+        
+    Returns:
+        Formatted string (e.g., "$32.2B", "$500.0M", "$1.5M")
+    """
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "N/A"
+    
+    # Convert from thousands to actual value
+    actual_value = value * 1000
+    
+    if abs(actual_value) >= 1e12:  # Trillions
+        return f"${actual_value/1e12:.1f}T"
+    elif abs(actual_value) >= 1e9:  # Billions
+        return f"${actual_value/1e9:.1f}B"
+    elif abs(actual_value) >= 1e6:  # Millions
+        return f"${actual_value/1e6:.1f}M"
+    elif abs(actual_value) >= 1e3:  # Thousands
+        return f"${actual_value/1e3:.1f}K"
+    else:
+        return f"${actual_value:,.0f}"
 
 def _resolve_company_name_col(df: pd.DataFrame) -> str | None:
     return resolve_column(df, ["Company_Name", "Company Name", "Name"])
@@ -4811,6 +4840,10 @@ Generate a comprehensive credit analysis report for the following corporate issu
 COMPANY OVERVIEW:
 {company_overview}
 
+IMPORTANT: All monetary values in this data are in THOUSANDS of the reported currency.
+For example: 32184000 = $32.184 billion, 500000 = $500 million.
+Convert to appropriate scale (millions/billions) when writing the report.
+
 CURRENT FINANCIAL POSITION (As of {last_period_date}):
 {current_metrics}
 
@@ -4874,6 +4907,10 @@ Generate a comprehensive credit analysis report for the following industry class
 
 CLASSIFICATION OVERVIEW:
 {classification_overview}
+
+IMPORTANT: All monetary values in this data are in THOUSANDS of the reported currency.
+For example: 32184000 = $32.184 billion, 500000 = $500 million.
+Convert to appropriate scale (millions/billions) when writing the report.
 
 RATING DISTRIBUTION:
 {rating_distribution}
@@ -9138,7 +9175,20 @@ def _build_trend_section_for_prompt(trend_details: dict, trend_score: float) -> 
             end = metric_data.get('end_value')
             
             if start is not None and end is not None:
-                section += f"- {metric_name}: {classification} ({start:.2f} -> {end:.2f}, {direction:+.1f}%/year)"
+                # SSOT: Use existing alias resolution, then look up metric info
+                canonical_name = resolve_column_name(metric_name)
+                metric_key = next((k for k, v in METRIC_REGISTRY.items() if v['canonical'] == canonical_name), None)
+                unit = METRIC_REGISTRY.get(metric_key, {}).get('unit') if metric_key else None
+                
+                # Format monetary values for human readability
+                if unit == 'K':
+                    start_disp = format_monetary_value_for_display(start, metric_name)
+                    end_disp = format_monetary_value_for_display(end, metric_name)
+                else:
+                    start_disp = f"{start:.2f}"
+                    end_disp = f"{end:.2f}"
+                
+                section += f"- {metric_name}: {classification} ({start_disp} -> {end_disp}, {direction:+.1f}%/year)"
                 if metric_data.get('fallback_bounded', False):
                     bounds = metric_data.get('bound_limits', {})
                     section += f" [BOUNDED: values capped to CIQ range {bounds.get('min', 0)}-{bounds.get('max', 'N/A')}]"
@@ -16800,7 +16850,20 @@ if HAS_DATA:
                             c1, c2 = st.columns([1, 2])
                             
                             with c1:
-                                st.markdown(f"**{start_val:.2f}** ({start_year}) -> **{end_val:.2f}** ({end_year})")
+                                # Format values based on unit
+                                # SSOT: Use existing alias resolution, then look up metric info
+                                canonical_name = resolve_column_name(metric_name)
+                                metric_key = next((k for k, v in METRIC_REGISTRY.items() if v['canonical'] == canonical_name), None)
+                                unit = METRIC_REGISTRY.get(metric_key, {}).get('unit') if metric_key else None
+                                
+                                if unit == 'K':
+                                    start_disp = format_monetary_value_for_display(start_val, metric_name)
+                                    end_disp = format_monetary_value_for_display(end_val, metric_name)
+                                else:
+                                    start_disp = f"{start_val:.2f}"
+                                    end_disp = f"{end_val:.2f}"
+                                    
+                                st.markdown(f"{start_disp.strip()} ({start_year}) → {end_disp.strip()} ({end_year})")
                                 st.caption(f"Annual Change: {trend_direction:+.1f}% per year")
                                 st.markdown(explanation)
                                 

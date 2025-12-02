@@ -3,10 +3,20 @@ streamlit>=1.28.0
 pandas>=2.0.0
 numpy>=1.24.0
 openpyxl>=3.1.0  # For Excel file reading
+xlsxwriter>=3.1.0  # For Excel file writing (diagnostics export)
+
+# Date parsing
+python-dateutil>=2.8.0
+
+# Optimization
+scipy>=1.11.0  # For dynamic weight calibration
 
 # Visualization
 plotly>=5.17.0
-scikit-learn>=1.3.0  # For PCA
+matplotlib>=3.7.0
+
+# Machine Learning
+scikit-learn>=1.3.0  # For PCA and RobustScaler
 
 # AI/LLM dependencies (optional - for GenAI Credit Reports)
 openai>=1.0.0
