@@ -94,6 +94,9 @@ MODEL_THRESHOLDS = {
     'stale_data_days': 180,        # Days before data considered stale
     'min_coverage_pct': 70,        # Minimum data coverage percentage
     
+    # Leverage Guardrail
+    'leverage_score_avoid': 35,    # Leverage_Score < 35 → force Avoid (extreme leverage)
+    
     # Display Classification Thresholds (for UI visualization only)
     'display_cycle_favorable': 70,     # Cycle score >= 70 = Favorable position
     'display_cycle_neutral': 40,       # Cycle score >= 40 = Neutral/Stable
@@ -12596,6 +12599,34 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         # Investment Grade (AAA-BBB) and BB: No caps
         return base_rec
 
+    def _apply_leverage_guardrail(base_rec, leverage_score):
+        """
+        Apply leverage-based cap to prevent positive recommendations for highly levered issuers.
+        
+        Rationale: Extreme leverage (Debt/EBITDA > 10x) indicates structural credit risk
+        that should not be masked by an improving trend. Even if trends are positive,
+        the balance sheet risk is too high for Hold or Buy.
+        
+        Args:
+            base_rec: Base recommendation after classification and rating guardrails
+            leverage_score: Issuer's Leverage_Score (0-100 scale)
+        
+        Returns:
+            Final recommendation after applying leverage cap
+        """
+        # Handle missing leverage score
+        if pd.isna(leverage_score):
+            return base_rec
+        
+        # Extreme leverage (score < 35 ≈ Debt/EBITDA > 10x): Force Avoid
+        LEVERAGE_AVOID_THRESHOLD = MODEL_THRESHOLDS.get('leverage_score_avoid', 35)
+        
+        if leverage_score < LEVERAGE_AVOID_THRESHOLD:
+            if base_rec in ['Strong Buy', 'Buy', 'Hold']:
+                return 'Avoid'
+        
+        return base_rec
+
     def _assign_recommendation_by_classification(classification, percentile_in_band):
         """
         Map classification + percentile to base recommendation (before rating guardrails).
@@ -12680,9 +12711,13 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         )
 
         # Step 2: Apply rating guardrails
-        final = _apply_rating_guardrails(base, row['Rating_Band'])
+        after_rating = _apply_rating_guardrails(base, row['Rating_Band'])
+        
+        # Step 3: Apply leverage guardrail
+        leverage_score = row.get('Leverage_Score', None)
+        final = _apply_leverage_guardrail(after_rating, leverage_score)
 
-        # Step 3: Generate reason for transparency
+        # Step 4: Generate reason for transparency
         classification = row['Signal'] if pd.notna(row['Signal']) else '—'
         pct = row['Composite_Percentile_in_Band']
         pct_str = f"{pct:.0f}%" if pd.notna(pct) else "N/A"
@@ -12691,7 +12726,13 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         reason = f"{classification} (Percentile: {pct_str})"
 
         if final != base:
-            reason += f" → Capped from {base} due to {rating} rating"
+            if final != after_rating:
+                # Leverage guardrail was applied
+                lev_str = f"{leverage_score:.1f}" if pd.notna(leverage_score) else "N/A"
+                reason += f" → Capped from {after_rating} to Avoid due to extreme leverage (score: {lev_str})"
+            else:
+                # Rating guardrail was applied
+                reason += f" → Capped from {base} due to {rating} rating"
 
         return final, reason
 
