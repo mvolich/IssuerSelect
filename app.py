@@ -12834,12 +12834,22 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
     )
     validation_results['single_b'] = single_b_violations.sum()
 
-    # Violation 4: Strong & Improving with Avoid
+    # Violation 4: Strong & Improving with Avoid (UNLESS due to leverage guardrail)
+    # Leverage guardrail legitimately caps to Avoid when Leverage_Score < 35
+    LEVERAGE_AVOID_THRESHOLD = MODEL_THRESHOLDS.get('leverage_score_avoid', 35)
+    
     strong_improving_avoid = (
         (results['Signal'] == 'Strong & Improving') &
-        (results['Recommendation'] == 'Avoid')
+        (results['Recommendation'] == 'Avoid') &
+        (results['Leverage_Score'] >= LEVERAGE_AVOID_THRESHOLD)  # Only flag if NOT due to leverage guardrail
     )
     validation_results['strong_improving_avoid'] = strong_improving_avoid.sum()
+    
+    # Count leverage guardrail applications (for info, not violations)
+    leverage_guardrail_applied = (
+        (results['Recommendation'] == 'Avoid') &
+        (results['Leverage_Score'] < LEVERAGE_AVOID_THRESHOLD)
+    )
 
     # Count successful guardrail applications (for info)
     weak_det_capped = (
@@ -12856,6 +12866,9 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         (results['Rating_Band'] == 'B') &
         (results['Composite_Percentile_in_Band'] >= 80)
     ).sum()
+
+    # Count leverage guardrail applications
+    leverage_capped = leverage_guardrail_applied.sum()
 
     # Display validation results
     total_violations = sum(validation_results.values())
@@ -12888,7 +12901,7 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
 
     else:
         # SUCCESS: All guardrails working
-        guardrails_applied = weak_det_capped + distressed_capped + single_b_capped
+        guardrails_applied = weak_det_capped + distressed_capped + single_b_capped + leverage_capped
 
         if guardrails_applied > 0 and not os.environ.get("RG_TESTS"):
             st.sidebar.success(
@@ -12896,8 +12909,9 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
                 f"Protected {guardrails_applied} issuers from inappropriate recommendations:\n"
                 f"- {weak_det_capped} Weak & Deteriorating (capped to Avoid)\n"
                 f"- {distressed_capped} Distressed CCC/CC/C (capped to Hold)\n"
-                f"- {single_b_capped} Single-B (capped to Buy)\n\n"
-                f"These had high percentiles but were downgraded due to quality/rating concerns."
+                f"- {single_b_capped} Single-B (capped to Buy)\n"
+                f"- {leverage_capped} Extreme Leverage (capped to Avoid)\n\n"
+                f"These had high percentiles but were downgraded due to quality/rating/leverage concerns."
             )
 
         # Log success for tests
