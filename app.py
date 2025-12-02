@@ -15330,11 +15330,11 @@ if HAS_DATA:
         
             # Results table
             display_cols = [
-                'Overall_Rank', 'Company_Name', 'Ticker', 'Credit_Rating_Clean', 'Rating_Band',
+                'Overall_Rank', 'Company_Name', 'Ticker', 'Credit_Rating_Clean', 'Rating_Band', 
                 'Rubrics_Custom_Classification', 'Composite_Score', 'Cycle_Position_Score',
                 'Fin_Badge', 'Financial_Data_Freshness_Days',
                 'Rating_Badge', 'Rating_Review_Freshness_Days',
-                'Combined_Signal', 'Recommendation', 'Weight_Method'
+                'Combined_Signal', 'Recommendation', 'Weight_Method', 'Company_ID'
             ]
 
             # --- UI-only column label mapping for issuer table ---
@@ -15353,7 +15353,8 @@ if HAS_DATA:
                 'Rating_Review_Freshness_Days': 'Days Since Last Rating Review',
                 'Combined_Signal': 'Quality & Trend Signal',
                 'Recommendation': 'Model Recommendation',
-                'Weight_Method': 'Portfolio Sector Weight (Context)'
+                'Weight_Method': 'Portfolio Sector Weight (Context)',
+                'Company_ID': 'Company ID',
             }
 
             # Create recommendation priority for sorting
