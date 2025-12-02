@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -22,6 +23,7 @@ from datetime import datetime
 import sys
 import random
 from scipy.optimize import minimize as scipy_minimize
+from scipy.stats import gaussian_kde
 
 # AI Analysis (optional) — uses OpenAI via st.secrets
 try:
@@ -57,6 +59,134 @@ class PeriodType(Enum):
     """Type of financial period"""
     ANNUAL = "FY"  # Fiscal Year
     QUARTERLY = "CQ"  # Calendar Quarter
+
+# ============================================================================
+# MODEL THRESHOLDS - SINGLE SOURCE OF TRUTH
+# ============================================================================
+# All threshold comparisons throughout the app MUST reference these constants.
+# DO NOT hardcode threshold values elsewhere in the code.
+
+# Cache version - increment when calculation logic changes to invalidate cached results
+CACHE_VERSION = "v6.1.0"  # [Phase 2] Peer context in diagnostics + GenAI consistency
+
+MODEL_THRESHOLDS = {
+    # Signal Classification Thresholds
+    'quality_strong': 55,          # Composite_Score >= 55 = "Strong" quality
+    'trend_improving': 55,         # Cycle_Position_Score >= 55 = "Improving" trend
+    
+    # Recommendation Percentile Thresholds
+    'percentile_strong_buy': 70,   # >= 70th percentile in band = Strong Buy eligible
+    'percentile_exceptional': 90,  # >= 90th percentile = Exceptional quality
+    
+    # Visualization Thresholds (for chart display only)
+    'viz_quality_split': 60,       # Visual split on quadrant chart (display only)
+    
+    # Volatility & Outlier Detection
+    'volatility_cv': 0.30,         # Coefficient of variation threshold for VolatileSeries flag
+    'outlier_z_score': -2.5,       # Z-score threshold for outlier detection
+    
+    # Volatility Score Interpretation (0-100 scale, higher = more stable)
+    'volatility_score_consistent': 70,  # >= 70 = "consistent" trend (data closely tracks trend line)
+    'volatility_score_moderate': 50,    # >= 50 = "overall" trend (some deviation from trend)
+    # Below 50 = "volatile" trend (significant swings around trend line)
+    
+    # Data Quality
+    'stale_data_days': 180,        # Days before data considered stale
+    'min_coverage_pct': 70,        # Minimum data coverage percentage
+    
+    # Display Classification Thresholds (for UI visualization only)
+    'display_cycle_favorable': 70,     # Cycle score >= 70 = Favorable position
+    'display_cycle_neutral': 40,       # Cycle score >= 40 = Neutral/Stable
+    'display_composite_high': 70,      # Composite >= 70 = High Quality
+    'display_composite_moderate': 50,  # Composite >= 50 = Moderate Quality
+}
+
+def classify_signal(quality_score, trend_score, quality_thr=None, trend_thr=None):
+    """
+    Centralized signal classification - SINGLE SOURCE OF TRUTH.
+    
+    All signal classification in the app should use this function.
+    
+    Args:
+        quality_score: Composite score (0-100)
+        trend_score: Cycle position score (0-100)
+        quality_thr: Override quality threshold (default: QUALITY_THRESHOLD)
+        trend_thr: Override trend threshold (default: TREND_THRESHOLD)
+    
+    Returns:
+        Signal string: "Strong & Improving", "Strong but Deteriorating", 
+                      "Weak but Improving", "Weak & Deteriorating", or "n/a"
+    """
+    if quality_thr is None:
+        quality_thr = QUALITY_THRESHOLD
+    if trend_thr is None:
+        trend_thr = TREND_THRESHOLD
+        
+    if pd.isna(quality_score) or pd.isna(trend_score):
+        return "n/a"
+    
+    is_strong = quality_score >= quality_thr
+    is_improving = trend_score >= trend_thr
+    
+    if is_strong and is_improving:
+        return "Strong & Improving"
+    elif is_strong and not is_improving:
+        return "Strong but Deteriorating"
+    elif not is_strong and is_improving:
+        return "Weak but Improving"
+    else:
+        return "Weak & Deteriorating"
+
+# Convenience accessors for most-used thresholds
+QUALITY_THRESHOLD = MODEL_THRESHOLDS['quality_strong']      # 55
+
+# =============================================================================
+# CIQ-ALIGNED BOUNDS FOR FALLBACK-CALCULATED RATIOS
+# =============================================================================
+# Based on observed ranges from 1,945 issuers * 8 periods in CIQ data.
+# These bounds only apply to fallback calculations (when CIQ returns NM),
+# not to CIQ-provided values which are trusted as-is.
+
+CIQ_RATIO_BOUNDS = {
+    'EBITDA / Interest Expense (x)': {'min': 0.0, 'max': 294.0},  # CIQ observed max: 293.65
+    'Net Debt / EBITDA': {'min': 0.0, 'max': 274.0},              # CIQ observed max: 273.83
+}
+
+def apply_ciq_ratio_bounds(metric_name: str, raw_value: float) -> tuple:
+    """
+    Apply CIQ-aligned bounds to a fallback-calculated ratio value.
+    
+    SINGLE SOURCE OF TRUTH for all ratio bounding logic.
+    
+    Args:
+        metric_name: The metric name (must match CIQ_RATIO_BOUNDS keys)
+        raw_value: The calculated ratio value
+        
+    Returns:
+        tuple: (bounded_value, was_bounded)
+            - bounded_value: Value clipped to CIQ range
+            - was_bounded: True if value was outside CIQ range and was clipped
+    """
+    import numpy as np
+    bounds = CIQ_RATIO_BOUNDS.get(metric_name)
+    
+    if bounds is None:
+        # No bounds defined for this metric - return as-is
+        return raw_value, False
+    
+    bound_min = bounds['min']
+    bound_max = bounds['max']
+    
+    if raw_value < bound_min or raw_value > bound_max:
+        return float(np.clip(raw_value, bound_min, bound_max)), True
+    
+    return raw_value, False
+TREND_THRESHOLD = MODEL_THRESHOLDS['trend_improving']       # 55
+PERCENTILE_STRONG_BUY = MODEL_THRESHOLDS['percentile_strong_buy']  # 70
+
+# Volatility score interpretation thresholds
+VOLATILITY_CONSISTENT = MODEL_THRESHOLDS['volatility_score_consistent']  # 70
+VOLATILITY_MODERATE = MODEL_THRESHOLDS['volatility_score_moderate']      # 50
 
 # ============================================================================
 # DIAGNOSTIC DATA STRUCTURES (V5.0)
@@ -565,6 +695,9 @@ class DiagnosticDataAccessor:
         
         if missing:
             raise ValueError(f"Diagnostic data for {self.company_name} missing required keys: {missing}")
+        
+        # Note: 'peer_context' is optional for backward compatibility with existing diagnostic data
+        # New diagnostic data will include it
     
     # ========================================================================
     # COMPANY INFORMATION
@@ -614,7 +747,7 @@ class DiagnosticDataAccessor:
         
         Args:
             factor_name: One of 'Credit', 'Leverage', 'Profitability', 
-                        'Liquidity', 'Growth', 'Cash_Flow'
+                        'Liquidity', 'Cash_Flow'
         
         Returns:
             Score (0-100) or None if not available
@@ -641,6 +774,36 @@ class DiagnosticDataAccessor:
             'Liquidity': self.get_factor_score('Liquidity'),
             'Cash_Flow': self.get_factor_score('Cash_Flow')
         }
+    
+    # ========================================================================
+    # PEER CONTEXT (for GenAI reports)
+    # ========================================================================
+    
+    def get_peer_context(self) -> Optional[Dict[str, Any]]:
+        """
+        Get pre-computed peer context for GenAI reports.
+        
+        Returns:
+            Dictionary containing:
+                - sector_comparison: {classification, peer_count, medians, percentiles}
+                - rating_comparison: {rating, peer_count, medians, percentiles}
+            Or None if not available
+        """
+        return self.diag.get('peer_context')
+    
+    def get_sector_percentile(self, metric_key: str) -> Optional[float]:
+        """Get company's percentile within sector for a specific metric."""
+        peer_ctx = self.get_peer_context()
+        if peer_ctx is None:
+            return None
+        return peer_ctx.get('sector_comparison', {}).get('percentiles', {}).get(metric_key)
+    
+    def get_rating_percentile(self, metric_key: str) -> Optional[float]:
+        """Get company's percentile within rating peers for a specific metric."""
+        peer_ctx = self.get_peer_context()
+        if peer_ctx is None:
+            return None
+        return peer_ctx.get('rating_comparison', {}).get('percentiles', {}).get(metric_key)
     
     # ========================================================================
     # FACTOR DETAILS (Component Breakdowns)
@@ -1099,7 +1262,7 @@ def build_issuer_diagnostic_report(
         'signal_base': results.loc[idx, 'Signal_Base'],
         'signal_final': results.loc[idx, 'Signal'],
         'is_strong_quality': results.loc[idx, 'Composite_Score'] >= 50, # V5.0.3 logic
-        'is_improving_trend': results.loc[idx, 'Cycle_Position_Score'] >= 55, # Default threshold
+        'is_improving_trend': results.loc[idx, 'Cycle_Position_Score'] >= TREND_THRESHOLD, # Default threshold
         'exceptional_quality': bool(results.loc[idx, 'ExceptionalQuality']) if 'ExceptionalQuality' in results.columns else False,
         'volatile_series': bool(results.loc[idx, 'VolatileSeries']) if 'VolatileSeries' in results.columns else False,
         'outlier_quarter': bool(results.loc[idx, 'OutlierQuarter']) if 'OutlierQuarter' in results.columns else False
@@ -1548,8 +1711,8 @@ def create_diagnostic_export_data(
     report.signal_classification = {
         'signal_base': results.get('Signal_Base'),
         'signal_final': results.get('Signal'),
-        'is_strong_quality': results.get('Composite_Score', 0) >= 50,
-        'is_improving_trend': results.get('Cycle_Position_Score', 0) >= 55,
+        'is_strong_quality': results.get('Composite_Score', 0) >= QUALITY_THRESHOLD,
+        'is_improving_trend': results.get('Cycle_Position_Score', 0) >= TREND_THRESHOLD,
         'exceptional_quality': bool(results.get('ExceptionalQuality', False)),
         'volatile_series': bool(results.get('VolatileSeries', False)),
         'outlier_quarter': bool(results.get('OutlierQuarter', False))
@@ -2126,7 +2289,7 @@ def calculate_reference_date_coverage(df):
                 if pd.notna(period_date) and period_date.year >= 1950:
                     has_any_date = True
                     break
-            except:
+            except Exception:
                 continue
         if has_any_date:
             companies_with_any_data += 1
@@ -2168,7 +2331,7 @@ def calculate_reference_date_coverage(df):
                         if quarter_start <= period_date <= quarter_end:
                             has_data_in_quarter = True
                             break
-                except:
+                except Exception:
                     continue
 
             if has_data_in_quarter:
@@ -2310,7 +2473,7 @@ def detect_stale_data(df, reference_date, stale_threshold_days=180):
                 if pd.notna(date_val) and date_val.year > 1950:
                     if latest_date is None or date_val > latest_date:
                         latest_date = date_val
-            except:
+            except Exception:
                 continue
 
         if latest_date:
@@ -2460,6 +2623,18 @@ COMPANY_NAME_ALIASES = [
     "Entity Name"
 ]
 
+# Currency symbol mapping - single source of truth
+CURRENCY_SYMBOLS = {
+    'AUD': 'A$', 'CAD': 'C$', 'CHF': 'CHF ', 'CNY': '¥', 'CZK': 'Kč ',
+    'DKK': 'kr ', 'EUR': '€', 'GBP': '£', 'HKD': 'HK$', 'ITL': '₤',
+    'JPY': '¥', 'NOK': 'kr ', 'NZD': 'NZ$', 'PEN': 'S/', 'SEK': 'kr ',
+    'USD': '$'
+}
+
+def get_currency_symbol(currency_code: str) -> str:
+    """Get currency symbol for a currency code. Defaults to code + space if not found."""
+    return CURRENCY_SYMBOLS.get(currency_code, currency_code + ' ')
+
 # Features that are optional - gate UI/functionality if columns missing
 REQ_FOR = {
     "classification": ["Rubrics Custom Classification"],
@@ -2506,24 +2681,407 @@ def resolve_company_name_column(df):
     return resolve_column(df, COMPANY_NAME_ALIASES)
 
 # ---------- Metric alias registry & helpers (AI Analysis v2) ----------
-METRIC_ALIASES = {
-    "EBITDA Margin": ["EBITDA Margin", "EBITDA margin %", "EBITDA Margin (%)"],
-    "Gross Profit Margin": ["Gross Profit Margin", "Gross Margin", "GP Margin"],
-    "Return on Equity": ["Return on Equity", "ROE"],
-    "Return on Assets": ["Return on Assets", "ROA"],
-    "Total Debt / EBITDA (x)": ["Total Debt / EBITDA (x)", "Total Debt/EBITDA", "Total Debt to EBITDA", "Debt / EBITDA (x)"],
-    "Net Debt / EBITDA": ["Net Debt / EBITDA", "Net Debt/EBITDA", "Net Debt to EBITDA"],
-    "EBITDA / Interest Expense (x)": ["EBITDA / Interest Expense (x)", "EBITDA/ Interest Expense (x)", "EBITDA/Interest (x)", "EBITDA / Interest", "Interest Coverage (x)", "Interest Cover (x)"],
-    "Current Ratio (x)": ["Current Ratio (x)", "Current Ratio"],
-    "Quick Ratio (x)": ["Quick Ratio (x)", "Quick Ratio"],
-    "Cash from Ops. to Curr. Liab. (x)": ["Cash from Ops. to Curr. Liab. (x)", "OCF/Current Liabilities", "OCF to Current Liabilities", "Cash from Operations / Current Liabilities"],
-    # optional level/trend inputs (don't break if absent)
-    "Total Debt": ["Total Debt"],
-    "Cash and Short-Term Investments": ["Cash and Short-Term Investments"],
-    "Total Revenues": ["Total Revenues"],
-    "EBITDA": ["EBITDA"],
-    "Interest Expense": ["Interest Expense"],
+# =============================================================================
+# METRIC_REGISTRY - SINGLE SOURCE OF TRUTH FOR ALL METRIC DEFINITIONS
+# =============================================================================
+# ALL column names, aliases, and metadata defined HERE ONLY.
+# NO OTHER DICTIONARY should define column names.
+# =============================================================================
+
+METRIC_REGISTRY = {
+    # PROFITABILITY
+    'ebitda_margin': {
+        'canonical': 'EBITDA Margin',
+        'aliases': ['EBITDA Margin', 'EBITDA margin %', 'EBITDA Margin (%)'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'gross_margin': {
+        'canonical': 'Gross Profit Margin',
+        'aliases': ['Gross Profit Margin', 'Gross Margin', 'GP Margin'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'ebit_margin': {
+        'canonical': 'EBIT Margin',
+        'aliases': ['EBIT Margin'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'net_income_margin': {
+        'canonical': 'Net Income Margin',
+        'aliases': ['Net Income Margin'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'roe': {
+        'canonical': 'Return on Equity',
+        'aliases': ['Return on Equity', 'ROE'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'roa': {
+        'canonical': 'Return on Assets',
+        'aliases': ['Return on Assets', 'ROA'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'roic': {
+        'canonical': 'Return on Capital',
+        'aliases': ['Return on Capital', 'ROIC'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+
+    # LEVERAGE
+    'total_debt_ebitda': {
+        'canonical': 'Total Debt / EBITDA (x)',
+        'aliases': ['Total Debt / EBITDA (x)', 'Total Debt/EBITDA', 'Total Debt to EBITDA', 'Debt / EBITDA (x)'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': False,
+    },
+    'net_debt_ebitda': {
+        'canonical': 'Net Debt / EBITDA',
+        'aliases': ['Net Debt / EBITDA', 'Net Debt/EBITDA', 'Net Debt to EBITDA'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': False,
+    },
+    'ebitda_interest': {
+        'canonical': 'EBITDA / Interest Expense (x)',
+        'aliases': ['EBITDA / Interest Expense (x)', 'EBITDA/ Interest Expense (x)', 'EBITDA/Interest (x)', 'EBITDA / Interest', 'Interest Coverage (x)', 'Interest Cover (x)'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': True,
+    },
+    'interest_coverage': {
+        'canonical': 'EBITDA / Interest Expense (x)',
+        'aliases': ['EBITDA / Interest Expense (x)', 'EBITDA/ Interest Expense (x)', 'Interest Coverage (x)'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': True,
+    },
+    'total_debt_equity': {
+        'canonical': 'Total Debt/Equity (%)',
+        'aliases': ['Total Debt/Equity (%)', 'Debt to Equity (%)'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': False,
+    },
+    'debt_to_equity': {
+        'canonical': 'Total Debt/Equity (%)',
+        'aliases': ['Total Debt/Equity (%)'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': False,
+    },
+    'lt_debt_capital': {
+        'canonical': 'Long-term Debt / Total Capital (%)',
+        'aliases': ['Long-term Debt / Total Capital (%)'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': False,
+    },
+    'total_debt_capital': {
+        'canonical': 'Total Debt / Total Capital (%)',
+        'aliases': ['Total Debt / Total Capital (%)', 'Debt / Capital (%)'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': False,
+    },
+    'debt_to_capital': {
+        'canonical': 'Total Debt / Total Capital (%)',
+        'aliases': ['Total Debt / Total Capital (%)'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': False,
+    },
+    'total_liabilities_assets': {
+        'canonical': 'Total Liabilities / Total Assets (%)',
+        'aliases': ['Total Liabilities / Total Assets (%)'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': False,
+    },
+
+    # LIQUIDITY
+    'current_ratio': {
+        'canonical': 'Current Ratio (x)',
+        'aliases': ['Current Ratio (x)', 'Current Ratio'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': True,
+    },
+    'quick_ratio': {
+        'canonical': 'Quick Ratio (x)',
+        'aliases': ['Quick Ratio (x)', 'Quick Ratio'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': True,
+    },
+    'cash_ops_curr_liab': {
+        'canonical': 'Cash from Ops. to Curr. Liab. (x)',
+        'aliases': ['Cash from Ops. to Curr. Liab. (x)', 'OCF/Current Liabilities', 'OCF to Current Liabilities', 'Cash from Operations / Current Liabilities'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': True,
+    },
+
+    # CASH FLOW
+    'levered_fcf': {
+        'canonical': 'Levered Free Cash Flow',
+        'aliases': ['Levered Free Cash Flow', 'Free Cash Flow'],
+        'type': 'calc', 'unit': 'M', 'higher_is_better': True,
+    },
+    'free_cash_flow': {
+        'canonical': 'Levered Free Cash Flow',
+        'aliases': ['Levered Free Cash Flow'],
+        'type': 'calc', 'unit': 'M', 'higher_is_better': True,
+    },
+    'unlevered_fcf': {
+        'canonical': 'Unlevered Free Cash Flow',
+        'aliases': ['Unlevered Free Cash Flow'],
+        'type': 'calc', 'unit': 'M', 'higher_is_better': True,
+    },
+    'levered_fcf_margin': {
+        'canonical': 'Levered Free Cash Flow Margin',
+        'aliases': ['Levered Free Cash Flow Margin'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'unlevered_fcf_margin': {
+        'canonical': 'Unlevered Free Cash Flow Margin',
+        'aliases': ['Unlevered Free Cash Flow Margin'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'operating_cash_flow': {
+        'canonical': 'Cash from Ops.',
+        'aliases': ['Cash from Ops.', 'Cash from Operations', 'Operating Cash Flow', 'Cash from Ops', 'Net Cash Provided by Operating Activities'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+
+    # GROWTH
+    'revenue_growth': {
+        'canonical': 'Total Revenues, 1 Year Growth',
+        'aliases': ['Total Revenues, 1 Year Growth', 'Revenue Growth 1Y'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'revenue_1y_growth': {
+        'canonical': 'Total Revenues, 1 Year Growth',
+        'aliases': ['Total Revenues, 1 Year Growth'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'revenue_3y_cagr': {
+        'canonical': 'Total Revenues, 3 Yr. CAGR',
+        'aliases': ['Total Revenues, 3 Yr. CAGR'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'ebitda_growth': {
+        'canonical': 'EBITDA, 1 Yr. Growth',
+        'aliases': ['EBITDA, 1 Yr. Growth'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'ebitda_3y_cagr': {
+        'canonical': 'EBITDA, 3 Years CAGR',
+        'aliases': ['EBITDA, 3 Years CAGR'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'net_income_growth': {
+        'canonical': 'Net Income, 1 Yr. Growth',
+        'aliases': ['Net Income, 1 Yr. Growth'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+    'net_income_3y_cagr': {
+        'canonical': 'Net Income, 3 Yr. CAGR',
+        'aliases': ['Net Income, 3 Yr. CAGR'],
+        'type': 'calc', 'unit': '%', 'higher_is_better': True,
+    },
+
+    # RAW FINANCIALS
+    'total_debt': {
+        'canonical': 'Total Debt',
+        'aliases': ['Total Debt'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+    'net_debt': {
+        'canonical': 'Net Debt',
+        'aliases': ['Net Debt'],
+        'type': 'calc', 'unit': 'M', 'higher_is_better': False,
+    },
+    'ebitda': {
+        'canonical': 'EBITDA',
+        'aliases': ['EBITDA'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'ebit': {
+        'canonical': 'EBIT',
+        'aliases': ['EBIT', 'Operating Income'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'operating_income': {
+        'canonical': 'EBIT',
+        'aliases': ['EBIT'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'revenue': {
+        'canonical': 'Total Revenues',
+        'aliases': ['Total Revenues', 'Total Revenue', 'Revenue'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'total_revenues': {
+        'canonical': 'Total Revenues',
+        'aliases': ['Total Revenues'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'interest_expense': {
+        'canonical': 'Interest Expense',
+        'aliases': ['Interest Expense', 'Interest Expense, net', 'Net Interest Expense'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': False,
+    },
+    'net_income': {
+        'canonical': 'Net Income',
+        'aliases': ['Net Income'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'cash': {
+        'canonical': 'Cash & Short-term Investments',
+        'aliases': ['Cash & Short-term Investments', 'Cash and Short-Term Investments', 'Cash & ST Investments', 'Cash and Equivalents'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'cash_equivalents': {
+        'canonical': 'Cash & Short-term Investments',
+        'aliases': ['Cash & Short-term Investments'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'total_assets': {
+        'canonical': 'Total Assets',
+        'aliases': ['Total Assets'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+    'equity': {
+        'canonical': 'Total Common Equity',
+        'aliases': ['Total Common Equity', 'Total Equity'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'total_equity': {
+        'canonical': 'Total Common Equity',
+        'aliases': ['Total Common Equity'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': True,
+    },
+    'capital_expenditure': {
+        'canonical': 'Capital Expenditure',
+        'aliases': ['Capital Expenditure', 'CapEx'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+    'capex': {
+        'canonical': 'Capital Expenditure',
+        'aliases': ['Capital Expenditure'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+    'market_cap': {
+        'canonical': 'Market Capitalization',
+        'aliases': ['Market Capitalization'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+
+    # BALANCE SHEET
+    'current_assets': {
+        'canonical': 'Current Assets',
+        'aliases': ['Current Assets'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+    'current_liabilities': {
+        'canonical': 'Current Liabilities',
+        'aliases': ['Current Liabilities'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+    'total_liabilities': {
+        'canonical': 'Total Liabilities',
+        'aliases': ['Total Liabilities'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': False,
+    },
+    'long_term_debt': {
+        'canonical': 'Long-Term Debt',
+        'aliases': ['Long-Term Debt'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': False,
+    },
+    'short_term_debt': {
+        'canonical': 'Short-Term Debt',
+        'aliases': ['Short-Term Debt'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': False,
+    },
+    'accounts_receivable': {
+        'canonical': 'Accounts Receivable',
+        'aliases': ['Accounts Receivable'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+    'inventory': {
+        'canonical': 'Inventory',
+        'aliases': ['Inventory'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+    'accounts_payable': {
+        'canonical': 'Accounts Payable',
+        'aliases': ['Accounts Payable'],
+        'type': 'raw', 'unit': 'M', 'higher_is_better': None,
+    },
+
+    # EFFICIENCY
+    'asset_turnover': {
+        'canonical': 'Total Asset Turnover',
+        'aliases': ['Total Asset Turnover'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': True,
+    },
+    'fixed_asset_turnover': {
+        'canonical': 'Fixed Asset Turnover',
+        'aliases': ['Fixed Asset Turnover'],
+        'type': 'calc', 'unit': 'x', 'higher_is_better': True,
+    },
 }
+
+
+# =============================================================================
+# HELPER FUNCTIONS - Derive from METRIC_REGISTRY
+# =============================================================================
+
+def _build_alias_to_canonical():
+    """Build reverse lookup: alias -> canonical name."""
+    mapping = {}
+    for key, info in METRIC_REGISTRY.items():
+        for alias in info['aliases']:
+            if alias not in mapping:
+                mapping[alias] = info['canonical']
+    return mapping
+
+_ALIAS_TO_CANONICAL = _build_alias_to_canonical()
+
+
+def get_metric_canonical(metric_key):
+    """Get canonical column name for a metric key."""
+    if metric_key in METRIC_REGISTRY:
+        return METRIC_REGISTRY[metric_key]['canonical']
+    return None
+
+
+def get_metric_aliases(metric_key):
+    """Get all aliases for a metric key."""
+    if metric_key in METRIC_REGISTRY:
+        return METRIC_REGISTRY[metric_key]['aliases']
+    return []
+
+
+def get_metric_column(metric_key, suffix=""):
+    """Get column name with optional period suffix."""
+    canonical = get_metric_canonical(metric_key)
+    if canonical:
+        return f"{canonical}{suffix}" if suffix else canonical
+    return None
+
+def get_metric_display_name(metric_key):
+    """Get display name (canonical name) for a metric."""
+    return get_metric_canonical(metric_key)
+
+def get_metric_info(metric_key):
+    """Get full metadata for a metric."""
+    if metric_key not in METRIC_REGISTRY:
+        return None
+    info = METRIC_REGISTRY[metric_key]
+    return {
+        'canonical': info['canonical'],
+        'aliases': info['aliases'],
+        'type': info['type'],
+        'unit': info['unit'],
+        'higher_is_better': info['higher_is_better'],
+    }
+
+
+def resolve_column_name(column_name):
+    """Resolve any alias to its canonical form."""
+    return _ALIAS_TO_CANONICAL.get(column_name, column_name)
+
+
+def format_metric_value(value, metric_key):
+    """Format value based on metric unit."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "N/A"
+    info = METRIC_REGISTRY.get(metric_key)
+    if not info:
+        return f"{value:,.2f}"
+    unit = info['unit']
+    if unit == 'M':
+        return f"{value:,.1f}M"
+    elif unit == '%':
+        return f"{value:.2f}%"
+    elif unit == 'x':
+        return f"{value:.2f}x"
+    return f"{value:,.2f}"
 
 def _resolve_company_name_col(df: pd.DataFrame) -> str | None:
     return resolve_column(df, ["Company_Name", "Company Name", "Name"])
@@ -2561,11 +3119,11 @@ def calculate_interest_coverage_fallback(ebitda_value, interest_expense_value, e
             try:
                 float(v.replace(',', ''))
                 return True
-            except:
+            except Exception:
                 return False
         try:
             return not np.isnan(float(v))
-        except:
+        except Exception:
             return False
     
     def to_float(v):
@@ -2577,11 +3135,11 @@ def calculate_interest_coverage_fallback(ebitda_value, interest_expense_value, e
                 return np.nan
             try:
                 return float(v.replace(',', ''))
-            except:
+            except Exception:
                 return np.nan
         try:
             return float(v)
-        except:
+        except Exception:
             return np.nan
     
     # Check if existing ratio is valid - if so, use it
@@ -2620,7 +3178,9 @@ def _resolve_classification_col(df: pd.DataFrame) -> str | None:
     return resolve_column(df, ["Rubrics_Custom_Classification", "Rubrics Custom Classification"])
 
 def resolve_metric_column(df_like, canonical: str) -> str | None:
-    aliases = METRIC_ALIASES.get(canonical, [canonical])
+    aliases = get_metric_aliases(canonical)
+    if not aliases:
+        aliases = [canonical]
     # Accept Series -> make it a 1-row frame to reuse resolve_column
     if isinstance(df_like, pd.Series):
         df_like = df_like.to_frame().T
@@ -2630,14 +3190,20 @@ def list_metric_columns(df: pd.DataFrame, canonical: str) -> tuple[str | None, l
     """Return (base_col, [all existing suffixed cols]) for a canonical metric."""
     base = resolve_metric_column(df, canonical)
     suffixes = []
-    for alias in METRIC_ALIASES.get(canonical, [canonical]):
+    aliases = get_metric_aliases(canonical)
+    if not aliases:
+        aliases = [canonical]
+    for alias in aliases:
         suffixes += [c for c in df.columns if isinstance(c, str) and c.startswith(f"{alias}.")]
     suffixes = sorted(set(suffixes))
     return base, suffixes
 
 def get_from_row(row: pd.Series, canonical: str):
     """Row-level safe getter honoring aliases."""
-    for a in METRIC_ALIASES.get(canonical, [canonical]):
+    aliases = get_metric_aliases(canonical)
+    if not aliases:
+        aliases = [canonical]
+    for a in aliases:
         if a in row.index:
             return row.get(a)
     return np.nan
@@ -2768,7 +3334,7 @@ def _factor_score_columns(results: pd.DataFrame) -> list:
     Return list of individual factor score columns for PCA.
     Use individual factor scores; avoid letting Composite dominate.
     """
-    cols = [c for c in results.columns if c.endswith("_Score") and c != "Composite_Score"]
+    cols = [c for c in results.columns if c.endswith("_Score") and c not in ("Composite_Score", "Quality_Score")]
     if len(cols) < 2:
         # Fallback: include Composite if needed to reach 2+
         cols = [c for c in results.columns if c.endswith("_Score")]
@@ -3273,7 +3839,10 @@ def extract_issuer_financial_data(df_original: pd.DataFrame, company_name: str) 
 
     for metric in metrics_to_extract:
         # Resolve metric column (handle aliases)
-        metric_col = resolve_column(df_original, METRIC_ALIASES.get(metric, [metric]))
+        aliases = get_metric_aliases(metric)
+        if not aliases:
+            aliases = [metric]
+        metric_col = resolve_column(df_original, aliases)
         if metric_col is None:
             continue
 
@@ -3442,7 +4011,7 @@ def generate_credit_report(data: dict) -> str:
 
     # Call OpenAI API
     response = client.chat.completions.create(
-        model="gpt-4-turbo-preview",
+        model="gpt-5",
         messages=[
             {
                 "role": "system",
@@ -3454,7 +4023,7 @@ def generate_credit_report(data: dict) -> str:
             }
         ],
         temperature=0.7,
-        max_tokens=2500
+        max_tokens=8000
     )
 
     return response.choices[0].message.content
@@ -3568,6 +4137,74 @@ def _safe_get(row, *names):
             if _has_value(val):
                 return val.iloc[0] if isinstance(val, pd.Series) else val
     return np.nan
+
+
+def get_metric_series_row(row: pd.Series, metric: str, prefer: str = "FY") -> pd.Series:
+    """
+    Re-implementation of get_metric_series_row for test compatibility.
+    Extracts a time series for a metric from a single row, handling FY/CQ filtering.
+    """
+    # 1. Identify all available (date, value) pairs
+    pairs = []
+    
+    # Check base
+    if pd.notna(row.get(metric)) and pd.notna(row.get("Period Ended")):
+        try:
+            dt = pd.to_datetime(row.get("Period Ended"), dayfirst=True)
+            pairs.append((dt, row.get(metric)))
+        except (ValueError, TypeError, pd.errors.ParserError): pass
+        
+    # Check suffixes .1 to .20 (reasonable limit)
+    for i in range(1, 21):
+        m_col = f"{metric}.{i}"
+        p_col = f"Period Ended.{i}"
+        if m_col in row and pd.notna(row[m_col]) and p_col in row and pd.notna(row[p_col]):
+            try:
+                dt = pd.to_datetime(row[p_col], dayfirst=True)
+                pairs.append((dt, row[m_col]))
+            except (ValueError, TypeError, pd.errors.ParserError): pass
+            
+    if not pairs:
+        return pd.Series(dtype=float)
+        
+    # 2. Filter for FY if requested
+    if prefer == "FY" and len(pairs) > 1:
+        # Heuristic: Find the most common month, assume that's the FY end
+        from collections import Counter
+        months = [d.month for d, v in pairs]
+        if months:
+            common = Counter(months).most_common(1)[0][0]
+            # Keep only dates with that month
+            pairs = [(d, v) for d, v in pairs if d.month == common]
+        
+    # 3. Sort by date
+    pairs.sort(key=lambda x: x[0])
+    
+    return pd.Series([p[1] for p in pairs], index=[p[0] for p in pairs])
+
+def most_recent_annual_value(row: pd.Series, metric: str) -> float:
+    """Get the most recent annual value for a metric."""
+    s = get_metric_series_row(row, metric, prefer="FY")
+    if s.empty:
+        return np.nan
+    return s.iloc[-1] # Last one is most recent due to sort
+
+def get_most_recent_column(df: pd.DataFrame, base_metric: str, data_period_setting: str) -> pd.Series:
+    """Get the most recent value column for a metric based on period setting."""
+    prefer_fy = "FY" in data_period_setting
+    
+    def _get_val(row):
+        s = get_metric_series_row(row, base_metric, prefer="FY" if prefer_fy else "CQ")
+        return s.iloc[-1] if not s.empty else np.nan
+        
+    return df.apply(_get_val, axis=1)
+
+def extract_metric_time_series(row: pd.Series, df: pd.DataFrame, metric: str) -> dict:
+    """Extract time series for a metric as a dictionary."""
+    s = get_metric_series_row(row, metric, prefer="FY")
+    if s.empty:
+        return {}
+    return {k.strftime('%Y-%m-%d'): v for k, v in s.items()}
 
 def _mk_key_inputs_row(row: pd.Series) -> Dict[str, Any]:
     """Collect raw inputs used by scoring; values reflect the most-recent annual numbers already computed in the app."""
@@ -3975,7 +4612,7 @@ def _build_ai_prompt_chatty(scope: Dict[str, Any], mode: AIMode, depth: str) -> 
 
         You are analyzing a **classification group**, not an individual issuer. Your CONTEXT includes class_stats with:
         - n_issuers: number of issuers in this classification
-        - medians: median scores for Credit, Leverage, Profitability, Liquidity, Growth, and Composite
+        - medians: median scores for Credit, Leverage, Profitability, Liquidity, Cash Flow, and Composite
         - ig_count / hy_count: Investment Grade vs High Yield mix
         - signal_counts: distribution of Combined_Signal values (Strong/Moderate Quality & Improving/Stable/Deteriorating Trend)
         - top5 / bottom5: top 5 and bottom 5 issuers by Composite_Score
@@ -4381,7 +5018,7 @@ def extract_latest_period_metrics(raw_row: pd.Series, results_row: pd.Series) ->
             if abs(float_val) > 1e15:
                 return f"{float_val:.2e}"
             return f"{float_val:.{decimals}f}"
-        except:
+        except Exception:
             return "N/A"
     def latest_of(metric):
         ts = _metric_series_for_row(results_row.to_frame(), results_row, metric, prefer_fy=True) \
@@ -4407,6 +5044,7 @@ def extract_latest_period_metrics(raw_row: pd.Series, results_row: pd.Series) ->
         "quick_ratio":     safe_float(latest_of("Quick Ratio (x)"), 2),
         "total_debt":      safe_float(latest_of("Total Debt"), 0),
         "cash":            safe_float(latest_of("Cash and Short-Term Investments"), 0),
+        "reporting_currency": str(raw_row.get('Reported Currency', 'USD')) if pd.notna(raw_row.get('Reported Currency')) else 'USD',
     }
 
 
@@ -4436,7 +5074,7 @@ def extract_time_series_compact(row: pd.Series, metric_base: str, n_periods: int
             formatted += " →"
 
         return formatted
-    except:
+    except Exception:
         return "N/A"
 
 
@@ -4519,7 +5157,7 @@ def get_top_issuers(class_subset: pd.DataFrame, n: int, by: str) -> list:
 
         sorted_df = class_subset[[name_col, by]].dropna().sort_values(by, ascending=False).head(n)
         return [{"name": row[name_col], "value": f"{row[by]:.1f}"} for _, row in sorted_df.iterrows()]
-    except:
+    except Exception:
         return []
 
 
@@ -4532,7 +5170,7 @@ def get_bottom_issuers(class_subset: pd.DataFrame, n: int, by: str) -> list:
 
         sorted_df = class_subset[[name_col, by]].dropna().sort_values(by, ascending=True).head(n)
         return [{"name": row[name_col], "value": f"{row[by]:.1f}"} for _, row in sorted_df.iterrows()]
-    except:
+    except Exception:
         return []
 
 
@@ -4581,7 +5219,7 @@ def _safe_format(val, decimals=2):
                 return f"{float_val:.2e}"  # Scientific notation for very large numbers
             return f"{float_val:.{decimals}f}"
         return str(val)
-    except:
+    except Exception:
         return "N/A"
 
 
@@ -4709,7 +5347,7 @@ def _latest_periods(row: pd.Series, prefer_fy=True, fy_n=5, cq_n=8):
     fy = []
     cq = []
     # Pick values per suffix; reuse alias-aware series builder
-    for k in METRIC_ALIASES.keys():
+    for k in METRIC_REGISTRY.keys():
         s = _metric_series_for_row(row.to_frame().T, row, k, prefer_fy=True)
         if not s.empty:
             break
@@ -4781,7 +5419,7 @@ def assemble_issuer_context(issuer_row: pd.Series, raw_row: pd.Series, results_d
         "profitability": _safe_get(issuer_row, "Profitability_Score", "profitability_score"),
         "leverage": _safe_get(issuer_row, "Leverage_Score", "leverage_score"),
         "liquidity": _safe_get(issuer_row, "Liquidity_Score", "liquidity_score"),
-        "growth": _safe_get(issuer_row, "Growth_Score", "growth_score"),
+        # Growth factor removed from 5-factor model
         "credit": _safe_get(issuer_row, "Credit_Score", "credit_score"),
         "combined_signal": _safe_get(issuer_row, "__Signal_v2", "__Signal", "Combined_Signal", "Signal"),
     }
@@ -4802,6 +5440,7 @@ def assemble_issuer_context(issuer_row: pd.Series, raw_row: pd.Series, results_d
         },
         "company_name": company_name,
         "classification": classification,
+        "reporting_currency": latest_metrics.get('reporting_currency', 'USD'),
         "sp_rating": _safe_get(issuer_row, "S&P LT Issuer Credit Rating", "Rating"),
         "country": _safe_get(issuer_row, "Country"),
         "latest_metrics": latest_metrics,
@@ -4880,6 +5519,9 @@ def assemble_classification_context(classification: str, results_df: pd.DataFram
 
 def build_issuer_report_prompt(context: dict) -> str:
     """Build formatted prompt for issuer credit report."""
+    # Get currency symbol using global function
+    curr_sym = get_currency_symbol(context.get('reporting_currency', 'USD'))
+    
     # Company Overview section
     company_overview = f"""
 Company: {context['company_name']}
@@ -4900,14 +5542,14 @@ Profitability:
 Leverage:
 - Total Debt / EBITDA: {m['total_debt_ebitda']}x (Peer median: {context['peer_stats'].get('peer_median_leverage', 'N/A')}x, Percentile: {context['peer_stats'].get('leverage_percentile', 'N/A')}th)
 - Net Debt / EBITDA: {m['net_debt_ebitda']}x
-- Total Debt: ${m['total_debt']}
+- Total Debt: {curr_sym}{m['total_debt']}
 
 Coverage:
 - EBITDA / Interest Expense: {m['coverage']}x (Peer median: {context['peer_stats'].get('peer_median_coverage', 'N/A')}x)
 
 Liquidity:
 - {get_metric_display_name('current_ratio')}: {m['current_ratio']}x
-- {get_metric_display_name('cash')}: ${m['cash']}
+- {get_metric_display_name('cash')}: {curr_sym}{m['cash']}
 - {get_metric_display_name('quick_ratio')}: {m['quick_ratio']}x
 """
 
@@ -5025,9 +5667,7 @@ def render_ai_analysis_chat(df_original: pd.DataFrame, results_final: pd.DataFra
     # Optional snapshot counts (safe even if missing)
     try:
         buckets = build_buckets_v2(results_final,
-                                    df_original,
-                                    trend_thr=55,  # Fixed threshold
-                                    quality_thr=60)  # Fixed threshold
+                                    df_original)  # Uses MODEL_THRESHOLDS defaults
         df_counts = buckets.get("counts", pd.DataFrame())
         if isinstance(df_counts, dict):
             df_counts = pd.DataFrame(list(df_counts.items()), columns=["Signal","Count"])
@@ -5830,44 +6470,7 @@ def latest_periods(cal: pd.DataFrame, max_k_fy=4, max_k_cq=7) -> pd.DataFrame:
 # BATCH METRIC EXTRACTION (moved to module level for reuse)
 # ============================================================================
 
-def extract_raw_inputs_for_diagnostic(df: pd.DataFrame, idx: int, selected_suffix: str) -> Dict:
-    """
-    Extract raw input values from Excel for diagnostic report.
-    
-    This captures the SOURCE data before any calculations.
-    """
-    def get_val(metric_name):
-        col = f"{metric_name}{selected_suffix}"
-        if col in df.columns:
-            val = df.loc[idx, col]
-            return float(val) if pd.notna(val) and str(val) != 'NM' else None
-        return None
-    
-    return {
-        'BALANCE_SHEET': {
-            'Total_Debt': get_val('Total Debt'),
-            'Total_Assets': get_val('Total Assets'),
-            'Cash_And_Short_Term_Investments': get_val('Cash & Short-term Investments'),
-            'Total_Equity': get_val('Total Equity'),
-            'Total_Capital': get_val('Total Capital'),
-            'Current_Assets': get_val('Current Assets'),
-            'Current_Liabilities': get_val('Current Liabilities'),
-            'Inventory': get_val('Inventory')
-        },
-        'INCOME_STATEMENT': {
-            'Revenue': get_val('Revenue'),
-            'Gross_Profit': get_val('Gross Profit'),
-            'EBITDA': get_val('EBITDA'),
-            'Operating_Income': get_val('Operating Income'),
-            'Interest_Expense': get_val('Interest Expense'),
-            'Net_Income': get_val('Net Income')
-        },
-        'CASH_FLOW': {
-            'Operating_Cash_Flow': get_val('Cash from Operations'),
-            'Capital_Expenditures': get_val('Capital Expenditures'),
-            'Free_Cash_Flow': get_val('Levered Free Cash Flow')
-        }
-    }
+
 
 def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_setting,
                           reference_date=None, prefer_annual_reports=False,
@@ -5925,7 +6528,7 @@ def _batch_extract_metrics(df, metric_list, has_period_alignment, data_period_se
     # For each metric, extract values based on selected periods or legacy logic
     for metric in metric_list:
         if selected_periods is not None:
-            print(f"DEBUG: Using selected_periods, shape={selected_periods.shape}", flush=True)
+            # Debug statement removed for production
             # Use pre-selected periods for consistency with trend scores
             values = []
             for idx in df.index:
@@ -6358,7 +6961,7 @@ def calculate_calibrated_sector_weights(df, rating_band='BBB', use_dynamic=True)
         'leverage_score': 'Leverage_Score',
         'profitability_score': 'Profitability_Score',
         'liquidity_score': 'Liquidity_Score',
-        'growth_score': 'Growth_Score',
+
         'cash_flow_score': 'Cash_Flow_Score'
     }
     
@@ -6705,8 +7308,8 @@ def _resolve_model_weights_for_row(row: pd.Series, scoring_method: str, calibrat
     Keys: lowercase matching UNIVERSAL_WEIGHTS (credit_score, leverage_score,
           profitability_score, liquidity_score, growth_score, cash_flow_score)
     """
-    UNIVERSAL = {"credit_score": 0.20, "leverage_score": 0.25, "profitability_score": 0.20,
-                 "liquidity_score": 0.10, "cash_flow_score": 0.25}
+    # Use module-level UNIVERSAL_WEIGHTS (defined at line ~6559)
+    UNIVERSAL = UNIVERSAL_WEIGHTS
 
     # Universal mode short-circuit
     if str(scoring_method).lower().startswith("universal"):
@@ -6747,7 +7350,6 @@ def _build_explainability_table(issuer_row: pd.Series, scoring_method: str, cali
         "Leverage": "leverage_score",
         "Profitability": "profitability_score",
         "Liquidity": "liquidity_score",
-        "Growth": "growth_score",
         "Cash Flow": "cash_flow_score"
     }
 
@@ -6765,7 +7367,7 @@ def _build_explainability_table(issuer_row: pd.Series, scoring_method: str, cali
     current_w = {k: v / current_sum for k, v in current_w.items()}
 
     # Use UNIVERSAL_WEIGHTS as baseline for "Universal Weight %" column
-    # This provides a consistent reference point (20/20/20/10/15/15)
+    # This provides a consistent reference point (20/25/20/10/25)
     original_w = {f: float(UNIVERSAL_WEIGHTS.get(factor_map[f], 0.0)) for f in present}
     original_sum = sum(original_w.values()) or 1.0
     original_w = {k: v / original_sum for k, v in original_w.items()}
@@ -6859,7 +7461,7 @@ def render_issuer_explainability(filtered: pd.DataFrame, scoring_method: str, ca
         # Display weight provenance
         st.markdown(f"**Current Weight Method:** {provenance}")
 
-        st.info("ℹ️ **Weight Comparison:** Universal baseline (20/20/20/10/15/15) vs Current active weights. When Dynamic Calibration is OFF, both columns will be identical.")
+        st.info("ℹ️ **Weight Comparison:** Universal baseline (20/25/20/10/25) vs Current active weights. When Dynamic Calibration is OFF, both columns will be identical.")
 
         # Display comparison table
         st.dataframe(df_contrib, use_container_width=True, hide_index=True)
@@ -6868,7 +7470,7 @@ def render_issuer_explainability(filtered: pd.DataFrame, scoring_method: str, ca
         st.caption("""
         **How to read this table:**
         - **Score**: Factor score (0-100) for this issuer
-        - **Universal Weight %**: Universal baseline weight (20/20/20/10/15/15) - constant for all issuers
+        - **Universal Weight %**: Universal baseline weight (20/25/20/10/25) - constant for all issuers
         - **Current Weight %**: Active weight from current Dynamic Calibration settings (identical to Universal if calibration OFF)
         - **Weight Change**: % change from universal baseline to current active weight
         - **Universal Contrib**: Factor's contribution using universal baseline weights
@@ -6879,61 +7481,66 @@ def render_issuer_explainability(filtered: pd.DataFrame, scoring_method: str, ca
         # Summary metrics
         st.markdown("---")
         st.markdown("### Score Breakdown")
+        
+        # Get Quality Score and Trend Score for proper breakdown
+        quality_score = float(issuer_row.get("Quality_Score", np.nan))
+        trend_score = float(issuer_row.get("Cycle_Position_Score", np.nan))
+        
+        # Calculate expected composite from 80/20 blend
+        expected_composite = np.nan
+        if pd.notna(quality_score) and pd.notna(trend_score):
+            expected_composite = (quality_score * 0.80) + (trend_score * 0.20)
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
 
         with col1:
-            st.metric("Stored Composite Score", f"{comp:.2f}" if pd.notna(comp) else "n/a")
-            st.caption("Score as calculated and stored")
+            st.metric("Quality Score", f"{quality_score:.2f}" if pd.notna(quality_score) else "n/a")
+            st.caption("Sum of weighted factors (80% of composite)")
 
         with col2:
-            if pd.notna(original_sum):
-                st.metric("Universal Baseline", f"{original_sum:.2f}")
-                st.caption("Sum using universal weights (20/20/20/10/15/15)")
-                diff_original = original_sum - comp if pd.notna(comp) else np.nan
-                if pd.notna(diff_original) and abs(diff_original) > 0.5:
-                    st.caption(f"Diff from stored: {diff_original:+.2f}")
-            else:
-                st.metric("Universal Baseline", "N/A")
-                st.caption("Calculation error")
+            st.metric("Trend Score", f"{trend_score:.2f}" if pd.notna(trend_score) else "n/a")
+            st.caption("Cycle position (20% of composite)")
 
         with col3:
+            st.metric("Composite Score", f"{comp:.2f}" if pd.notna(comp) else "n/a")
+            st.caption("Quality × 0.80 + Trend × 0.20")
+
+        with col4:
+            # True calibration impact: compare quality scores with different weights
             current_sum = df_contrib["Current Contrib"].sum() if len(df_contrib) else np.nan
-            if pd.notna(current_sum):
-                st.metric("Current Calibration", f"{current_sum:.2f}")
-                st.caption("Sum using current weights")
-                if pd.notna(comp):
-                    impact = current_sum - comp
-                    st.caption(f"Impact: {impact:+.2f} points")
-            else:
-                st.metric("Current Calibration", "N/A")
+            calibration_impact = (current_sum - original_sum) if pd.notna(current_sum) and pd.notna(original_sum) else np.nan
+            st.metric("Weight Impact", f"{calibration_impact:+.2f}" if pd.notna(calibration_impact) else "n/a")
+            st.caption("Current vs Universal weights")
 
-        # Interpretation guidance
-        # Interpretation guidance
-        if pd.notna(comp) and pd.notna(current_sum):
-            impact = current_sum - comp
-            if abs(impact) > 5.0:
+        # Show calibration impact message only when there's actual weight difference
+        if pd.notna(calibration_impact):
+            if abs(calibration_impact) > 5.0:
                 st.warning(f"""
-                **⚠️ Significant Calibration Impact ({impact:+.2f} points)**
-
-                Current active weights would change this issuer's score by {impact:+.2f} points
-                compared to the stored composite score. This indicates Dynamic Calibration is making
-                substantial weight adjustments for this sector/classification.
+                **⚠️ Significant Calibration Impact ({calibration_impact:+.2f} points on Quality Score)**
+                
+                Dynamic Calibration is making substantial weight adjustments for this sector/classification,
+                changing the Quality Score by {calibration_impact:+.2f} points compared to universal weights.
                 """)
-            elif abs(impact) > 1.0:
+            elif abs(calibration_impact) > 1.0:
                 st.info(f"""
-                **ℹ️ Moderate Calibration Impact ({impact:+.2f} points)**
-
-                Current active weights adjust this issuer's score by {impact:+.2f} points.
-                This shows Dynamic Calibration is tailoring weights for this classification.
+                **ℹ️ Moderate Calibration Impact ({calibration_impact:+.2f} points on Quality Score)**
+                
+                Dynamic Calibration is tailoring weights for this classification,
+                adjusting the Quality Score by {calibration_impact:+.2f} points.
                 """)
-            elif abs(impact) > 0.1:
+            elif abs(calibration_impact) > 0.1:
                 st.success(f"""
-                **✓ Minor Calibration Impact ({impact:+.2f} points)**
-
-                Current active weights produce minimal change ({impact:+.2f} points).
-                If Dynamic Calibration is ON, sector adjustments are minor for this issuer.
-                If OFF, this confirms weights match universal baseline.
+                **✓ Minor Calibration Impact ({calibration_impact:+.2f} points on Quality Score)**
+                
+                Weight adjustments produce minimal change. If Dynamic Calibration is OFF,
+                this confirms weights match the universal baseline.
+                """)
+            else:
+                st.success("""
+                **✓ No Calibration Impact**
+                
+                Current weights match universal baseline (20/25/20/10/25).
+                No weight adjustments are being applied.
                 """)
 # ================================
 
@@ -7226,7 +7833,7 @@ if period_mode == PeriodSelectionMode.REFERENCE_ALIGNED:
                 # Try multi-index first, fall back to single index
                 try:
                     raw_df = pd.read_excel(uploaded_file_ref, sheet_name='Pasted Values', header=[0, 1])
-                except:
+                except Exception:
                     raw_df = pd.read_excel(uploaded_file_ref, sheet_name='Pasted Values')
 
             # Normalize headers
@@ -7388,7 +7995,7 @@ st.session_state['calibration_rating_band'] = calibration_rating_band
 # [V2.3] DUAL-HORIZON CONTEXT PARAMETERS (using recommended defaults)
 # ============================================================================
 # Advanced controls removed for simplicity - using tested default values
-volatility_cv_threshold = 0.30
+volatility_cv_threshold = MODEL_THRESHOLDS['volatility_cv']
 outlier_z_threshold = -2.5
 damping_factor = 0.5
 near_peak_tolerance = 10
@@ -7473,7 +8080,7 @@ def extract_raw_financials_from_input(df_original: pd.DataFrame, company_name: s
             if pd.isna(val):
                 return default
             return val
-        except:
+        except Exception:
             return default
 
     def safe_get_numeric(column_name, default=None):
@@ -7493,7 +8100,7 @@ def extract_raw_financials_from_input(df_original: pd.DataFrame, company_name: s
                     # Conversion failed (e.g., 'NM', 'N/A'), return default
                     return default
             return val
-        except:
+        except Exception:
             return default
 
     def safe_get_by_key(metric_key, suffix='', default=None):
@@ -7521,7 +8128,7 @@ def extract_raw_financials_from_input(df_original: pd.DataFrame, company_name: s
                     return default
 
             return val
-        except:
+        except Exception:
             return default
 
     # Extract ALL financial metrics from the spreadsheet
@@ -7643,6 +8250,124 @@ def extract_raw_financials_from_input(df_original: pd.DataFrame, company_name: s
     return raw_data
 
 
+def calculate_peer_context_for_scoring(
+    df: pd.DataFrame,
+    idx: int,
+    classification: str,
+    rating: str
+) -> dict:
+    """
+    Calculate peer context during scoring pipeline.
+    
+    This is called ONCE per issuer during scoring, and the result
+    is stored in diagnostic_data for later use by GenAI tab.
+    
+    Args:
+        df: Full DataFrame with all issuers
+        idx: Index of current issuer
+        classification: Issuer's Rubrics Custom Classification
+        rating: Issuer's cleaned credit rating
+    
+    Returns:
+        dict: Peer context with medians and percentiles
+    """
+    
+    # Define metrics to compare (using METRIC_REGISTRY)
+    metrics_config = {
+        'ebitda_margin': {'higher_is_better': True},
+        'roe': {'higher_is_better': True},
+        'roa': {'higher_is_better': True},
+        'total_debt_ebitda': {'higher_is_better': False},
+        'net_debt_ebitda': {'higher_is_better': False},
+        'current_ratio': {'higher_is_better': True},
+        'quick_ratio': {'higher_is_better': True},
+        'ebitda_interest': {'higher_is_better': True},
+        'revenue_1y_growth': {'higher_is_better': True},
+        'revenue_3y_cagr': {'higher_is_better': True},
+    }
+    
+    # Get column names from registry
+    def get_col(metric_key):
+        if metric_key in METRIC_REGISTRY:
+            return METRIC_REGISTRY[metric_key]['canonical']
+        return None
+    
+    # Build column mapping
+    metric_columns = {}
+    for key in metrics_config:
+        col = get_col(key)
+        if col and col in df.columns:
+            metric_columns[key] = col
+    
+    # Get sector peers
+    classification_col = df.get('Rubrics_Custom_Classification', df.get('Rubrics Custom Classification', pd.Series()))
+    sector_peers = df[classification_col == classification].copy() if len(classification_col) > 0 else pd.DataFrame()
+    
+    # Get rating peers
+    rating_col = df.get('_Credit_Rating_Clean', df.get('Credit_Rating_Clean', pd.Series()))
+    rating_peers = df[rating_col == rating].copy() if len(rating_col) > 0 else pd.DataFrame()
+    
+    # Calculate medians and percentiles
+    sector_medians = {}
+    sector_percentiles = {}
+    rating_medians = {}
+    rating_percentiles = {}
+    
+    # Get company's own values
+    company_row = df.loc[idx]
+    
+    for metric_key, col_name in metric_columns.items():
+        higher_is_better = metrics_config[metric_key]['higher_is_better']
+        
+        # Company value
+        company_val = company_row.get(col_name)
+        if pd.isna(company_val):
+            continue
+        try:
+            company_val = float(company_val)
+        except (ValueError, TypeError):
+            continue
+        
+        # Sector comparison
+        if len(sector_peers) > 0 and col_name in sector_peers.columns:
+            numeric_vals = pd.to_numeric(sector_peers[col_name], errors='coerce').dropna()
+            if len(numeric_vals) > 0:
+                sector_medians[metric_key] = float(numeric_vals.median())
+                # Calculate percentile
+                if higher_is_better:
+                    pct = (numeric_vals < company_val).sum() / len(numeric_vals) * 100
+                else:
+                    pct = (numeric_vals > company_val).sum() / len(numeric_vals) * 100
+                sector_percentiles[metric_key] = round(pct, 1)
+        
+        # Rating comparison
+        if len(rating_peers) > 0 and col_name in rating_peers.columns:
+            numeric_vals = pd.to_numeric(rating_peers[col_name], errors='coerce').dropna()
+            if len(numeric_vals) > 0:
+                rating_medians[metric_key] = float(numeric_vals.median())
+                # Calculate percentile
+                if higher_is_better:
+                    pct = (numeric_vals < company_val).sum() / len(numeric_vals) * 100
+                else:
+                    pct = (numeric_vals > company_val).sum() / len(numeric_vals) * 100
+                rating_percentiles[metric_key] = round(pct, 1)
+    
+    return {
+        'sector_comparison': {
+            'classification': classification,
+            'peer_count': len(sector_peers),
+            'medians': sector_medians,
+            'percentiles': sector_percentiles,
+        },
+        'rating_comparison': {
+            'rating': rating,
+            'peer_count': len(rating_peers),
+            'medians': rating_medians,
+            'percentiles': rating_percentiles,
+        }
+    }
+
+
 def calculate_peer_context(df_original: pd.DataFrame, raw_financials: dict) -> dict:
     """
     Calculate peer medians and percentile rankings.
@@ -7658,6 +8383,16 @@ def calculate_peer_context(df_original: pd.DataFrame, raw_financials: dict) -> d
 
     classification = raw_financials['company_info']['classification']
     rating = raw_financials['company_info']['sp_rating_clean']
+
+    # =========================================================================
+    # CACHING: Peer context only depends on classification + rating
+    # Cache to avoid recalculating for same peer group
+    # =========================================================================
+    cache_key = f"_peer_context_cache_{classification}_{rating}"
+    
+    # Return cached result if available
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
 
     # Check for missing or NaN values (handle None, empty string, NaN)
     def is_valid_value(val):
@@ -7711,17 +8446,12 @@ def calculate_peer_context(df_original: pd.DataFrame, raw_financials: dict) -> d
     sector_medians = {}
     sector_percentiles = {}
 
+    # Derive from METRIC_REGISTRY - single source of truth
+    _compare_keys = ['ebitda_margin', 'roe', 'roa', 'total_debt_ebitda', 'net_debt_ebitda',
+                     'current_ratio', 'quick_ratio', 'ebitda_interest', 'revenue_1y_growth', 'revenue_3y_cagr']
     metrics_to_compare = {
-        'ebitda_margin': ('EBITDA Margin', True),
-        'roe': ('Return on Equity', True),
-        'roa': ('Return on Assets', True),
-        'total_debt_ebitda': ('Total Debt / EBITDA (x)', False),  # Lower is better
-        'net_debt_ebitda': ('Net Debt / EBITDA', False),
-        'current_ratio': ('Current Ratio (x)', True),
-        'quick_ratio': ('Quick Ratio (x)', True),
-        'ebitda_interest': ('EBITDA/ Interest Expense (x)', True),  # NO space before /
-        'revenue_1y_growth': ('Total Revenues, 1 Year Growth', True),
-        'revenue_3y_cagr': ('Total Revenues, 3 Yr. CAGR', True),
+        k: (METRIC_REGISTRY[k]['canonical'], METRIC_REGISTRY[k]['higher_is_better'])
+        for k in _compare_keys if k in METRIC_REGISTRY
     }
 
     for metric_key, (col_name, higher_is_better) in metrics_to_compare.items():
@@ -7797,6 +8527,9 @@ def calculate_peer_context(df_original: pd.DataFrame, raw_financials: dict) -> d
         }
     }
 
+    # Cache the result before returning
+    st.session_state[cache_key] = peer_context
+
     return peer_context
 
 
@@ -7852,7 +8585,7 @@ def extract_model_outputs(results_df: pd.DataFrame, company_name: str,
             "leverage_score": result.get('Leverage_Score'),
             "profitability_score": result.get('Profitability_Score'),
             "liquidity_score": result.get('Liquidity_Score'),
-            "growth_score": result.get('Growth_Score'),
+
             "cash_flow_score": result.get('Cash_Flow_Score'),
         },
 
@@ -7866,7 +8599,7 @@ def extract_model_outputs(results_df: pd.DataFrame, company_name: str,
             "leverage_weight": weights_used.get('leverage_score'),
             "profitability_weight": weights_used.get('profitability_score'),
             "liquidity_weight": weights_used.get('liquidity_score'),
-            "growth_weight": weights_used.get('growth_score'),
+
             "cash_flow_weight": weights_used.get('cash_flow_score'),
             "source": weights_source,
         },
@@ -7881,8 +8614,384 @@ def extract_model_outputs(results_df: pd.DataFrame, company_name: str,
             "critical_note": "CRITICAL: Model scores represent RELATIVE POSITIONING after sector calibration, NOT absolute credit quality. Low scores can reflect 'average within advantaged sector', not weak fundamentals. ALWAYS check raw metrics first."
         }
     }
-
     return model_outputs
+
+def _extract_trend_summary_for_genai(time_series_data: dict) -> dict:
+    """
+    Extract trend summary from time series diagnostic data for GenAI prompt.
+    
+    READ-ONLY: Only reads from pre-computed diagnostic data.
+    Includes bounding information so AI can appropriately caveat analysis.
+    
+    Args:
+        time_series_data: Dict of metric -> time series diagnostic data
+        
+    Returns:
+        dict: Summary of trends with bounding flags
+    """
+    summary = {
+        'metrics': {},
+        'bounded_metrics': [],
+        'has_bounded_data': False
+    }
+    
+    key_metrics = [
+        'EBITDA / Interest Expense (x)',
+        'Total Debt / EBITDA (x)',
+        'Net Debt / EBITDA',
+        'EBITDA Margin',
+        'Levered Free Cash Flow Margin',
+        'Revenue'
+    ]
+    
+    for metric in key_metrics:
+        if metric not in time_series_data:
+            continue
+            
+        ts = time_series_data[metric]
+        values = ts.get('values', [])
+        
+        if not values or len(values) < 2:
+            continue
+        
+        metric_summary = {
+            'start_value': values[0] if values else None,
+            'end_value': values[-1] if values else None,
+            'trend_direction': ts.get('trend_direction', 0),
+            'classification': ts.get('classification', 'STABLE'),
+            'momentum': ts.get('momentum', 50),
+            'volatility': ts.get('volatility', 50),
+            'periods_count': ts.get('periods_count', len(values)),
+            'fallback_bounded': ts.get('fallback_bounded', False),
+        }
+        
+        if ts.get('fallback_bounded', False):
+            metric_summary['bound_limits'] = ts.get('bound_limits', {})
+            summary['bounded_metrics'].append(metric)
+            summary['has_bounded_data'] = True
+        
+        summary['metrics'][metric] = metric_summary
+    
+    return summary
+
+def get_genai_data_from_diagnostics(results_df, company_name, use_sector_adjusted=True, calibrated_weights=None):
+    """
+    Extract data for GenAI prompt generation directly from the diagnostic data structure.
+    Args:
+        results_df: Model scoring results DataFrame (contains diagnostic_data column)
+        company_name: Company to analyze
+        use_sector_adjusted: Whether sector calibration is enabled
+        calibrated_weights: Dynamic calibration weights (if enabled)
+    
+    Returns:
+        dict: Complete data package for GenAI, or None if diagnostics unavailable
+    """
+    try:
+        # Find company row
+        company_mask = results_df['Company_Name'] == company_name
+        if not company_mask.any():
+            return None
+        
+        company_row = results_df[company_mask].iloc[0]
+        
+        # Check if diagnostic data exists
+        diagnostic_json = company_row.get('diagnostic_data')
+        if pd.isna(diagnostic_json) or not diagnostic_json:
+            return None
+        
+        # Parse diagnostic JSON
+        try:
+            diag = json.loads(diagnostic_json)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        
+        # Verify required keys exist
+        required_keys = ['factor_details', 'time_series', 'composite_calculation']
+        if not all(k in diag for k in required_keys):
+            return None
+        
+        # Extract company info from results row
+        company_info = {
+            "name": str(company_row.get('Company_Name', '')),
+            "ticker": str(company_row.get('Ticker', 'N/A')),
+            "country": str(company_row.get('Country', 'N/A')),
+            "region": str(company_row.get('Region', 'N/A')),
+            "sector": str(company_row.get('Sector', 'N/A')),
+            "industry": str(company_row.get('Industry', 'N/A')),
+            "industry_group": str(company_row.get('Industry_Group', 'N/A')),
+            "classification": str(company_row.get('Rubrics_Custom_Classification', 'N/A')),
+            "sp_rating": str(company_row.get('Credit_Rating_Clean', 'NR')),
+            "sp_rating_clean": str(company_row.get('Credit_Rating_Clean', 'NR')),
+            "rating_date": str(company_row.get('S&P_Last_Review_Date', 'N/A')),
+            "market_cap": float(company_row.get('Market_Cap')) if pd.notna(company_row.get('Market_Cap')) else None,
+        }
+        
+        # Extract raw inputs from diagnostic data
+        raw_inputs = diag.get('raw_inputs', {})
+        
+        # Add reporting currency to company_info (must be after raw_inputs is defined)
+        company_info["reporting_currency"] = raw_inputs.get('Reported_Currency', 'USD')
+        
+        # Map diagnostic raw_inputs to GenAI raw_financials format
+        raw_financials = {
+            "company_info": company_info,
+            
+            "profitability": _extract_profitability_from_diagnostics(diag, company_row),
+            "leverage": _extract_leverage_from_diagnostics(diag, company_row, raw_inputs),
+            "liquidity": _extract_liquidity_from_diagnostics(diag, company_row, raw_inputs),
+            "coverage": _extract_coverage_from_diagnostics(diag, company_row),
+            "growth": _extract_growth_from_diagnostics(diag, company_row),
+            "cash_flow": _extract_cashflow_from_diagnostics(diag, company_row, raw_inputs),
+        }
+        
+        # Extract model outputs
+        composite_calc = diag.get('composite_calculation', {})
+        factor_details = diag.get('factor_details', {})
+        
+        model_outputs = {
+            "overall_metrics": {
+                "composite_score": composite_calc.get('composite_score'),
+                "rating_band": str(company_row.get('Rating_Band', 'N/A')),
+                "signal": str(company_row.get('Signal', 'N/A')),
+                "recommendation": str(company_row.get('Recommendation', 'N/A')),
+            },
+            "factor_scores": {
+                "credit_score": _safe_get_factor_score(factor_details, 'Credit'),
+                "leverage_score": _safe_get_factor_score(factor_details, 'Leverage'),
+                "profitability_score": _safe_get_factor_score(factor_details, 'Profitability'),
+                "liquidity_score": _safe_get_factor_score(factor_details, 'Liquidity'),
+                "cash_flow_score": _safe_get_factor_score(factor_details, 'Cash_Flow'),
+            },
+            "quality_vs_trend": {
+                "quality_score": composite_calc.get('quality_score'),
+                "trend_score": composite_calc.get('trend_score'),
+            },
+            "weights_applied": {
+                "credit_weight": _safe_get_weight(composite_calc, 'Credit'),
+                "leverage_weight": _safe_get_weight(composite_calc, 'Leverage'),
+                "profitability_weight": _safe_get_weight(composite_calc, 'Profitability'),
+                "liquidity_weight": _safe_get_weight(composite_calc, 'Liquidity'),
+                "cash_flow_weight": _safe_get_weight(composite_calc, 'Cash_Flow'),
+                "source": composite_calc.get('weight_method', 'Universal') + " (No sector adjustment)" if not use_sector_adjusted else " (Sector-adjusted)",
+            },
+            "sector_context": {
+                "classification": company_info['classification'],
+                "sector": company_info['sector'],
+                "calibration_enabled": use_sector_adjusted,
+            },
+            "scoring_methodology": {
+                "critical_note": "CRITICAL: Model scores represent RELATIVE POSITIONING after sector calibration, NOT absolute credit quality. Low scores can reflect 'average within advantaged sector', not weak fundamentals. ALWAYS check raw metrics first."
+            }
+        }
+        
+        # Get peer context from diagnostics (pre-computed during scoring)
+        peer_context = diag.get('peer_context')
+        
+
+        # Extract time series data for trend analysis (READ-ONLY from diagnostics)
+        time_series_data = diag.get('time_series', {})
+        trend_summary = _extract_trend_summary_for_genai(time_series_data)
+        
+        return {
+            "company_name": company_name,
+            "raw_financials": raw_financials,
+            "model_outputs": model_outputs,
+            "peer_context": peer_context,  # Now from diagnostics, not calculated on-demand
+            "trend_details": trend_summary,  # Trend data with bounding info (READ-ONLY)
+            "from_diagnostics": True,  # Flag indicating data source
+            "data_sources": {
+                "raw_metrics": "Pre-computed diagnostic data (from scoring pipeline)",
+                "model_scores": "Pre-computed diagnostic data",
+                "peer_data": "Pre-computed during scoring (from diagnostics)" if peer_context else "Needs separate calculation",
+            },
+            "generation_timestamp": pd.Timestamp.now().isoformat(),
+            "calibration_info": {
+                "sector_adjusted": use_sector_adjusted,
+                "dynamic_calibration": calibrated_weights is not None,
+                "weights_source": model_outputs['weights_applied']['source'],
+            }
+        }
+        
+    except Exception as e:
+        pass  # Silently handle diagnostic extraction errors
+        return None
+
+
+def _safe_get_factor_score(factor_details: dict, factor_name: str) -> Optional[float]:
+    """Safely extract factor score from diagnostic data."""
+    factor = factor_details.get(factor_name, {})
+    score = factor.get('final_score') or factor.get('score')
+    return float(score) if score is not None else None
+
+
+def _safe_get_weight(composite_calc: dict, factor_name: str) -> float:
+    """Safely extract factor weight from composite calculation."""
+    contributions = composite_calc.get('factor_contributions', {})
+    factor_contrib = contributions.get(factor_name, {})
+    return float(factor_contrib.get('weight', 0.0))
+
+
+def _extract_leverage_from_diagnostics(diag: dict, row: pd.Series, raw_inputs: dict) -> dict:
+    """Extract leverage metrics from diagnostic factor details."""
+    lev_details = diag.get('factor_details', {}).get('Leverage', {})
+    components = lev_details.get('components', {})
+    
+    # Get raw values from components (already computed during scoring)
+    net_debt_ebitda = _get_component_raw_value(components, 'Net_Debt_EBITDA')
+    debt_capital = _get_component_raw_value(components, 'Debt_Capital_Ratio')
+    
+    # Get absolute values from raw_inputs
+    total_debt = raw_inputs.get('Total Debt')
+    total_equity = raw_inputs.get('Total Equity')
+    ebitda = raw_inputs.get('EBITDA')
+    cash = raw_inputs.get('Cash & ST Investments')
+    
+    # Calculate Total Debt/EBITDA if we have the values and it's not in components
+    total_debt_ebitda = None
+    if total_debt is not None and ebitda is not None and ebitda != 0:
+        total_debt_ebitda = total_debt / ebitda
+    
+    # Calculate net debt
+    net_debt = None
+    if total_debt is not None and cash is not None:
+        net_debt = total_debt - cash
+    
+    return {
+        "total_debt": total_debt,
+        "net_debt": net_debt,
+        "total_equity": total_equity,
+        "total_debt_ebitda": total_debt_ebitda if total_debt_ebitda is not None else raw_inputs.get('Total Debt / EBITDA'),
+        "net_debt_ebitda": net_debt_ebitda,
+        "total_debt_equity": raw_inputs.get('Debt to Equity'),
+        "total_debt_capital": debt_capital,
+    }
+
+
+def _extract_profitability_from_diagnostics(diag: dict, row: pd.Series) -> dict:
+    """Extract profitability metrics from diagnostic factor details."""
+    prof_details = diag.get('factor_details', {}).get('Profitability', {})
+    components = prof_details.get('components', {})
+    raw_inputs = diag.get('raw_inputs', {})
+    
+    return {
+        "ebitda_margin": _get_component_raw_value(components, 'EBITDA_Margin'),
+        "gross_margin": _get_component_raw_value(components, 'Gross_Profit_Margin'),
+        "ebit_margin": raw_inputs.get('Operating Margin'),
+        "operating_margin": raw_inputs.get('Operating Margin'),
+        "net_margin": raw_inputs.get('Net Profit Margin'),
+        "roe": raw_inputs.get('Return on Equity'),
+        "roa": _get_component_raw_value(components, 'ROA'),
+        "roic": raw_inputs.get('ROIC'),
+    }
+
+
+def _extract_liquidity_from_diagnostics(diag: dict, row: pd.Series, raw_inputs: dict) -> dict:
+    """Extract liquidity metrics from diagnostic data."""
+    liq_details = diag.get('factor_details', {}).get('Liquidity', {})
+    components = liq_details.get('components', {})
+    
+    return {
+        "current_ratio": _get_component_raw_value(components, 'Current_Ratio'),
+        "quick_ratio": _get_component_raw_value(components, 'Quick_Ratio'),
+        "cash_st_investments": raw_inputs.get('Cash & ST Investments'),
+        "current_assets": raw_inputs.get('Current Assets'),
+        "current_liabilities": raw_inputs.get('Current Liabilities'),
+        "working_capital": None,  # Can be calculated if needed
+    }
+
+
+def _extract_coverage_from_diagnostics(diag: dict, row: pd.Series) -> dict:
+    """Extract coverage metrics from diagnostic data."""
+    lev_details = diag.get('factor_details', {}).get('Leverage', {})
+    components = lev_details.get('components', {})
+    
+    # Time series may have the coverage data too
+    time_series = diag.get('time_series', {})
+    coverage_ts = time_series.get('EBITDA / Interest Expense (x)', {})
+    
+    # Get most recent value from time series if available
+    coverage_value = _get_component_raw_value(components, 'Interest_Coverage')
+    if coverage_value is None and coverage_ts:
+        values = coverage_ts.get('values', [])
+        if values:
+            coverage_value = values[-1]  # Most recent
+    
+    return {
+        "ebitda_interest": coverage_value,
+        "ebit_interest": None,  # Not typically in diagnostics
+        "interest_expense": diag.get('raw_inputs', {}).get('Interest Expense'),
+    }
+
+
+def _extract_growth_from_diagnostics(diag: dict, row: pd.Series) -> dict:
+    """Extract growth metrics from diagnostic data."""
+    time_series = diag.get('time_series', {})
+    raw_inputs = diag.get('raw_inputs', {})  # Get raw_inputs from diagnostic data
+    
+    # Get growth rates from time series trend_direction if available
+    revenue_ts = time_series.get('Revenue', {})
+    ebitda_ts = time_series.get('EBITDA', {}) or time_series.get('EBITDA Margin', {})
+    
+    return {
+        "revenue_1y_growth": raw_inputs.get('Revenue 1Y Growth'),
+        "revenue_3y_cagr": raw_inputs.get('Revenue 3Y CAGR'),
+        "ebitda_3y_cagr": raw_inputs.get('EBITDA 3Y CAGR'),
+        "total_revenues": raw_inputs.get('Total Revenue'),
+        "ebitda": raw_inputs.get('EBITDA'),
+    }
+
+
+def _extract_cashflow_from_diagnostics(diag: dict, row: pd.Series, raw_inputs: dict) -> dict:
+    """Extract cash flow metrics from diagnostic data."""
+    cf_details = diag.get('factor_details', {}).get('Cash_Flow', {})
+    components = cf_details.get('components', {})
+    
+    # Try raw_inputs first (absolute values)
+    cfo = raw_inputs.get('Operating Cash Flow')
+    capex = raw_inputs.get('Capital Expenditures')
+    lfcf = raw_inputs.get('Levered Free Cash Flow')
+    ufcf = raw_inputs.get('Unlevered Free Cash Flow')
+    total_debt = raw_inputs.get('Total Debt')
+    
+    # Calculate CFO/Debt if we have the values
+    cfo_total_debt = None
+    if cfo is not None and total_debt is not None and total_debt != 0:
+        cfo_total_debt = (cfo / total_debt) * 100
+    
+    # Fallback: get ratios from scored components (these are always available)
+    ocf_to_debt_ratio = _get_component_raw_value(components, 'OCF_to_Debt')
+    ocf_to_revenue_ratio = _get_component_raw_value(components, 'OCF_to_Revenue')
+    ufcf_margin = _get_component_raw_value(components, 'UFCF_Margin')
+    lfcf_margin = _get_component_raw_value(components, 'LFCF_Margin')
+    
+    # Use component ratio if direct calculation not available
+    if cfo_total_debt is None and ocf_to_debt_ratio is not None:
+        cfo_total_debt = ocf_to_debt_ratio * 100  # Convert to percentage
+    
+    return {
+        "cfo": cfo,
+        "capex": capex,
+        "fcf": lfcf,  # Levered FCF is more relevant for credit
+        "ufcf": ufcf,
+        "cfo_total_debt": cfo_total_debt,
+        "fcf_total_debt": None,
+        # Additional ratios from components (always available from scoring)
+        "ocf_to_revenue": (ocf_to_revenue_ratio * 100) if ocf_to_revenue_ratio else None,
+        "ufcf_margin": (ufcf_margin * 100) if ufcf_margin else None,
+        "lfcf_margin": (lfcf_margin * 100) if lfcf_margin else None,
+    }
+
+
+def _get_component_raw_value(components: dict, component_name: str) -> Optional[float]:
+    """Safely get raw_value from a component dict."""
+    component = components.get(component_name, {})
+    raw_val = component.get('raw_value')
+    if raw_val is not None:
+        try:
+            return float(raw_val)
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def prepare_genai_credit_report_data(
@@ -7894,22 +9003,55 @@ def prepare_genai_credit_report_data(
 ) -> dict:
     """
     MASTER FUNCTION: Combines all data sources for GenAI credit report.
-
-    This is the function that should be called from the UI when user
-    requests a credit report.
+    
+    OPTIMIZATION: First tries to use pre-computed diagnostic data (fast path).
+    Falls back to spreadsheet extraction only if diagnostics unavailable.
 
     Args:
-        df_original: Raw input spreadsheet data (the uploaded Excel file)
-        results_df: Model scoring results from app.py
-        company_name: Company to analyze
-        use_sector_adjusted: Whether sector calibration is enabled
-        calibrated_weights: Dynamic calibration weights (if enabled)
+        df_original: Raw input DataFrame (source of truth for financials)
+        results_df: Model outputs (source of scores/signals)
+        company_name: Selected company
+        use_sector_adjusted: Whether to use sector-adjusted scores
+        calibrated_weights: Optional dynamic weights
 
     Returns:
-        dict: Complete data package for GenAI with raw metrics, model scores, and peer context
+        dict: Complete data package for GenAI prompt
     """
 
     try:
+        # =====================================================================
+        # FAST PATH: Try to get data from pre-computed diagnostics first
+        # =====================================================================
+        diag_data = get_genai_data_from_diagnostics(
+            results_df=results_df,
+            company_name=company_name,
+            use_sector_adjusted=use_sector_adjusted,
+            calibrated_weights=calibrated_weights
+        )
+        
+        if diag_data is not None:
+            # Got data from diagnostics - peer context is already included!
+            if diag_data.get('peer_context') is None:
+                # Fallback: calculate if not in diagnostics (legacy data)
+                classification = diag_data['raw_financials']['company_info'].get('classification', 'Unknown')
+                rating = diag_data['raw_financials']['company_info'].get('sp_rating_clean', 'Unknown')
+                peer_cache_key = f"_peer_context_cache_{classification}_{rating}"
+                
+                if peer_cache_key in st.session_state:
+                    diag_data['peer_context'] = st.session_state[peer_cache_key]
+                else:
+                    peer_context = calculate_peer_context(df_original, diag_data['raw_financials'])
+                    if "error" not in peer_context:
+                        st.session_state[peer_cache_key] = peer_context
+                    diag_data['peer_context'] = peer_context
+            
+            diag_data['data_sources']['peer_data'] = "Pre-computed during scoring (from diagnostics)"
+            return diag_data
+        
+        # =====================================================================
+        # SLOW PATH: Fall back to spreadsheet extraction
+        # =====================================================================
+        
         # Step 1: Get raw financials from input spreadsheet (SOURCE OF TRUTH)
         raw_financials = extract_raw_financials_from_input(df_original, company_name)
 
@@ -7968,22 +9110,70 @@ def prepare_genai_credit_report_data(
         return {"error": f"Error preparing data: {str(e)}"}
 
 
+def _build_trend_section_for_prompt(trend_details: dict, trend_score: float) -> str:
+    """
+    Build the trend analysis section of the GenAI prompt with bounding context.
+    
+    READ-ONLY: Only formats data from pre-computed diagnostics.
+    """
+    def fmt_score(val):
+        if val is None or pd.isna(val):
+            return "N/A"
+        return f"{val:.1f}"
+    
+    section = f"(4-5 sentences) Based on the Trend Score of {fmt_score(trend_score)}/100:\n"
+    section += "- Characterize the trajectory (improving, stable, deteriorating)\n"
+    section += "- Identify which metrics are driving the trend\n"
+    section += "- Discuss potential catalysts for improvement or further deterioration\n"
+    section += "- Note any concerning patterns\n"
+    
+    # Add metric-level trend details
+    metrics = trend_details.get('metrics', {})
+    if metrics:
+        section += "\n**Trend Details by Metric:**\n"
+        for metric_name, metric_data in metrics.items():
+            classification = metric_data.get('classification', 'STABLE')
+            direction = metric_data.get('trend_direction', 0)
+            start = metric_data.get('start_value')
+            end = metric_data.get('end_value')
+            
+            if start is not None and end is not None:
+                section += f"- {metric_name}: {classification} ({start:.2f} -> {end:.2f}, {direction:+.1f}%/year)"
+                if metric_data.get('fallback_bounded', False):
+                    bounds = metric_data.get('bound_limits', {})
+                    section += f" [BOUNDED: values capped to CIQ range {bounds.get('min', 0)}-{bounds.get('max', 'N/A')}]"
+                section += "\n"
+    
+    # Add explicit bounding caveat if any metrics were bounded
+    if trend_details.get('has_bounded_data', False):
+        bounded_list = trend_details.get('bounded_metrics', [])
+        section += "\n**[DATA NOTE]** The following metrics contain bounded fallback values: " + ", ".join(bounded_list) + ".\n"
+        section += "This occurs when Capital IQ reported \"NM\" (Not Meaningful) for certain periods, and the app calculated the ratio from components. "
+        section += "Extreme calculated values (outside CIQ's observed range) were capped to maintain comparability. "
+        section += "This typically indicates very low interest expense or structural capital changes - often a POSITIVE credit signal. "
+        section += "When analyzing trends for these metrics, focus on the DIRECTION of change rather than the exact magnitude.\n"
+    
+    return section
+
+
 def build_comprehensive_credit_prompt(data: dict) -> str:
     """
-    Build GenAI prompt with clear data hierarchy and interpretation guidance.
-    Emphasizes raw metrics over model scores.
-
+    Build GenAI prompt for credit analysis report.
+    
     Args:
         data: Complete data package from prepare_genai_credit_report_data()
-
+    
     Returns:
         str: Formatted prompt for LLM
     """
-
+    
     raw = data['raw_financials']
     model = data['model_outputs']
     peers = data['peer_context']
-
+    
+    # Get currency symbol
+    curr_sym = get_currency_symbol(raw.get('company_info', {}).get('reporting_currency', 'USD'))
+    
     # Helper function to format metric safely
     def fmt(value, decimals=2, suffix=''):
         if value is None or pd.isna(value):
@@ -7993,220 +9183,161 @@ def build_comprehensive_credit_prompt(data: dict) -> str:
         elif suffix == 'x':
             return f"{value:.{decimals}f}x"
         elif suffix == 'B':
-            return f"${value/1000:.1f}B"
+            return f"{curr_sym}{value/1000000:.1f}B"
         else:
             return f"{value:.{decimals}f}"
+    
+    # Extract key values for easier reference
+    company_name = raw['company_info']['name']
+    ticker = raw['company_info']['ticker']
+    sp_rating = raw['company_info']['sp_rating']
+    sector = raw['company_info']['sector']
+    classification = raw['company_info']['classification']
+    
+    recommendation = model['overall_metrics']['recommendation']
+    signal = model['overall_metrics']['signal']
+    quality_score = model['quality_vs_trend']['quality_score']
+    trend_score = model['quality_vs_trend']['trend_score']
+    
+    prompt = f"""You are a senior credit analyst at a fixed income investment manager. Write a credit opinion for the portfolio management team.
 
-    prompt = f"""# CREDIT ANALYSIS REPORT: {data['company_name']}
+---
+## ISSUER DATA
 
-You are generating a professional credit analysis report. You have access to THREE data sources with a CLEAR HIERARCHY:
+**Company:** {company_name} ({ticker})
+**S&P Rating:** {sp_rating}
+**Sector:** {sector} / {classification}
 
-## DATA SOURCE #1: RAW FINANCIAL METRICS (PRIMARY - SOURCE OF TRUTH)
+### Current Financials (LTM)
 
-These come directly from the input spreadsheet and represent ACTUAL company fundamentals.
-Use these metrics as the FOUNDATION of your analysis.
+| Category | Metric | Value | Sector Median | Percentile |
+|----------|--------|-------|---------------|------------|
+| Profitability | EBITDA Margin | {fmt(raw['profitability']['ebitda_margin'], 1, '%')} | {fmt(peers['sector_comparison']['medians'].get('ebitda_margin'), 1, '%')} | {fmt(peers['sector_comparison']['percentiles'].get('ebitda_margin'), 0)}%ile |
+| Profitability | ROE | {fmt(raw['profitability']['roe'], 1, '%')} | {fmt(peers['sector_comparison']['medians'].get('roe'), 1, '%')} | {fmt(peers['sector_comparison']['percentiles'].get('roe'), 0)}%ile |
+| Profitability | ROA | {fmt(raw['profitability']['roa'], 1, '%')} | N/A | N/A |
+| Leverage | Total Debt/EBITDA | {fmt(raw['leverage']['total_debt_ebitda'], 1, 'x')} | {fmt(peers['sector_comparison']['medians'].get('total_debt_ebitda'), 1, 'x')} | {fmt(peers['sector_comparison']['percentiles'].get('total_debt_ebitda'), 0)}%ile |
+| Leverage | Net Debt/EBITDA | {fmt(raw['leverage']['net_debt_ebitda'], 1, 'x')} | N/A | N/A |
+| Coverage | EBITDA/Interest | {fmt(raw['coverage']['ebitda_interest'], 1, 'x')} | N/A | N/A |
+| Liquidity | Current Ratio | {fmt(raw['liquidity']['current_ratio'], 2, 'x')} | {fmt(peers['sector_comparison']['medians'].get('current_ratio'), 2, 'x')} | {fmt(peers['sector_comparison']['percentiles'].get('current_ratio'), 0)}%ile |
+| Liquidity | Quick Ratio | {fmt(raw['liquidity']['quick_ratio'], 2, 'x')} | N/A | N/A |
+| Liquidity | Cash & ST Inv | {fmt(raw['liquidity']['cash_st_investments'], 1, 'B')} | N/A | N/A |
+| Cash Flow | Operating CF | {fmt(raw['cash_flow']['cfo'], 1, 'B')} | N/A | N/A |
+| Cash Flow | Free Cash Flow | {fmt(raw['cash_flow']['fcf'], 1, 'B')} | N/A | N/A |
+| Cash Flow | CFO/Debt | {fmt(raw['cash_flow']['cfo_total_debt'], 1, '%')} | N/A | N/A |
+| Growth | Revenue One Year | {fmt(raw['growth']['revenue_1y_growth'], 1, '%')} | N/A | N/A |
+| Growth | Revenue CAGR 3 Year | {fmt(raw['growth']['revenue_3y_cagr'], 1, '%')} | N/A | N/A |
 
-### Company Profile
-- Name: {raw['company_info']['name']}
-- Ticker: {raw['company_info']['ticker']}
-- S&P Rating: {raw['company_info']['sp_rating']}
-- Classification: {raw['company_info']['classification']}
-- Sector: {raw['company_info']['sector']}
-
-### Profitability (Actual Metrics from Spreadsheet)
-- EBITDA Margin: {fmt(raw['profitability']['ebitda_margin'], 2, '%')}
-- Return on Equity: {fmt(raw['profitability']['roe'], 2, '%')}
-- Return on Assets: {fmt(raw['profitability']['roa'], 2, '%')}
-- Operating Margin: {fmt(raw['profitability']['operating_margin'], 2, '%')}
-
-### Leverage (Actual Metrics from Spreadsheet)
-- Total Debt/EBITDA: {fmt(raw['leverage']['total_debt_ebitda'], 2, 'x')}
-- Net Debt/EBITDA: {fmt(raw['leverage']['net_debt_ebitda'], 2, 'x')}
+### Capital Structure
 - Total Debt: {fmt(raw['leverage']['total_debt'], 1, 'B')}
-- Total Debt/Equity: {fmt(raw['leverage']['total_debt_equity'], 2, 'x')}
-
-### Coverage (Actual Metrics from Spreadsheet)
-- EBITDA/Interest Expense: {fmt(raw['coverage']['ebitda_interest'], 2, 'x')}
-
-### Liquidity (Actual Metrics from Spreadsheet)
-- Current Ratio: {fmt(raw['liquidity']['current_ratio'], 2, 'x')}
-- Quick Ratio: {fmt(raw['liquidity']['quick_ratio'], 2, 'x')}
 - Cash & ST Investments: {fmt(raw['liquidity']['cash_st_investments'], 1, 'B')}
+- Net Debt: ~{fmt((raw['leverage']['total_debt'] or 0) - (raw['liquidity']['cash_st_investments'] or 0), 1, 'B')}
 
-### Growth (Actual Metrics from Spreadsheet)
-- Revenue Growth (1Y): {fmt(raw['growth']['revenue_1y_growth'], 2, '%')}
-- Revenue CAGR (3Y): {fmt(raw['growth']['revenue_3y_cagr'], 2, '%')}
+### Rating Peer Comparison ({peers['rating_comparison']['rating']}, n={peers['rating_comparison']['peer_count']})
 
-### Cash Flow (Actual Metrics from Spreadsheet)
-- Operating Cash Flow: {fmt(raw['cash_flow']['cfo'], 1, 'B')}
-- Free Cash Flow: {fmt(raw['cash_flow']['fcf'], 1, 'B')}
-- CFO/Total Debt: {fmt(raw['cash_flow']['cfo_total_debt'], 2, '%')}
+| Metric | Issuer | Rating Median | vs Peers |
+|--------|--------|---------------|----------|
+| EBITDA Margin | {fmt(raw['profitability']['ebitda_margin'], 1, '%')} | {fmt(peers['rating_comparison']['medians'].get('ebitda_margin'), 1, '%')} | {fmt(peers['rating_comparison']['percentiles'].get('ebitda_margin'), 0)}%ile |
+| Debt/EBITDA | {fmt(raw['leverage']['total_debt_ebitda'], 1, 'x')} | {fmt(peers['rating_comparison']['medians'].get('total_debt_ebitda'), 1, 'x')} | {fmt(peers['rating_comparison']['percentiles'].get('total_debt_ebitda'), 0)}%ile |
 
----
-
-## DATA SOURCE #2: PEER COMPARISONS (CRITICAL CONTEXT)
-
-These show how the company compares to sector peers and rating peers.
-Use these to determine if metrics are "strong", "average", or "weak".
-
-### Sector Peer Comparison ({peers['sector_comparison']['classification']})
-Peer Count: {peers['sector_comparison']['peer_count']} companies
-
-| Metric | Company Value | Sector Median | Percentile |
-|--------|---------------|---------------|------------|
-| EBITDA Margin | {fmt(raw['profitability']['ebitda_margin'], 2, '%')} | {fmt(peers['sector_comparison']['medians'].get('ebitda_margin'), 2, '%')} | {fmt(peers['sector_comparison']['percentiles'].get('ebitda_margin'), 0)}%ile |
-| ROE | {fmt(raw['profitability']['roe'], 2, '%')} | {fmt(peers['sector_comparison']['medians'].get('roe'), 2, '%')} | {fmt(peers['sector_comparison']['percentiles'].get('roe'), 0)}%ile |
-| Total Debt/EBITDA | {fmt(raw['leverage']['total_debt_ebitda'], 2, 'x')} | {fmt(peers['sector_comparison']['medians'].get('total_debt_ebitda'), 2, 'x')} | {fmt(peers['sector_comparison']['percentiles'].get('total_debt_ebitda'), 0)}%ile |
-| Current Ratio | {fmt(raw['liquidity']['current_ratio'], 2, 'x')} | {fmt(peers['sector_comparison']['medians'].get('current_ratio'), 2, 'x')} | {fmt(peers['sector_comparison']['percentiles'].get('current_ratio'), 0)}%ile |
-
-### Rating Peer Comparison ({peers['rating_comparison']['rating']})
-Peer Count: {peers['rating_comparison']['peer_count']} companies
-
-| Metric | Company Value | Rating Median | Percentile |
-|--------|---------------|---------------|------------|
-| EBITDA Margin | {fmt(raw['profitability']['ebitda_margin'], 2, '%')} | {fmt(peers['rating_comparison']['medians'].get('ebitda_margin'), 2, '%')} | {fmt(peers['rating_comparison']['percentiles'].get('ebitda_margin'), 0)}%ile |
-| ROE | {fmt(raw['profitability']['roe'], 2, '%')} | {fmt(peers['rating_comparison']['medians'].get('roe'), 2, '%')} | {fmt(peers['rating_comparison']['percentiles'].get('roe'), 0)}%ile |
-| Total Debt/EBITDA | {fmt(raw['leverage']['total_debt_ebitda'], 2, 'x')} | {fmt(peers['rating_comparison']['medians'].get('total_debt_ebitda'), 2, 'x')} | {fmt(peers['rating_comparison']['percentiles'].get('total_debt_ebitda'), 0)}%ile |
-| Current Ratio | {fmt(raw['liquidity']['current_ratio'], 2, 'x')} | {fmt(peers['rating_comparison']['medians'].get('current_ratio'), 2, 'x')} | {fmt(peers['rating_comparison']['percentiles'].get('current_ratio'), 0)}%ile |
-
-**INTERPRETATION GUIDE:**
-- Percentile >75%: Strong/Exceptional (for positive metrics) or Weak (for leverage - higher percentile = lower leverage = better)
-- Percentile 50-75%: Above Average
-- Percentile 25-50%: Below Average
-- Percentile <25%: Weak (for positive metrics) or Strong (for leverage)
+### Model Output
+- **Recommendation:** {recommendation}
+- **Signal:** {signal}
+- Quality Score: {fmt(quality_score, 1)}/100 (>=50 = Strong)
+- Trend Score: {fmt(trend_score, 1)}/100 (>=55 = Improving)
 
 ---
+## YOUR TASK
 
-## DATA SOURCE #3: MODEL SCORES (SUPPLEMENTARY CONTEXT ONLY)
+Write a **comprehensive 1200-1500 word** credit analysis report. Use EXACTLY these markdown section headers:
 
-{model['scoring_methodology']['critical_note']}
+## EXECUTIVE SUMMARY
+(3-4 sentences) State the recommendation ({recommendation}), the signal ({signal}), and the key drivers. This should give a PM the bottom line upfront.
 
-### Model Scores (0-100 scale, relative positioning after sector calibration)
-- Composite Score: {fmt(model['overall_metrics']['composite_score'], 1)}/100
-- Profitability Score: {fmt(model['factor_scores']['profitability_score'], 1)}/100
-- Leverage Score: {fmt(model['factor_scores']['leverage_score'], 1)}/100
-- Liquidity Score: {fmt(model['factor_scores']['liquidity_score'], 1)}/100
+## COMPANY OVERVIEW
+(3-4 sentences) Brief description of the business, sector positioning ({sector} / {classification}), and current S&P rating ({sp_rating}).
 
-- Cash Flow Score: {fmt(model['factor_scores']['cash_flow_score'], 1)}/100
-- Credit Score: {fmt(model['factor_scores']['credit_score'], 1)}/100
+## CREDIT STRENGTHS
+(5-6 detailed bullets using - not bullet points) Analyze each positive factor comprehensively:
+- Name the metric, its exact value, and unit
+- Compare to BOTH sector median AND rating peer median
+- State the percentile ranking
+- Explain WHY this matters for credit quality
+- Quantify the cushion or buffer where relevant
 
-### Model Context
-- Signal: {model['overall_metrics']['signal']}
-- Recommendation: {model['overall_metrics']['recommendation']}
-- Weights Applied: {model['weights_applied']['source']}
-- Sector: {model['sector_context']['sector']}
+Example format:
+- **Strong operating profitability:** EBITDA margin of 28.2 percent significantly exceeds the Capital Goods sector median of 14.4 percent (96th percentile), demonstrating superior pricing power.
 
-### Understanding Model Scores (CRITICAL)
+## CREDIT CONCERNS
+(5-6 detailed bullets) Same comprehensive format as strengths.
 
-**Example of CORRECT Interpretation:**
-If Profitability Score = 38.7 BUT EBITDA Margin = 28.17% (97th percentile):
-WRONG: "Low profitability score indicates weak earnings"
-CORRECT: "EBITDA margin of 28.17% is exceptional (97th percentile vs sector). The moderate profitability score of 38.7 reflects sector calibration adjusting for this classification's structural profitability advantages. The model deweights profitability to avoid sector bias in cross-sector comparisons."
+MUST address these if applicable:
+- If Trend Score < 55: Explain the deteriorating trajectory and which metrics are weakening
+- If Revenue Growth < 2%: Discuss organic growth challenges
+- If any metric is below twenty-fifth percentile vs peers: Flag as relative weakness
+- If Quality Score is only marginally above 50: Note the limited cushion
 
-**Key Principle:** Model scores are for relative RANKING within a universe, not absolute credit assessment.
+## FINANCIAL PROFILE DEEP DIVE
+
+### Leverage & Capital Structure
+(4-5 sentences) Analyze Total Debt/EBITDA, Net Debt/EBITDA, Debt/Capital, Debt/Equity. Compare to rating peers. Discuss absolute debt levels and maturity considerations if relevant.
+
+### Profitability & Returns
+(4-5 sentences) Analyze EBITDA margin, ROE, ROA, ROIC trends. Compare to sector and rating peers. Discuss sustainability of returns.
+
+### Liquidity & Coverage
+(4-5 sentences) Analyze current ratio, quick ratio, cash position, interest coverage. Assess ability to meet near-term obligations and service debt.
+
+### Cash Flow Generation
+(4-5 sentences) Analyze CFO, FCF, CFO/Debt, FCF/Debt. Discuss cash conversion and ability to self-fund operations, capex, and debt service.
+
+## PEER COMPARISON ANALYSIS
+(5-6 sentences) Detailed comparison to {peers['rating_comparison']['rating']} rating peers (n={peers['rating_comparison']['peer_count']}):
+- Where does the issuer rank vs rating peers on key metrics?
+- Is the credit profile consistent with the current rating?
+- Identify metrics that suggest positive or negative rating migration risk
+- Compare to sector peers as well for context
+
+## TREND ANALYSIS & OUTLOOK
+{_build_trend_section_for_prompt(data.get('trend_details', {}), trend_score)}
+
+## RECOMMENDATION RATIONALE
+(4-5 sentences) Explain the model's recommendation:
+- Quality Score of {fmt(quality_score, 1)}/100 is {'above' if quality_score >= 55 else 'below'} the 55 "Strong" threshold
+- Trend Score of {fmt(trend_score, 1)}/100 is {'above' if trend_score >= 55 else 'below'} the 55 "Improving" threshold  
+- This combination produces the "{signal}" signal
+- Synthesize the overall risk/reward and portfolio fit
 
 ---
+## FORMATTING GUIDELINES
 
-## YOUR TASK: GENERATE CREDIT ANALYSIS REPORT
+**DO:**
+- Use exact numbers from the data provided
+- Include percentile rankings (e.g., "73rd percentile")
+- Compare to BOTH sector AND rating peer medians
+- Use specific thresholds (e.g., "above the 3x investment-grade threshold")
+- Quantify spreads and cushions (e.g., "14 percentage points above median")
+- Write in professional credit analyst tone
+- Use markdown headers exactly as specified above
 
-### Analysis Hierarchy (MUST FOLLOW THIS ORDER):
+**DO NOT:**
+- Use the $ symbol for currency (write "5.0B USD" or "5.0 billion" instead)
+- Invent data not provided
+- Override or contradict the model recommendation
+- Use vague qualifiers without data support
+- Use bullet points with • (use - instead)
+- Number the sections (use ## headers only)
 
-1. **START WITH RAW METRICS (Data Source #1)**
-   - What are the actual EBITDA margin, leverage ratios, liquidity ratios?
-   - State these numbers explicitly
+**PERCENTILE INTERPRETATION:**
+- For profitability/coverage/liquidity: Higher percentile = stronger credit
+- For leverage (Debt/EBITDA): Higher percentile = LOWER leverage = stronger credit
+- >75th percentile: Credit strength
+- 50-75th: Above average
+- 25-50th: Below average  
+- <25th: Credit weakness requiring monitoring
 
-2. **ADD PEER CONTEXT (Data Source #2)**
-   - How do metrics compare to sector median?
-   - How do they compare to rating peer median?
-   - What percentile is the company in?
-
-3. **MAKE ASSESSMENT**
-   - If percentile >75%: "Strong" or "Exceptional"
-   - If better than rating peer median: Note as credit strength
-   - If worse than rating peer median: Note as credit concern
-   - If metric is below median BUT percentile shows >50%: The distribution is right-skewed, company is still above average
-
-4. **EXPLAIN MODEL SCORES (Data Source #3) - LAST**
-   - If raw metrics strong BUT model score low: Explain sector calibration effect
-   - If raw metrics weak AND model score low: Confirm fundamental weakness
-   - DO NOT use model scores to override what raw metrics show
-
-### Report Structure:
-
-**Executive Summary**
-- Brief overview based on raw metrics and peer comparisons
-- Synthesize absolute credit quality
-- 3-4 sentences max
-
-**Profitability Analysis (Score: X/100)**
-- Start with actual metrics: "EBITDA margin of X%, ROE of Y%"
-- Compare to peers: "vs sector median of A%, rating median of B%"
-- State percentiles: "placing company in Xth percentile"
-- Assess: "This represents [strong/weak/average] profitability"
-- Then explain: "The profitability score of X reflects [sector calibration context]"
-
-**Leverage Analysis (Score: X/100)**
-- Follow same structure as profitability
-- Remember: lower leverage = better credit quality
-
-**Liquidity Analysis (Score: X/100)**
-- Follow same structure
-- Current ratio >1.5x generally considered adequate for IG
-
-**Coverage Analysis**
-- State EBITDA/Interest coverage
-- Compare to thresholds (>3x = comfortable, 2-3x = adequate, <2x = tight)
-
-**Cash Flow Analysis (Score: X/100)**
-- State CFO, FCF, CFO/Debt ratio
-- Assess cash generation strength
-
-**Growth Analysis (Score: X/100)**
-- State revenue growth rates
-- Context: is growth positive/negative, accelerating/decelerating?
-
-**Credit Strengths**
-- List 3-5 genuine strengths with supporting data
-- Must be backed by percentiles >60% or better than rating peers
-
-**Credit Risks & Concerns**
-- List 3-5 genuine concerns with supporting data
-- Must be backed by percentiles <40% or worse than rating peers
-
-**Rating Outlook & Investment Recommendation**
-- Based on peer comparison: count metrics better/worse than rating peer median
-- If 70%+ metrics better than rating peers: Rating appropriate or conservative
-- If 70%+ metrics worse: Rating at risk
-- Provide outlook (Stable/Negative/Positive) with rationale
-- Investment recommendation: Overweight/Neutral/Underweight with rationale
-
-### CRITICAL RULES (MUST FOLLOW):
-
-NEVER say: "Profitability score of X indicates weak earnings"
-ALWAYS say: "EBITDA margin of X% (Yth percentile) indicates [strong/weak] profitability. The profitability score of Z reflects [context]."
-
-NEVER interpret model scores without first stating raw metrics
-ALWAYS state raw metric → peer comparison → percentile → assessment → then model score context
-
-NEVER recommend rating change without showing metrics worse than rating peers
-ALWAYS compare multiple metrics to rating peer median before assessing rating risk
-
-NEVER call fundamentals "weak" when percentiles show >60%
-ALWAYS align qualitative language with percentile rankings
-
-NEVER use phrases like "low score suggests" or "score indicates"
-ALWAYS say "actual metric of X (percentile Y) shows [assessment]"
-
-### Formatting:
-- Use clear section headers
-- Include specific numbers in every claim
-- Cite percentiles frequently
-- Keep sections concise (3-5 sentences each)
-- Use bullet points for strengths/risks lists
-
-Generate the comprehensive credit analysis report now, following all instructions above.
+Generate the comprehensive credit analysis report now.
 """
-
+    
     return prompt
 
 
@@ -8398,8 +9529,14 @@ def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: 
                         ebitda_lookup[key] = pd.to_numeric(df.loc[row_idx, ebitda_col], errors='coerce')
                         int_exp_lookup[key] = pd.to_numeric(df.loc[row_idx, int_exp_col], errors='coerce')
         
-        # Apply fallback where value is NaN
+        # Apply fallback where value is NaN (with CIQ-aligned bounding via SSOT helper)
         fallback_count = 0
+        bounded_count = 0
+        
+        # Initialize was_bounded column if not present
+        if 'was_bounded' not in long_df.columns:
+            long_df['was_bounded'] = False
+        
         for idx in long_df.index:
             if pd.isna(long_df.loc[idx, 'value']):
                 key = (long_df.loc[idx, 'row_idx'], long_df.loc[idx, 'date'])
@@ -8407,11 +9544,21 @@ def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: 
                 int_exp = int_exp_lookup.get(key)
                 
                 if pd.notna(ebitda) and pd.notna(int_exp) and int_exp != 0:
-                    long_df.loc[idx, 'value'] = ebitda / abs(int_exp)
+                    raw_value = ebitda / abs(int_exp)
+                    # Apply CIQ-aligned bounds via SSOT helper
+                    bounded_value, was_bounded = apply_ciq_ratio_bounds(base_metric, raw_value)
+                    long_df.loc[idx, 'value'] = bounded_value
+                    long_df.loc[idx, 'was_bounded'] = was_bounded
+                    if was_bounded:
+                        bounded_count += 1
                     fallback_count += 1
         
         if fallback_count > 0 and not os.environ.get("RG_TESTS"):
-            print(f"  [DEV] Interest Coverage trend fallback: {fallback_count} data points calculated")
+            bounds = CIQ_RATIO_BOUNDS.get(base_metric, {})
+            msg = f"  [DEV] Interest Coverage trend fallback: {fallback_count} data points calculated"
+            if bounded_count > 0:
+                msg += f" ({bounded_count} bounded to [{bounds.get('min', 0)}, {bounds.get('max', 'N/A')}])"
+            print(msg)
 
     # [V5.0.2] Net Debt / EBITDA Fallback for Trend Calculation
     # Handles "NM" cases, especially net cash positions (Cash > Debt)
@@ -8436,8 +9583,14 @@ def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: 
                         cash_lookup[key] = pd.to_numeric(df.loc[row_idx, cash_col], errors='coerce')
                         ebitda_lookup[key] = pd.to_numeric(df.loc[row_idx, ebitda_col], errors='coerce')
         
-        # Apply fallback where value is NaN
+        # Apply fallback where value is NaN (with CIQ-aligned bounding via SSOT helper)
         fallback_count = 0
+        bounded_count = 0
+        
+        # Initialize was_bounded column if not present
+        if 'was_bounded' not in long_df.columns:
+            long_df['was_bounded'] = False
+        
         for idx in long_df.index:
             if pd.isna(long_df.loc[idx, 'value']):
                 key = (long_df.loc[idx, 'row_idx'], long_df.loc[idx, 'date'])
@@ -8448,11 +9601,21 @@ def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: 
                 # Only calculate if EBITDA is positive (negative EBITDA = truly NM)
                 if pd.notna(debt) and pd.notna(cash) and pd.notna(ebitda) and ebitda > 0:
                     net_debt = debt - cash  # Can be negative for net cash positions
-                    long_df.loc[idx, 'value'] = net_debt / ebitda
+                    raw_value = net_debt / ebitda
+                    # Apply CIQ-aligned bounds via SSOT helper
+                    bounded_value, was_bounded = apply_ciq_ratio_bounds(base_metric, raw_value)
+                    long_df.loc[idx, 'value'] = bounded_value
+                    long_df.loc[idx, 'was_bounded'] = was_bounded
+                    if was_bounded:
+                        bounded_count += 1
                     fallback_count += 1
         
         if fallback_count > 0 and not os.environ.get("RG_TESTS"):
-            print(f"  [DEV] Net Debt/EBITDA trend fallback: {fallback_count} data points calculated")
+            bounds = CIQ_RATIO_BOUNDS.get(base_metric, {})
+            msg = f"  [DEV] Net Debt/EBITDA trend fallback: {fallback_count} data points calculated"
+            if bounded_count > 0:
+                msg += f" ({bounded_count} bounded to [{bounds.get('min', 0)}, {bounds.get('max', 'N/A')}])"
+            print(msg)
 
     # 5) Filter out invalid dates and values
     long_df = long_df[long_df['date'].notna() & long_df['value'].notna()]
@@ -8524,6 +9687,17 @@ def _build_metric_timeseries(df: pd.DataFrame, base_metric: str, use_quarterly: 
         aggfunc='first'  # Should be unnecessary after de-dup, but safe
     )
 
+    # Track which issuers had any bounded values (for diagnostic display)
+    bounded_by_issuer = pd.Series(False, index=df.index)
+    if 'was_bounded' in long_df.columns:
+        bounded_agg = long_df.groupby('row_idx')['was_bounded'].any()
+        for issuer_idx in bounded_agg.index:
+            if issuer_idx in bounded_by_issuer.index:
+                bounded_by_issuer.loc[issuer_idx] = bounded_agg.loc[issuer_idx]
+    
+    # Attach as attribute for downstream access
+    wide_df.attrs['bounded_by_issuer'] = bounded_by_issuer
+
     # 9) Sort columns by date (ascending) and reindex to match original df
     wide_df = wide_df[sorted(wide_df.columns)]
     wide_df = wide_df.reindex(df.index, fill_value=np.nan)
@@ -8561,7 +9735,7 @@ def robust_slope(xs: np.ndarray, ys: np.ndarray) -> float:
     try:
         coeffs = np.polyfit(xs[:len(y_clipped)], y_clipped, 1)
         return float(coeffs[0])  # slope is first coefficient
-    except:
+    except Exception:
         return np.nan
 
 
@@ -8799,7 +9973,7 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False,
                 return {
                     'dates': [],
                     'values': values.values.tolist(),
-                    'trend_direction': float(basic_result['trend']) * 100.0,
+                    'trend_direction': float(basic_result['trend']) * 10.0,
                     'momentum': float(basic_result['mom']),
                     'volatility': float(basic_result['vol']),
                     'classification': _classify_trend(float(basic_result['trend']), metric_name=metric_name),
@@ -8874,8 +10048,17 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False,
                 # Edge case: all data in one half
                 mom = 50.0
         else:
-            # Not enough data or time span too small
-            mom = 50.0
+            # Fallback to index-based momentum if time span is zero (e.g. integer index)
+            if n >= 8:
+                 recent_avg = float(values.iloc[-4:].mean())
+                 prior_avg = float(values.iloc[-8:-4].mean())
+                 if prior_avg != 0:
+                     mom = 50.0 + 50.0 * ((recent_avg - prior_avg) / abs(prior_avg))
+                 else:
+                     mom = 50.0
+                 mom = float(np.clip(mom, 0, 100))
+            else:
+                 mom = 50.0
 
         # Basic result for backward compatibility
         basic_result = pd.Series({'trend': trend, 'vol': vol, 'mom': mom})
@@ -8887,7 +10070,7 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False,
         return {
             'dates': [d.strftime('%Y-%m-%d') for d in dates],  # ISO format strings
             'values': values.values.tolist(),
-            'trend_direction': trend * 100.0,  # Convert to percentage per year
+            'trend_direction': trend * 10.0,  # trend has 10x scaling, so ×10 gives actual % per year
             'momentum': mom,
             'volatility': vol,
             'classification': _classify_trend(trend, metric_name=metric_name),
@@ -8989,6 +10172,16 @@ def calculate_trend_indicators(df, base_metrics, use_quarterly=False,
             # Get full diagnostic data for this issuer's time series
             row_series = ts.loc[idx]
             diag_data = _calc_row_stats(row_series, return_full_diagnostic=True, metric_name=base_metric)
+            
+            # Check if any values were bounded (from fallback calculation)
+            bounded_by_issuer = ts.attrs.get('bounded_by_issuer', pd.Series(False, index=ts.index))
+            was_bounded = bool(bounded_by_issuer.get(idx, False)) if idx in bounded_by_issuer.index else False
+            diag_data['fallback_bounded'] = was_bounded
+            
+            # Add bound limits for context if bounded
+            if was_bounded and base_metric in CIQ_RATIO_BOUNDS:
+                bounds = CIQ_RATIO_BOUNDS[base_metric]
+                diag_data['bound_limits'] = {'min': bounds['min'], 'max': bounds['max']}
             
             # Store under metric name
             trend_diagnostic_data[idx][base_metric] = diag_data
@@ -9138,69 +10331,17 @@ def get_trend_cfg():
     # [V2.3] quality_basis is now hard-coded (no longer in session state)
     return {
         "quality_basis": "Percentile within Band (recommended)",
-        "quality_threshold": float(st.session_state.get("cfg_quality_threshold", 60)),
-        "trend_threshold": float(st.session_state.get("cfg_trend_threshold", 55)),
+        "quality_threshold": float(st.session_state.get("cfg_quality_threshold", MODEL_THRESHOLDS['viz_quality_split'])),
+        "trend_threshold": float(st.session_state.get("cfg_trend_threshold", TREND_THRESHOLD)),
     }
 
-def compute_trend_heatmap(df: pd.DataFrame, selected_band: str, trend_threshold: float, min_count: int = 5):
-    """
-    Compute trend heatmap with proper Rating Band filtering and min-count guard.
 
-    Returns (heatmap_df, aggregation_df)
-    - heatmap_df: pivoted for visualization (rows=metrics, cols=classifications)
-    - aggregation_df: raw aggregation with counts for debugging
-    """
-    # 1) Filter by Rating Band if not "All"
-    df_ = df.copy()
-    if selected_band and selected_band != "All":
-        df_ = df_[df_["Rating_Band"] == selected_band]
-
-    # Guard: nothing to show
-    if df_.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # 2) Group by Classification
-    if 'Rubrics_Custom_Classification' not in df_.columns:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # Rename for consistency
-    if 'Rubrics_Custom_Classification' in df_.columns and 'Classification' not in df_.columns:
-        df_ = df_.rename(columns={'Rubrics_Custom_Classification': 'Classification'})
-
-    gb = df_.groupby("Classification", dropna=False, observed=True)
-
-    # Helper for % improving
-    def pct_improving(s: pd.Series) -> float:
-        s = s.dropna()
-        if len(s) == 0:
-            return np.nan
-        return float((s >= trend_threshold).mean() * 100.0)
-
-    agg = gb.agg(
-        Avg_Composite=("Composite_Score", "mean"),
-        Pct_Improving=("Cycle_Position_Score", pct_improving),
-        Avg_Cycle_Position=("Cycle_Position_Score", "mean"),
-        Count=("Cycle_Position_Score", "count"),
-    ).reset_index()
-
-    # 3) Min-count guard: mask too-small groups
-    agg.loc[agg["Count"] < min_count, ["Avg_Composite", "Pct_Improving", "Avg_Cycle_Position"]] = np.nan
-
-    # 4) Pivot into 3 rows × classifications for heatmap
-    heat = (
-        agg.melt(id_vars=["Classification"], value_vars=["Avg_Composite", "Pct_Improving", "Avg_Cycle_Position"],
-                 var_name="Metric", value_name="Score")
-        .pivot(index="Metric", columns="Classification", values="Score")
-        .sort_index()  # order rows consistently
-    )
-
-    return heat, agg
 
 # ============================================================================
 # AI ANALYSIS HELPERS (deterministic)
 # ============================================================================
 
-from datetime import datetime, timedelta
+
 
 def _col(df, candidates):
     """Find first matching column from candidates list."""
@@ -9227,26 +10368,28 @@ def _json_safe(obj):
         return [_json_safe(v) for v in obj]
     return str(obj)
 
-def _detect_signal(df, trend_thr=55, quality_thr=60):
-    """Return a small dataframe with computed/imputed regime signal if missing."""
+def _detect_signal(df, trend_thr=None, quality_thr=None):
+    """Return a small dataframe with computed/imputed regime signal if missing.
+    
+    Note: Defaults to MODEL_THRESHOLDS values if not specified.
+    """
+    # Use centralized thresholds as defaults
+    if trend_thr is None:
+        trend_thr = TREND_THRESHOLD  # 55
+    if quality_thr is None:
+        quality_thr = QUALITY_THRESHOLD  # 55
+        
     comp = _col(df, ["Composite_Score", "Composite Score (0-100)", "Composite Score"])
     cyc  = _col(df, ["Cycle_Position_Score", "Cycle Position Score (0-100)", "Cycle Position Score"])
     # Prefer post-override label if present
     sig  = _col(df, ["Combined_Signal", "Quality & Trend Signal", "Quality and Trend Signal", "Signal"])
     out = df.copy()
     if sig is None:
-        # Derive a simple 2x2 on composite vs cycle position for transparency.
-        def _lab(row):
-            q = row[comp]
-            t = row[cyc]
-            if pd.isna(q) or pd.isna(t): return "n/a"
-            hi_q = q >= quality_thr
-            up_t = t >= trend_thr
-            if hi_q and up_t: return "Strong & Improving"
-            if hi_q and not up_t: return "Strong but Deteriorating"
-            if (not hi_q) and up_t: return "Weak but Improving"
-            return "Weak & Deteriorating"
-        out["__Signal"] = out.apply(_lab, axis=1)
+        # Use centralized signal classification function
+        out["__Signal"] = out.apply(
+            lambda row: classify_signal(row[comp], row[cyc], quality_thr, trend_thr),
+            axis=1
+        )
         return out, "__Signal"
     return out, sig
 
@@ -9364,7 +10507,16 @@ def compute_raw_scores_v2(df_original: pd.DataFrame) -> pd.DataFrame:
     }, index=df_original.index)
     return out
 
-def build_buckets_v2(results_df: pd.DataFrame, df_original: pd.DataFrame, trend_thr=55, quality_thr=60):
+def build_buckets_v2(results_df: pd.DataFrame, df_original: pd.DataFrame, trend_thr=None, quality_thr=None):
+    """Return dict with regime buckets + column name for the signal (raw-only).
+    
+    Note: Defaults to MODEL_THRESHOLDS values if not specified.
+    """
+    # Use centralized thresholds as defaults
+    if trend_thr is None:
+        trend_thr = TREND_THRESHOLD  # 55
+    if quality_thr is None:
+        quality_thr = QUALITY_THRESHOLD  # 55
     """Return dict with regime buckets + column name for the signal (raw-only)."""
     nm_res = _resolve_company_name_col(results_df) or _resolve_company_name_col(df_original)
     nm_raw = _resolve_company_name_col(df_original)
@@ -9376,13 +10528,7 @@ def build_buckets_v2(results_df: pd.DataFrame, df_original: pd.DataFrame, trend_
     merged = results_df.merge(raw_scores, left_on=nm_res, right_on=nm_raw, how="left")
     comp, cyc = "Raw_Quality_Score", "Raw_Trend_Score"
     def lab(r):
-        if pd.isna(r[comp]) or pd.isna(r[cyc]): return "n/a"
-        return (
-            "Strong & Improving"      if (r[comp] >= quality_thr and r[cyc] >= trend_thr) else
-            "Strong & Normalizing"    if (r[comp] >= quality_thr and r[cyc] <  trend_thr) else
-            "Weak but Improving"      if (r[comp] <  quality_thr and r[cyc] >= trend_thr) else
-            "Weak & Deteriorating"
-        )
+        return classify_signal(r[comp], r[cyc], quality_thr, trend_thr)
     merged["__Signal_v2"] = merged.apply(lab, axis=1)
     rec = "__Signal_v2"
     leaders  = merged.sort_values([cyc, comp], ascending=[False, False]).head(20).copy()
@@ -9436,341 +10582,12 @@ def _dq_checks(df, staleness_days=365):
                 issues.append((f"Suspicious period-end sentinel in {colname}", frame))
     return issues
 
-# ============================================================================
-# [V3.1] CENTRALIZED METRIC EXTRACTION - Single Source of Truth
-# ============================================================================
-
-# Define comprehensive column name aliases for all metrics
-# [V3.1 UPDATE] Corrected to match exact column names in Input_File_V4b.xlsx
-# ALL METRICS ARE PRE-CALCULATED IN INPUT FILE - NO CALCULATIONS NEEDED
-METRIC_COLUMN_ALIASES = {
-    # ========================================================================
-    # CORE FINANCIAL METRICS (Raw Data from Input File)
-    # ========================================================================
-    'total_debt': ['Total Debt'],
-    'ebitda': ['EBITDA'],
-    'cash': ['Cash & Short-term Investments'],  # Corrected from "Cash & Equivalents"
-    'cash_equivalents': ['Cash & Short-term Investments'],  # Alias for backward compatibility
-    'interest_expense': ['Interest Expense'],
-    'revenue': ['Revenue'],
-    'total_assets': ['Total Assets'],
-    'equity': ['Total Common Equity'],  # Corrected from "Total Equity"
-    'total_equity': ['Total Common Equity'],  # Alias for backward compatibility
-    'operating_cash_flow': ['Cash from Ops.'],  # Corrected from "Operating Cash Flow"
-    'capital_expenditure': ['Capital Expenditure'],  # Singular, not plural
-    'capex': ['Capital Expenditure'],  # Alias
-    'net_income': ['Net Income'],
-    'ebit': ['EBIT'],  # Corrected from "Operating Income"
-    'operating_income': ['EBIT'],  # Alias for backward compatibility
-    'market_cap': ['Market Capitalization'],
-    'total_assets': ['Total Assets'],
-    'cash': ['Cash & Short-term Investments', 'Cash and Short-Term Investments', 'Cash & ST Investments', 'Cash and Equivalents'],
-    'cash_equivalents': ['Cash & Short-term Investments'],
-    'interest_expense': ['Interest Expense', 'Interest Expense, net', 'Net Interest Expense'],
-
-    # ========================================================================
-    # PRE-CALCULATED RATIOS (Extract directly - DO NOT RECALCULATE)
-    # ========================================================================
-    'net_debt': ['Net Debt'],  # Already calculated in input file
-    'levered_fcf': ['Levered Free Cash Flow'],
-    'free_cash_flow': ['Levered Free Cash Flow'],  # Alias
-    'unlevered_fcf': ['Unlevered Free Cash Flow'],
-    'current_ratio': ['Current Ratio (x)'],
-    'quick_ratio': ['Quick Ratio (x)'],
-    'total_debt_ebitda': ['Total Debt / EBITDA (x)'],
-    'net_debt_ebitda': ['Net Debt / EBITDA'],
-    'ebitda_interest': ['EBITDA/ Interest Expense (x)'],  # Note: space before "Interest"
-    'interest_coverage': ['EBITDA/ Interest Expense (x)'],  # Alias
-    'total_debt_equity': ['Total Debt/Equity (%)'],
-    'debt_to_equity': ['Total Debt/Equity (%)'],  # Alias
-
-    # ========================================================================
-    # PRE-CALCULATED MARGINS (Extract directly - DO NOT RECALCULATE)
-    # ========================================================================
-    'ebitda_margin': ['EBITDA Margin'],
-    'ebit_margin': ['EBIT Margin'],
-    'net_income_margin': ['Net Income Margin'],
-    'gross_margin': ['Gross Profit Margin'],
-    'levered_fcf_margin': ['Levered Free Cash Flow Margin'],
-    'unlevered_fcf_margin': ['Unlevered Free Cash Flow Margin'],
-
-    # ========================================================================
-    # PRE-CALCULATED RETURNS (Extract directly - DO NOT RECALCULATE)
-    # ========================================================================
-    'roe': ['Return on Equity'],
-    'roa': ['Return on Assets'],
-    'roic': ['Return on Capital'],
-
-    # ========================================================================
-    # PRE-CALCULATED GROWTH RATES (Extract directly - DO NOT RECALCULATE)
-    # ========================================================================
-    'revenue_growth': ['Total Revenues, 1 Year Growth'],
-    'revenue_3y_cagr': ['Total Revenues, 3 Yr. CAGR'],
-    'ebitda_growth': ['EBITDA, 1 Yr. Growth'],
-    'ebitda_3y_cagr': ['EBITDA, 3 Years CAGR'],
-    'net_income_growth': ['Net Income, 1 Yr. Growth'],
-    'net_income_3y_cagr': ['Net Income, 3 Yr. CAGR'],
-
-    # ========================================================================
-    # PRE-CALCULATED LEVERAGE RATIOS (Extract directly - DO NOT RECALCULATE)
-    # ========================================================================
-    'lt_debt_capital': ['Long-term Debt / Total Capital (%)'],
-    'total_debt_capital': ['Total Debt / Total Capital (%)'],
-    'debt_to_capital': ['Total Debt / Total Capital (%)'],  # Alias
-    'total_liabilities_assets': ['Total Liabilities / Total Assets (%)'],
-
-    # ========================================================================
-    # PRE-CALCULATED EFFICIENCY RATIOS (Extract directly - DO NOT RECALCULATE)
-    # ========================================================================
-    'asset_turnover': ['Total Asset Turnover'],
-    'fixed_asset_turnover': ['Fixed Asset Turnover'],
-
-    # ========================================================================
-    # ADDITIONAL METRICS (if available in input)
-    # ========================================================================
-    'current_assets': ['Current Assets'],
-    'current_liabilities': ['Current Liabilities'],
-    'total_liabilities': ['Total Liabilities'],
-    'long_term_debt': ['Long-Term Debt'],
-    'short_term_debt': ['Short-Term Debt'],
-    'accounts_receivable': ['Accounts Receivable'],
-    'inventory': ['Inventory'],
-    'accounts_payable': ['Accounts Payable'],
-}
-
-# =============================================================================
-# METRIC REGISTRY - SINGLE SOURCE OF TRUTH
-# =============================================================================
-
-METRIC_METADATA = {
-    'total_debt': ('Total Debt', 'raw', 'M'),
-    'cash': ('Cash & Short-term Investments', 'raw', 'M'),
-    'cash_equivalents': ('Cash & Short-term Investments', 'raw', 'M'),
-    'ebitda': ('EBITDA', 'raw', 'M'),
-    'equity': ('Total Common Equity', 'raw', 'M'),
-    'total_equity': ('Total Common Equity', 'raw', 'M'),
-    'interest_expense': ('Interest Expense', 'raw', 'M'),
-    'revenue': ('Revenue', 'raw', 'M'),
-    'total_assets': ('Total Assets', 'raw', 'M'),
-    'operating_cash_flow': ('Cash from Ops.', 'raw', 'M'),
-    'capital_expenditure': ('Capital Expenditure', 'raw', 'M'),
-    'capex': ('Capital Expenditure', 'raw', 'M'),
-    'net_income': ('Net Income', 'raw', 'M'),
-    'ebit': ('EBIT', 'raw', 'M'),
-    'operating_income': ('EBIT', 'raw', 'M'),
-    'market_cap': ('Market Capitalization', 'raw', 'M'),
-    'net_debt': ('Net Debt', 'calc', 'M'),
-    'levered_fcf': ('Levered Free Cash Flow', 'calc', 'M'),
-    'free_cash_flow': ('Levered Free Cash Flow', 'calc', 'M'),
-    'unlevered_fcf': ('Unlevered Free Cash Flow', 'calc', 'M'),
-    'current_ratio': ('Current Ratio (x)', 'calc', 'x'),
-    'quick_ratio': ('Quick Ratio (x)', 'calc', 'x'),
-    'total_debt_ebitda': ('Total Debt / EBITDA (x)', 'calc', 'x'),
-    'net_debt_ebitda': ('Net Debt / EBITDA', 'calc', 'x'),
-    'ebitda_interest': ('EBITDA/ Interest Expense (x)', 'calc', 'x'),
-    'interest_coverage': ('EBITDA/ Interest Expense (x)', 'calc', 'x'),
-    'total_debt_equity': ('Total Debt/Equity (%)', 'calc', '%'),
-    'debt_to_equity': ('Total Debt/Equity (%)', 'calc', '%'),
-    'lt_debt_capital': ('Long-term Debt / Total Capital (%)', 'calc', '%'),
-    'total_debt_capital': ('Total Debt / Total Capital (%)', 'calc', '%'),
-    'debt_to_capital': ('Total Debt / Total Capital (%)', 'calc', '%'),
-    'total_liabilities_assets': ('Total Liabilities / Total Assets (%)', 'calc', '%'),
-    'ebitda_margin': ('EBITDA Margin', 'calc', '%'),
-    'ebit_margin': ('EBIT Margin', 'calc', '%'),
-    'net_income_margin': ('Net Income Margin', 'calc', '%'),
-    'gross_margin': ('Gross Profit Margin', 'calc', '%'),
-    'levered_fcf_margin': ('Levered Free Cash Flow Margin', 'calc', '%'),
-    'unlevered_fcf_margin': ('Unlevered Free Cash Flow Margin', 'calc', '%'),
-    'roe': ('Return on Equity', 'calc', '%'),
-    'roa': ('Return on Assets', 'calc', '%'),
-    'roic': ('Return on Capital', 'calc', '%'),
-    'revenue_growth': ('Total Revenues, 1 Year Growth', 'calc', '%'),
-    'revenue_3y_cagr': ('Total Revenues, 3 Yr. CAGR', 'calc', '%'),
-    'ebitda_growth': ('EBITDA, 1 Yr. Growth', 'calc', '%'),
-    'ebitda_3y_cagr': ('EBITDA, 3 Years CAGR', 'calc', '%'),
-    'net_income_growth': ('Net Income, 1 Yr. Growth', 'calc', '%'),
-    'net_income_3y_cagr': ('Net Income, 3 Yr. CAGR', 'calc', '%'),
-    'asset_turnover': ('Total Asset Turnover', 'calc', 'x'),
-    'fixed_asset_turnover': ('Fixed Asset Turnover', 'calc', 'x'),
-}
-
-def get_metric_column(metric_key, suffix=""):
-    """Get column name for metric key with period suffix"""
-    if metric_key in METRIC_COLUMN_ALIASES:
-        base_name = METRIC_COLUMN_ALIASES[metric_key][0]
-        return f"{base_name}{suffix}" if suffix else base_name
-    return None
-
-def get_metric_display_name(metric_key):
-    """Get display name for metric key"""
-    if metric_key in METRIC_METADATA:
-        return METRIC_METADATA[metric_key][0]
-    return metric_key
-
-def get_metric_info(metric_key):
-    """Get complete metadata for a metric"""
-    if metric_key not in METRIC_METADATA:
-        return None
-    display_name, metric_type, unit = METRIC_METADATA[metric_key]
-    column_name = METRIC_COLUMN_ALIASES.get(metric_key, [None])[0]
-    return {
-        'display_name': display_name,
-        'type': metric_type,
-        'unit': unit,
-        'column_name': column_name
-    }
-
-def extract_metric(df, metric_key, suffix="", default=None):
-    """Extract metric value from DataFrame with fallback to base column"""
-    # Try with suffix first
-    if suffix:
-        col_name = get_metric_column(metric_key, suffix)
-        if col_name and col_name in df.columns:
-            value = df[col_name].iloc[0] if len(df) > 0 else default
-            if pd.notna(value):
-                return value
-
-    # Fall back to base column (no suffix)
-    col_name = get_metric_column(metric_key, "")
-    if col_name and col_name in df.columns:
-        value = df[col_name].iloc[0] if len(df) > 0 else default
-        return value if pd.notna(value) else default
-
-    return default
-
-def format_metric_value(value, metric_key):
-    """Format metric value based on unit type"""
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return "N/A"
-    info = get_metric_info(metric_key)
-    if info is None:
-        return f"{value:,.2f}"
-    unit = info['unit']
-    if unit == 'M':
-        return f"{value:,.1f}M"
-    elif unit == '%':
-        return f"{value:.2f}%"
-    elif unit == 'x':
-        return f"{value:.2f}x"
-    else:
-        return f"{value:,.2f}"
-
-def get_all_metric_keys():
-    """Get list of all primary metric keys (excludes aliases)"""
-    primary_keys = []
-    seen_columns = set()
-    for key in METRIC_METADATA.keys():
-        col_name = METRIC_COLUMN_ALIASES.get(key, [None])[0]
-        if col_name and col_name not in seen_columns:
-            primary_keys.append(key)
-            seen_columns.add(col_name)
-    return primary_keys
-
-
-def extract_metric_value(
-    row: pd.Series,
-    metric_key: str,
-    suffix: str = '',
-    return_column_name: bool = False
-):
-    """
-    Single source of truth for extracting metric values from a DataFrame row.
-
-    This function handles:
-    - Multiple column name variations (aliases)
-    - Period suffixes (.0, .1, .2, etc.)
-    - Missing data gracefully
-    - Data type conversion
-
-    Args:
-        row: DataFrame row (issuer data)
-        metric_key: Key from METRIC_COLUMN_ALIASES dict (e.g., 'total_debt')
-        suffix: Period suffix (e.g., '.4' for FY 2024)
-        return_column_name: If True, return (value, column_name) tuple
-
-    Returns:
-        If return_column_name=False: Metric value as float, or None if not found
-        If return_column_name=True: (value, column_name) tuple
-
-    Example:
-        >>> value = extract_metric_value(row, 'total_debt', suffix='.4')
-        >>> value, col = extract_metric_value(row, 'ebitda', suffix='.4', return_column_name=True)
-    """
-    if metric_key not in METRIC_COLUMN_ALIASES:
-        if return_column_name:
-            return None, None
-        return None
-
-    aliases = METRIC_COLUMN_ALIASES[metric_key]
-
-    # Try each alias with suffix first, then without
-    for alias in aliases:
-        # Try with suffix
-        if suffix:
-            col_with_suffix = f"{alias}{suffix}"
-            if col_with_suffix in row.index:
-                value = row[col_with_suffix]
-                if pd.notna(value):
-                    try:
-                        result = float(value)
-                        if return_column_name:
-                            return result, col_with_suffix
-                        return result
-                    except (ValueError, TypeError):
-                        pass  # Try next alias
-
-        # Try without suffix
-        if alias in row.index:
-            value = row[alias]
-            if pd.notna(value):
-                try:
-                    result = float(value)
-                    if return_column_name:
-                        return result, alias
-                    return result
-                except (ValueError, TypeError):
-                    pass  # Try next alias
-
-    # Not found
-    if return_column_name:
-        return None, None
-    return None
-
-
-def extract_multiple_metrics(
-    row: pd.Series,
-    metric_keys: List[str],
-    suffix: str = ''
-) -> Dict[str, Optional[float]]:
-    """
-    Extract multiple metrics from a row at once.
-
-    Args:
-        row: DataFrame row
-        metric_keys: List of metric keys to extract
-        suffix: Period suffix to use
-
-    Returns:
-        Dictionary mapping metric_key to value (or None if not found)
-
-    Example:
-        >>> metrics = extract_multiple_metrics(
-        ...     row,
-        ...     ['total_debt', 'ebitda', 'cash_equivalents'],
-        ...     suffix='.4'
-        ... )
-        >>> print(metrics['total_debt'])  # 15234.5 or None
-    """
-    return {
-        key: extract_metric_value(row, key, suffix)
-        for key in metric_keys
-    }
 
 # ============================================================================
 # MAIN DATA LOADING FUNCTION
 # ============================================================================
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: lambda df: CACHE_VERSION + str(df.shape)})
 def load_and_process_data(uploaded_file, use_sector_adjusted,
                           period_mode=PeriodSelectionMode.LATEST_AVAILABLE,
                           reference_date_override=None,
@@ -10184,7 +11001,10 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
                 val = df.loc[idx, col_name]
                 if pd.isna(val):
                     return None
-                return float(val)
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
             return None
 
         # 1. Balance Sheet
@@ -10194,17 +11014,59 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         raw_inputs['Current Assets'] = get_val('Current Assets')
         raw_inputs['Current Liabilities'] = get_val('Current Liabilities')
         raw_inputs['Inventory'] = get_val('Inventory')
+        raw_inputs['Total Equity'] = get_val('Total Equity')
+        raw_inputs['Total Capital'] = get_val('Total Capital')
         
         # 2. Income Statement
-        raw_inputs['Total Revenue'] = get_val('Total Revenue')
+        raw_inputs['Total Revenue'] = get_val('Revenue')  # FIXED: column is "Revenue" not "Total Revenue"
         raw_inputs['EBITDA'] = get_val('EBITDA')
         raw_inputs['Interest Expense'] = get_val('Interest Expense')
         raw_inputs['Net Income'] = get_val('Net Income')
         raw_inputs['Cost of Goods Sold'] = get_val('Cost of Goods Sold')
+        raw_inputs['Gross Profit'] = get_val('Gross Profit')
+        raw_inputs['Operating Income'] = get_val('Operating Income')
         
-        # 3. Cash Flow
-        raw_inputs['Operating Cash Flow'] = get_val('Operating Cash Flow')
+        # 3. Profitability Ratios (pre-calculated in spreadsheet)
+        raw_inputs['Return on Equity'] = get_val('Return on Equity')  # NEW
+        raw_inputs['Return on Assets'] = get_val('Return on Assets')
+        raw_inputs['EBITDA Margin'] = get_val('EBITDA Margin')
+        raw_inputs['Gross Profit Margin'] = get_val('Gross Profit Margin')
+        raw_inputs['Operating Margin'] = get_val('Operating Margin')
+        raw_inputs['Net Profit Margin'] = get_val('Net Profit Margin')
+        
+        # 4. Leverage Ratios (pre-calculated in spreadsheet)
+        raw_inputs['Total Debt / EBITDA'] = get_val('Total Debt / EBITDA (x)')  # NEW
+        raw_inputs['Net Debt / EBITDA'] = get_val('Net Debt / EBITDA')
+        raw_inputs['Total Debt / Capital'] = get_val('Total Debt / Capital')
+        raw_inputs['Debt to Equity'] = get_val('Debt to Equity')
+        
+        # 5. Liquidity Ratios
+        raw_inputs['Current Ratio'] = get_val('Current Ratio (x)')
+        raw_inputs['Quick Ratio'] = get_val('Quick Ratio (x)')
+        
+        # 6. Coverage Ratios
+        raw_inputs['EBITDA / Interest'] = get_val('EBITDA / Interest Expense (x)')
+        
+        # 7. Growth Metrics (use non-period suffixed columns for CAGRs)
+        # Note: CAGR columns may not have period suffixes - try both
+        raw_inputs['Revenue 3Y CAGR'] = get_val('Total Revenues, 3 Yr. CAGR')  # NEW
+        raw_inputs['EBITDA 3Y CAGR'] = get_val('EBITDA, 3 Years CAGR')  # NEW
+        raw_inputs['Revenue 1Y Growth'] = get_val('Total Revenues, 1 Year Growth')
+        
+        # 8. Cash Flow
+        raw_inputs['Operating Cash Flow'] = get_val('Cash from Ops.')
+        raw_inputs['Levered Free Cash Flow'] = get_val('Levered Free Cash Flow')
         raw_inputs['Unlevered Free Cash Flow'] = get_val('Unlevered Free Cash Flow')
+        raw_inputs['Capital Expenditures'] = get_val('Capital Expenditures')
+        raw_inputs['LFCF Margin'] = get_val('Levered Free Cash Flow Margin')
+        raw_inputs['UFCF Margin'] = get_val('Unlevered Free Cash Flow Margin')
+        
+        # 9. Company Metadata (non-period field)
+        if 'Reported Currency' in df.columns:
+            curr_val = df.loc[idx, 'Reported Currency']
+            raw_inputs['Reported_Currency'] = str(curr_val) if pd.notna(curr_val) else 'USD'
+        else:
+            raw_inputs['Reported_Currency'] = 'USD'
         
         return raw_inputs
 
@@ -10558,11 +11420,21 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
                 cash_val = cash_for_nd.loc[idx] if idx in cash_for_nd.index else np.nan
                 ebitda_val = ebitda_for_nd.loc[idx] if idx in ebitda_for_nd.index else np.nan
                 
-                # Only calculate if EBITDA is positive (negative EBITDA = truly NM)
-                if pd.notna(debt_val) and pd.notna(cash_val) and pd.notna(ebitda_val) and ebitda_val > 0:
+                # Only calculate if we have debt and cash
+                if pd.notna(debt_val) and pd.notna(cash_val):
                     net_debt = debt_val - cash_val  # Can be negative for net cash positions
-                    net_debt_ebitda.loc[idx] = net_debt / ebitda_val
-                    fallback_count_nd += 1
+                    
+                    # Case 1: Net cash position (Cash > Debt) - always valid, will score 100
+                    if net_debt < 0:
+                        # Use a small negative number to indicate net cash
+                        # The scoring logic at line 11278 will detect is_net_cash and score 100
+                        net_debt_ebitda.loc[idx] = -1.0  # Sentinel for "net cash"
+                        fallback_count_nd += 1
+                    # Case 2: Net debt position with positive EBITDA - calculate ratio
+                    elif pd.notna(ebitda_val) and ebitda_val > 0:
+                        net_debt_ebitda.loc[idx] = net_debt / ebitda_val
+                        fallback_count_nd += 1
+                    # Case 3: Net debt position with negative/zero EBITDA - truly NM (leave as NaN)
         
         if fallback_count_nd > 0 and not os.environ.get("RG_TESTS"):
             print(f"  [DEV] Net Debt/EBITDA fallback applied: {fallback_count_nd} issuers")
@@ -11234,12 +12106,25 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
             'selection_reason': 'Most recent data available'
         }
         
+        # Calculate peer context for this issuer (Phase 2 Architectural Fix)
+        # Use safe getters for classification and rating
+        class_val = df.loc[idx, 'Rubrics Custom Classification'] if 'Rubrics Custom Classification' in df.columns else df.loc[idx, 'Rubrics_Custom_Classification'] if 'Rubrics_Custom_Classification' in df.columns else 'Unknown'
+        rating_val = df.loc[idx, '_Credit_Rating_Clean'] if '_Credit_Rating_Clean' in df.columns else 'NR'
+        
+        peer_context = calculate_peer_context_for_scoring(
+            df=df,
+            idx=idx,
+            classification=str(class_val) if pd.notna(class_val) else 'Unknown',
+            rating=str(rating_val) if pd.notna(rating_val) else 'NR'
+        )
+        
         # Assemble complete diagnostic structure
         issuer_diagnostic = {
             'raw_inputs': raw_input_data.get(idx, {}),
             'time_series': trend_diagnostic_data.get(idx, {}),
             'factor_details': factor_diagnostic_data.get(idx, {}),
             'period_selection': period_diagnostic,
+            'peer_context': peer_context,  # [Phase 2] Store peer context
             'composite_calculation': {
                 'composite_score': float(composite_score[idx]) if pd.notna(composite_score[idx]) else None,
                 'quality_score': float(quality_scores.loc[idx, 'quality_score']) if pd.notna(quality_scores.loc[idx, 'quality_score']) else None,
@@ -11481,6 +12366,35 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         50 - (50 - results.loc[needs_damping, 'Cycle_Position_Score']) * damping_factor
     )
 
+    # ========================================================================
+    # [BUG FIX] Recalculate composite score using damped Cycle_Position_Score
+    # ========================================================================
+    # The composite score was initially calculated with raw cycle_score before damping.
+    # Recalculate using the damped Cycle_Position_Score for consistency.
+    results['Composite_Score'] = (
+        results['Quality_Score'] * QUALITY_WEIGHT + 
+        results['Cycle_Position_Score'] * TREND_WEIGHT
+    )
+    
+    # ========================================================================
+    # [BUG FIX] Update diagnostic_data with damped trend scores and recalculated composite
+    # ========================================================================
+    # The diagnostic_data_list was assembled before damping, so update it now.
+    for i, idx in enumerate(df.index):
+        if i < len(diagnostic_data_list):
+            try:
+                diag = json.loads(diagnostic_data_list[i])
+                if 'composite_calculation' in diag:
+                    diag['composite_calculation']['trend_score'] = float(results.loc[idx, 'Cycle_Position_Score']) if pd.notna(results.loc[idx, 'Cycle_Position_Score']) else None
+                    diag['composite_calculation']['composite_score'] = float(results.loc[idx, 'Composite_Score']) if pd.notna(results.loc[idx, 'Composite_Score']) else None
+                    diagnostic_data_list[i] = json.dumps(diag)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass  # Skip if diagnostic data is malformed
+    
+    # CRITICAL: Reassign updated list back to DataFrame column
+    # (The original assignment at line ~11946 created a copy, not a reference)
+    results['diagnostic_data'] = diagnostic_data_list
+
     _log_timing("05b_Context_Flags_Complete")
 
     # ========================================================================
@@ -11495,7 +12409,7 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
     # where a score of 30 becomes "100th percentile" and incorrectly "Strong").
     #
     # Signal classification uses fixed absolute thresholds:
-    # - Strong Quality: Composite_Score >= 50 (absolute, not relative)
+    # - Strong Quality: Composite_Score >= 55 (QUALITY_THRESHOLD, absolute)
     # - Improving Trend: Cycle_Position_Score >= trend_threshold (default 55)
     #
     # The visualization (Four Quadrant chart) can still use percentile-based
@@ -11508,8 +12422,7 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
     )
     
     # For signal classification - ALWAYS use absolute Composite Score
-    SIGNAL_QUALITY_THRESHOLD = 50  # Absolute score threshold for "Strong"
-    is_strong_quality = results["Composite_Score"] >= SIGNAL_QUALITY_THRESHOLD
+    is_strong_quality = results["Composite_Score"] >= QUALITY_THRESHOLD
     
     trend_metric = results["Cycle_Position_Score"]
     is_improving = trend_metric >= trend_threshold
@@ -11545,19 +12458,22 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
     results.loc[override_normalizing, 'Signal'] = 'Strong & Normalizing'
 
     # Override 2: Strong & Moderating
-    # When: Exceptional quality + High volatility + Not improving
+    # When: Exceptional quality + High volatility + NOT event-driven (no peak/outlier)
+    # Credit rationale: Structural business volatility (cyclical industry, project-based)
+    # makes trend score unreliable, but there's no specific "event" explaining weakness
     override_moderating = (
         results['ExceptionalQuality'] &
         (results['Signal_Base'] == 'Strong but Deteriorating') &
         results['VolatileSeries'] &
-        ~override_normalizing  # Don't double-override
+        ~results['NearPeak'] &        # NOT at an identifiable peak
+        ~results['OutlierQuarter']    # AND NOT an outlier event
     )
     results.loc[override_moderating, 'Signal'] = 'Strong & Moderating'
 
     # Add reasons column for transparency
     results['Signal_Reason'] = ''
     results.loc[override_normalizing, 'Signal_Reason'] = 'Exceptional quality (≥90th %ile); Medium-term improving; Near peak/outlier'
-    results.loc[override_moderating, 'Signal_Reason'] = 'Exceptional quality (≥90th %ile); High volatility (CV≥0.30); Damping applied'
+    results.loc[override_moderating, 'Signal_Reason'] = 'Exceptional quality (≥90th %ile); Structural volatility (CV≥0.30); No specific peak/outlier event'
     results.loc[results['OutlierQuarter'] & ~override_normalizing & ~override_moderating, 'Signal_Reason'] += 'Outlier quarter detected'
     results.loc[needs_damping & ~override_normalizing & ~override_moderating, 'Signal_Reason'] += 'Volatility damping applied (50%)'
 
@@ -11587,20 +12503,9 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
     # Check if any are incorrectly in the strong quadrant
     misclassified_signals = weak_deteriorating & results['Signal'].isin(['Strong & Improving', 'Strong but Deteriorating', 'Strong & Normalizing'])
 
-    if misclassified_signals.any() and not os.environ.get("RG_TESTS"):
-        st.warning(
-            f"**Signal Classification Alert**\n\n"
-            f"{misclassified_signals.sum()} issuer(s) have Weak & Deteriorating fundamentals "
-            f"but were initially classified in the Strong category. This may indicate data quality issues "
-            f"or edge cases in the classification logic.\n\n"
-            f"Review these issuers carefully before making investment decisions."
-        )
-
-        # Show affected issuers in expander (don't clutter main view)
-        with st.expander("View Affected Issuers"):
-            alert_cols = ['Company_Name', 'Composite_Score', 'Composite_Percentile_in_Band',
-                         'Cycle_Position_Score', 'Signal', 'Credit_Rating_Clean']
-            st.dataframe(results[misclassified_signals][alert_cols])
+    # Signal Classification Alert removed - validation happens upstream
+    # if misclassified_signals.any():
+    #     pass  # Logging available if needed
 
     # ========================================================================
     # [V2.2] COMPREHENSIVE RECOMMENDATION LOGIC
@@ -11670,12 +12575,12 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         if classification == "Strong & Improving":
             # Best quadrant: Strong quality + Improving trend
             # → Always positive recommendation (Buy or Strong Buy)
-            return "Strong Buy" if pct >= 70 else "Buy"
+            return "Strong Buy" if pct >= PERCENTILE_STRONG_BUY else "Buy"
 
         elif classification == "Strong but Deteriorating":
             # Good quality but declining trend
             # → Cautiously positive (Buy or Hold)
-            return "Buy" if pct >= 70 else "Hold"
+            return "Buy" if pct >= PERCENTILE_STRONG_BUY else "Hold"
 
         elif classification == "Strong & Normalizing":
             # Special case: Exceptional quality (90th+ percentile)
@@ -11692,7 +12597,7 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
         elif classification == "Weak but Improving":
             # Poor quality but turning around
             # → Cautiously positive if strong momentum (Buy or Hold)
-            return "Buy" if pct >= 70 else "Hold"
+            return "Buy" if pct >= PERCENTILE_STRONG_BUY else "Hold"
 
         elif classification == "Weak & Deteriorating":
             # Worst quadrant: Weak quality + Deteriorating trend
@@ -11795,7 +12700,7 @@ def load_and_process_data(uploaded_file, use_sector_adjusted,
                          'leverage': float(n.get('Leverage_Score', np.nan)) if pd.notna(n.get('Leverage_Score')) else None,
                          'profitability': float(n.get('Profitability_Score', np.nan)) if pd.notna(n.get('Profitability_Score')) else None,
                          'liquidity': float(n.get('Liquidity_Score', np.nan)) if pd.notna(n.get('Liquidity_Score')) else None,
-                         'growth': float(n.get('Growth_Score', np.nan)) if pd.notna(n.get('Growth_Score')) else None,
+
                          'cash_flow': float(n.get('Cash_Flow_Score', np.nan)) if pd.notna(n.get('Cash_Flow_Score')) else None,
                          'cycle': float(n.get('Cycle_Position_Score', np.nan)) if pd.notna(n.get('Cycle_Position_Score')) else None
                      },
@@ -12355,250 +13260,9 @@ async def get_cash_flow_data(ctx, company_name: str, row_data: dict) -> str:
 
     state = await ctx.get("state")
     state["cash_flow_data"] = result
-    await ctx.set("state", state)
 
+    await ctx.set("state", state)
     return f"Cash flow data extracted. Score: {row_data['cash_flow_score']:.1f}/100"
-
-
-async def get_growth_data(ctx, company_name: str, row_data: dict) -> str:
-    """Extract growth metrics."""
-    metrics = [
-        "Total Revenues, 3 Yr. CAGR",
-        "Total Revenues, 1 Year Growth",
-        "EBITDA, 3 Years CAGR"
-    ]
-
-    result = {
-        "company": company_name,
-        "factor_score": row_data["growth_score"],
-        "metrics": {}
-    }
-
-    for metric in metrics:
-        result["metrics"][metric] = extract_metric_time_series(
-            row_data["row"],
-            row_data["df"],
-            metric
-        )
-
-    state = await ctx.get("state")
-    state["growth_data"] = result
-    await ctx.set("state", state)
-
-    return f"Growth data extracted. Score: {row_data['growth_score']:.1f}/100"
-
-
-async def compile_final_report(ctx) -> str:
-    """Signal all analyses collected."""
-    state = await ctx.get("state")
-
-    sections = {
-        "profitability": state.get("profitability_analysis"),
-        "leverage": state.get("leverage_analysis"),
-        "liquidity": state.get("liquidity_analysis"),
-        "cash_flow": state.get("cash_flow_analysis"),
-        "growth": state.get("growth_analysis")
-    }
-
-    complete = sum(1 for s in sections.values() if s)
-    return f"Collected {complete}/5 specialist analyses"
-
-
-def create_profitability_agent(llm):
-    return FunctionAgent(
-        name="ProfitabilityAgent",
-        description="Analyze profitability: EBITDA Margin, ROE, ROA, EBIT Margin",
-        system_prompt="""You are a profitability analyst.
-
-**Task:**
-1. Call get_profitability_data
-2. Analyze each metric vs sector medians (primary comparison)
-3. Note sector-specific norms (e.g., "Tech EBITDA margins typically 25-35%")
-4. Explain factor weight in context of sector (e.g., "Profitability weighted 25% for this sector vs 20% default")
-5. Describe historical trends with specific values
-
-**Output Format:**
-### EBITDA Margin (Weight: X%)
-- Current: Y%
-- Sector Context: [Sector] companies typically achieve Z% margins. This company is [above/below/in-line].
-- Historical: [trend with values]
-- Assessment: [strength/weakness vs sector norms]
-
-[Repeat for ROE, ROA, EBIT Margin]
-
-**Overall Profitability:** [3-4 sentences on sector-relative performance]
-
-Hand off to LeverageAgent when complete.""",
-        llm=llm,
-        tools=[get_profitability_data],
-        can_handoff_to=["LeverageAgent"]
-    )
-
-
-def create_leverage_agent(llm):
-    return FunctionAgent(
-        name="LeverageAgent",
-        description="Analyze leverage: Net Debt/EBITDA, Interest Coverage, Debt/Capital, Total Debt/EBITDA",
-        system_prompt="""You are a leverage analyst.
-
-**Task:**
-1. Call get_leverage_data
-2. Analyze each metric vs sector medians
-3. Note if sector has different leverage tolerance (e.g., "Utilities typically 4-5x due to regulated cash flows")
-4. Describe historical trends
-
-**Output Format:**
-### Net Debt / EBITDA (Weight: X%)
-- Current: Yx
-- Sector Context: [comparison to sector median]
-- Historical: [trend]
-- Assessment: [strength/weakness]
-
-[Repeat for Interest Coverage, Debt/Capital, Total Debt/EBITDA]
-
-**Overall Leverage:** [3-4 sentences]
-
-Hand off to LiquidityAgent.""",
-        llm=llm,
-        tools=[get_leverage_data],
-        can_handoff_to=["LiquidityAgent"]
-    )
-
-
-def create_liquidity_agent(llm):
-    return FunctionAgent(
-        name="LiquidityAgent",
-        description="Analyze liquidity: Current Ratio, Quick Ratio",
-        system_prompt="""You are a liquidity analyst.
-
-**Task:**
-1. Call get_liquidity_data
-2. Analyze each metric vs sector medians
-3. Describe historical trends
-
-**Output Format:**
-### Current Ratio (Weight: X%)
-- Current: Yx
-- Sector Context: [comparison]
-- Historical: [trend]
-- Assessment: [strength/weakness]
-
-[Repeat for Quick Ratio]
-
-**Overall Liquidity:** [3-4 sentences]
-
-Hand off to CashFlowAgent.""",
-        llm=llm,
-        tools=[get_liquidity_data],
-        can_handoff_to=["CashFlowAgent"]
-    )
-
-
-def create_cash_flow_agent(llm):
-    return FunctionAgent(
-        name="CashFlowAgent",
-        description="Analyze cash flow quality",
-        system_prompt="""You are a cash flow analyst.
-
-**Task:**
-1. Call get_cash_flow_data
-2. Calculate ratios: OCF/Revenue, OCF/Debt, LFCF Margin
-3. Analyze trends in cash generation
-
-**Output Format:**
-### Cash Flow Quality
-- OCF/Revenue: [if calculable from OCF and Revenue]
-- OCF/Debt: [if calculable]
-- LFCF Margin: [if calculable]
-- Historical: [trends]
-- Assessment: [quality of cash generation]
-
-**Overall Cash Flow:** [3-4 sentences]
-
-Hand off to GrowthAgent.""",
-        llm=llm,
-        tools=[get_cash_flow_data],
-        can_handoff_to=["GrowthAgent"]
-    )
-
-
-def create_growth_agent(llm):
-    return FunctionAgent(
-        name="GrowthAgent",
-        description="Analyze growth: Revenue CAGR 3Y, Revenue Growth 1Y, EBITDA CAGR 3Y",
-        system_prompt="""You are a growth analyst.
-
-**Task:**
-1. Call get_growth_data
-2. Analyze growth trajectory
-3. Note consistency and quality
-
-**Output Format:**
-### Growth Profile
-- Revenue CAGR 3Y: X%
-- Revenue Growth 1Y: Y%
-- EBITDA CAGR 3Y: Z%
-- Assessment: [consistency, quality]
-
-**Overall Growth:** [3-4 sentences]
-
-Hand off to SupervisorAgent.""",
-        llm=llm,
-        tools=[get_growth_data],
-        can_handoff_to=["SupervisorAgent"]
-    )
-
-
-def create_supervisor_agent(llm):
-    return FunctionAgent(
-        name="SupervisorAgent",
-        description="Synthesize all analyses into 8-section credit report",
-        system_prompt="""You are the Chief Credit Officer. Synthesize all specialist analyses into comprehensive report.
-
-**Task:**
-1. Call compile_final_report
-2. Extract 3-4 credit strengths from specialist outputs
-3. Extract 3-4 credit risks from specialist outputs
-4. Provide rating outlook
-
-**Required Format:**
-
-# Credit Analysis: {company_name}
-**S&P Rating:** {rating} | **Composite Score:** {composite_score}/100 | **Band:** {rating_band}
-
-## 1. Executive Summary
-[3-4 sentences: overall profile, key themes]
-
-## 2. Profitability Analysis
-[ProfitabilityAgent output verbatim]
-
-## 3. Leverage Analysis
-[LeverageAgent output verbatim]
-
-## 4. Liquidity Analysis
-[LiquidityAgent output verbatim]
-
-## 5. Cash Flow & Growth Analysis
-[CashFlowAgent + GrowthAgent outputs combined]
-
-## 6. Credit Strengths
-- **[Strength 1]:** [1-2 sentences with metrics]
-- **[Strength 2]:** [1-2 sentences with metrics]
-- **[Strength 3]:** [1-2 sentences with metrics]
-
-## 7. Credit Risks & Concerns
-- **[Risk 1]:** [1-2 sentences with metrics]
-- **[Risk 2]:** [1-2 sentences with metrics]
-- **[Risk 3]:** [1-2 sentences with metrics]
-
-## 8. Rating Outlook & Recommendation
-[3-4 sentences on trajectory, catalysts]
-
-**Output ONLY the markdown report above.**""",
-        llm=llm,
-        tools=[compile_final_report],
-        can_handoff_to=[]
-    )
 
 
 async def generate_multiagent_credit_report(
@@ -12654,7 +13318,7 @@ async def generate_multiagent_credit_report(
             if isinstance(val, (int, float)):
                 return f"{val:.2f}"
             return str(val)
-        except:
+        except Exception:
             return default
 
     # Extract profitability metrics
@@ -12691,23 +13355,21 @@ async def generate_multiagent_credit_report(
         name = state['company_name']
         metrics = state['metrics']
 
-        prompt = f"""Analyze {name}'s profitability performance using raw financial metrics.
-
-**Profitability Score:** {prof_score:.1f}/100
-
-**Raw Financial Metrics:**
-- EBITDA Margin: {metrics['ebitda_margin']}%
-- ROA (Return on Assets): {metrics['roa']}%
-- Net Margin: {metrics['net_margin']}%
-
-**Instructions:**
-Provide a 2-3 paragraph assessment covering:
-1. Analyze the actual margin levels (EBITDA, Net) and ROA - are these strong/weak for the industry?
-2. What do these metrics reveal about operational efficiency and profitability quality?
-3. How do these financials support or contradict the {prof_score:.1f}/100 score?
-4. Compare to typical thresholds (e.g., EBITDA margins >20% = strong, 10-20% = moderate, <10% = weak)
-
-Be specific and reference the actual metric values, not just the score."""
+        prompt = (
+            f"Analyze {name}'s profitability performance using raw financial metrics.\n\n"
+            f"**Profitability Score:** {prof_score:.1f}/100\n\n"
+            f"**Raw Financial Metrics:**\n"
+            f"- EBITDA Margin: {metrics['ebitda_margin']}%\n"
+            f"- ROA (Return on Assets): {metrics['roa']}%\n"
+            f"- Net Margin: {metrics['net_margin']}%\n\n"
+            f"**Instructions:**\n"
+            f"Provide a 2-3 paragraph assessment covering:\n"
+            f"1. Analyze the actual margin levels (EBITDA, Net) and ROA - are these strong/weak for the industry?\n"
+            f"2. What do these metrics reveal about operational efficiency and profitability quality?\n"
+            f"3. How do these financials support or contradict the {prof_score:.1f}/100 score?\n"
+            f"4. Compare to typical thresholds (e.g., EBITDA margins >20% = strong, 10-20% = moderate, <10% = weak)\n\n"
+            f"Be specific and reference the actual metric values, not just the score."
+        )
 
         response = await llm.acomplete(prompt, temperature=0.3, max_tokens=1200)
         analysis = response.text
@@ -12722,16 +13384,15 @@ Be specific and reference the actual metric values, not just the score."""
         lev_score = state['factor_scores'].get('leverage_score', 50)
         name = state['company_name']
 
-        prompt = f"""Analyze {name}'s leverage position.
-
-**Leverage Score:** {lev_score:.1f}/100
-
-Provide a 2-3 paragraph assessment covering:
-1. Debt levels and overall leverage assessment
-2. Capital structure quality
-3. Leverage trajectory and financial flexibility
-
-Be specific and reference the score."""
+        prompt = (
+            f"Analyze {name}'s leverage position.\n\n"
+            f"**Leverage Score:** {lev_score:.1f}/100\n\n"
+            f"Provide a 2-3 paragraph assessment covering:\n"
+            f"1. Debt levels and overall leverage assessment\n"
+            f"2. Capital structure quality\n"
+            f"3. Leverage trajectory and financial flexibility\n\n"
+            f"Be specific and reference the score."
+        )
 
         response = await llm.acomplete(prompt, temperature=0.3, max_tokens=1200)
         analysis = response.text
@@ -12746,16 +13407,15 @@ Be specific and reference the score."""
         liq_score = state['factor_scores'].get('liquidity_score', 50)
         name = state['company_name']
 
-        prompt = f"""Analyze {name}'s liquidity position.
-
-**Liquidity Score:** {liq_score:.1f}/100
-
-Provide a 2-3 paragraph assessment covering:
-1. Current liquidity adequacy
-2. Ability to meet short-term obligations
-3. Interest coverage and debt serviceability
-
-Be specific and reference the score."""
+        prompt = (
+            f"Analyze {name}'s liquidity position.\n\n"
+            f"**Liquidity Score:** {liq_score:.1f}/100\n\n"
+            f"Provide a 2-3 paragraph assessment covering:\n"
+            f"1. Current liquidity adequacy\n"
+            f"2. Ability to meet short-term obligations\n"
+            f"3. Interest coverage and debt serviceability\n\n"
+            f"Be specific and reference the score."
+        )
 
         response = await llm.acomplete(prompt, temperature=0.3, max_tokens=1200)
         analysis = response.text
@@ -12770,16 +13430,15 @@ Be specific and reference the score."""
         cf_score = state['factor_scores'].get('cash_flow_score', 50)
         name = state['company_name']
 
-        prompt = f"""Analyze {name}'s cash flow quality.
-
-**Cash Flow Score:** {cf_score:.1f}/100
-
-Provide a 2-3 paragraph assessment covering:
-1. Operating cash flow quality and sustainability
-2. Free cash flow generation capacity
-3. Cash conversion efficiency
-
-Be specific and reference the score."""
+        prompt = (
+            f"Analyze {name}'s cash flow quality.\n\n"
+            f"**Cash Flow Score:** {cf_score:.1f}/100\n\n"
+            f"Provide a 2-3 paragraph assessment covering:\n"
+            f"1. Operating cash flow quality and sustainability\n"
+            f"2. Free cash flow generation capacity\n"
+            f"3. Cash conversion efficiency\n\n"
+            f"Be specific and reference the score."
+        )
 
         response = await llm.acomplete(prompt, temperature=0.3, max_tokens=1200)
         analysis = response.text
@@ -12806,106 +13465,76 @@ Be specific and reference the score."""
         liq_analysis = state.get('liquidity_analysis', 'Not available')
         cf_analysis = state.get('cash_flow_analysis', 'Not available')
 
-
-        prompt = f"""You are an expert credit analyst. Synthesize the specialist analyses below into a comprehensive credit report for {name}.
-
-**Company Overview:**
-- Company Name: {name}
-- S&P Rating: {rating_val}
-- Composite Score: {comp_score:.1f}/100
-- Rating Band: {band}
-- Industry Classification: {classification}
-
-**Factor Scores (0-100 scale, higher is better):**
-- Credit Score: {f_scores.get('credit_score', 50):.1f}/100
-- Leverage Score: {f_scores.get('leverage_score', 50):.1f}/100
-- Profitability Score: {f_scores.get('profitability_score', 50):.1f}/100
-- Liquidity Score: {f_scores.get('liquidity_score', 50):.1f}/100
-- Growth Score: {f_scores.get('growth_score', 50):.1f}/100
-- Cash Flow Score: {f_scores.get('cash_flow_score', 50):.1f}/100
-
-**Specialist Agent Analyses:**
-
-### Profitability Analysis
-{prof_analysis}
-
-### Leverage Analysis
-{lev_analysis}
-
-### Liquidity Analysis
-{liq_analysis}
-
-### Cash Flow Analysis
-{cf_analysis}
-
-### Growth Analysis
-{gr_analysis}
-
-**INSTRUCTIONS:**
-Create a COMPLETE, professional credit report with ALL sections below.
-
-## Comprehensive Credit Analysis: {name}
-
-### Executive Summary
-- Current Rating: {rating_val} | Composite Score: {comp_score:.1f}/100 | Band: {band}
-- Industry: {classification}
-- 3-4 sentence overview synthesizing key themes from all 5 specialist analyses
-- Primary rating drivers and risk positioning
-
----
-
-### Specialist Agent Analyses
-
-#### Profitability Analysis (Score: {f_scores.get('profitability_score', 50):.1f}/100)
-{prof_analysis}
-
-#### Leverage Analysis (Score: {f_scores.get('leverage_score', 50):.1f}/100)
-{lev_analysis}
-
-#### Liquidity Analysis (Score: {f_scores.get('liquidity_score', 50):.1f}/100)
-{liq_analysis}
-
-#### Cash Flow Analysis (Score: {f_scores.get('cash_flow_score', 50):.1f}/100)
-{cf_analysis}
-
-
-
----
-
-### Factor Analysis Summary
-Synthesize the specialist findings:
-- **Credit Score** ({f_scores.get('credit_score', 50):.1f}/100): Balance sheet strength
-- **Profitability** ({f_scores.get('profitability_score', 50):.1f}/100): Key themes from analysis above
-- **Leverage** ({f_scores.get('leverage_score', 50):.1f}/100): Key themes from analysis above
-- **Liquidity** ({f_scores.get('liquidity_score', 50):.1f}/100): Key themes from analysis above
-- **Cash Flow** ({f_scores.get('cash_flow_score', 50):.1f}/100): Key themes from analysis above
-
-
-Indicate strengths (70+), moderate performance (50-69), and weaknesses (<50) in your analysis.
-
-### Credit Strengths
-Extract 3-4 key positives from specialist analyses:
-1. [Strength with score support]
-2. [Strength with score support]
-3. [Strength with score support]
-4. [Strength with score support]
-
-### Credit Risks & Concerns
-Extract 3-4 key weaknesses from specialist analyses:
-1. [Risk with score support]
-2. [Risk with score support]
-3. [Risk with score support]
-4. [Risk with score support]
-
-### Rating Outlook & Investment Recommendation
-- **Rating Appropriateness**: Is {rating_val} justified given {comp_score:.1f}/100 composite?
-- **Upgrade Triggers**: What improvements would drive rating higher?
-- **Downgrade Risks**: What deterioration would pressure rating?
-- **Investment Recommendation**: Strong Buy/Buy/Hold/Avoid based on risk-reward
-
-**CRITICAL**: Complete ALL sections. Do NOT truncate. Target 1000-1200 words.
-
-Begin the complete report now:"""
+        prompt = (
+            f"You are an expert credit analyst. Synthesize the specialist analyses below into a comprehensive credit report for {name}.\n\n"
+            f"**Company Overview:**\n"
+            f"- Company Name: {name}\n"
+            f"- S&P Rating: {rating_val}\n"
+            f"- Composite Score: {comp_score:.1f}/100\n"
+            f"- Rating Band: {band}\n"
+            f"- Industry Classification: {classification}\n\n"
+            f"**Factor Scores (0-100 scale, higher is better):**\n"
+            f"- Credit Score: {f_scores.get('credit_score', 50):.1f}/100\n"
+            f"- Leverage Score: {f_scores.get('leverage_score', 50):.1f}/100\n"
+            f"- Profitability Score: {f_scores.get('profitability_score', 50):.1f}/100\n"
+            f"- Liquidity Score: {f_scores.get('liquidity_score', 50):.1f}/100\n"
+            f"- Cash Flow Score: {f_scores.get('cash_flow_score', 50):.1f}/100\n\n"
+            f"**Specialist Agent Analyses:**\n\n"
+            f"### Profitability Analysis\n"
+            f"{prof_analysis}\n\n"
+            f"### Leverage Analysis\n"
+            f"{lev_analysis}\n\n"
+            f"### Liquidity Analysis\n"
+            f"{liq_analysis}\n\n"
+            f"### Cash Flow Analysis\n"
+            f"{cf_analysis}\n\n"
+            f"**INSTRUCTIONS:**\n"
+            f"Create a COMPLETE, professional credit report with ALL sections below.\n\n"
+            f"## Comprehensive Credit Analysis: {name}\n\n"
+            f"### Executive Summary\n"
+            f"- Current Rating: {rating_val} | Composite Score: {comp_score:.1f}/100 | Band: {band}\n"
+            f"- Industry: {classification}\n"
+            f"- 3-4 sentence overview synthesizing key themes from all 5 specialist analyses\n"
+            f"- Primary rating drivers and risk positioning\n\n"
+            f"---\n\n"
+            f"### Specialist Agent Analyses\n\n"
+            f"#### Profitability Analysis (Score: {f_scores.get('profitability_score', 50):.1f}/100)\n"
+            f"{prof_analysis}\n\n"
+            f"#### Leverage Analysis (Score: {f_scores.get('leverage_score', 50):.1f}/100)\n"
+            f"{lev_analysis}\n\n"
+            f"#### Liquidity Analysis (Score: {f_scores.get('liquidity_score', 50):.1f}/100)\n"
+            f"{liq_analysis}\n\n"
+            f"#### Cash Flow Analysis (Score: {f_scores.get('cash_flow_score', 50):.1f}/100)\n"
+            f"{cf_analysis}\n\n"
+            f"---\n\n"
+            f"### Factor Analysis Summary\n"
+            f"Synthesize the specialist findings:\n"
+            f"- **Credit Score** ({f_scores.get('credit_score', 50):.1f}/100): Balance sheet strength\n"
+            f"- **Profitability** ({f_scores.get('profitability_score', 50):.1f}/100): Key themes from analysis above\n"
+            f"- **Leverage** ({f_scores.get('leverage_score', 50):.1f}/100): Key themes from analysis above\n"
+            f"- **Liquidity** ({f_scores.get('liquidity_score', 50):.1f}/100): Key themes from analysis above\n"
+            f"- **Cash Flow** ({f_scores.get('cash_flow_score', 50):.1f}/100): Key themes from analysis above\n\n"
+            f"Indicate strengths (70+), moderate performance (50-69), and weaknesses (<50) in your analysis.\n\n"
+            f"### Credit Strengths\n"
+            f"Extract 3-4 key positives from specialist analyses:\n"
+            f"1. [Strength with score support]\n"
+            f"2. [Strength with score support]\n"
+            f"3. [Strength with score support]\n"
+            f"4. [Strength with score support]\n\n"
+            f"### Credit Risks & Concerns\n"
+            f"Extract 3-4 key weaknesses from specialist analyses:\n"
+            f"1. [Risk with score support]\n"
+            f"2. [Risk with score support]\n"
+            f"3. [Risk with score support]\n"
+            f"4. [Risk with score support]\n\n"
+            f"### Rating Outlook & Investment Recommendation\n"
+            f"- **Rating Appropriateness**: Is {rating_val} justified given {comp_score:.1f}/100 composite?\n"
+            f"- **Upgrade Triggers**: What improvements would drive rating higher?\n"
+            f"- **Downgrade Risks**: What deterioration would pressure rating?\n"
+            f"- **Investment Recommendation**: Strong Buy/Buy/Hold/Avoid based on risk-reward\n\n"
+            f"**CRITICAL**: Complete ALL sections. Do NOT truncate. Target 1000-1200 words.\n\n"
+            f"Begin the complete report now:"
+        )
 
         response = await llm.acomplete(
             prompt,
@@ -12945,20 +13574,13 @@ Begin the complete report now:"""
     cf_agent = FunctionAgent(
         name="CashFlowAgent",
         description="Analyze cash flow metrics.",
-        system_prompt="Analyze cash flow score and provide commentary. Hand off to GrowthAgent when complete.",
+        system_prompt="Analyze cash flow score and provide commentary. Hand off to SupervisorAgent when complete.",
         llm=llm,
         tools=[analyze_cash_flow_tool],
-        can_handoff_to=["GrowthAgent"],
-    )
-
-    growth_agent = FunctionAgent(
-        name="GrowthAgent",
-        description="Analyze growth trends.",
-        system_prompt="Analyze growth score and provide commentary. Hand off to SupervisorAgent when complete.",
-        llm=llm,
-        tools=[analyze_growth_tool],
         can_handoff_to=["SupervisorAgent"],
     )
+
+    # growth_agent removed - Growth no longer in 5-factor model
 
     supervisor_agent = FunctionAgent(
         name="SupervisorAgent",
@@ -12966,12 +13588,12 @@ Begin the complete report now:"""
         system_prompt="Collect all specialist analyses and compile comprehensive report. If analyses missing, hand back to appropriate agent.",
         llm=llm,
         tools=[compile_final_report_tool],
-        can_handoff_to=["ProfitabilityAgent", "LeverageAgent", "LiquidityAgent", "CashFlowAgent", "GrowthAgent"],
+        can_handoff_to=["ProfitabilityAgent", "LeverageAgent", "LiquidityAgent", "CashFlowAgent"],
     )
 
     # Create workflow - SIMPLE structure per PDF
     workflow = AgentWorkflow(
-        agents=[prof_agent, lev_agent, liq_agent, cf_agent, growth_agent, supervisor_agent],
+        agents=[prof_agent, lev_agent, liq_agent, cf_agent, supervisor_agent],
         root_agent="ProfitabilityAgent",  # String name!
         initial_state={
             "company_name": company_name,
@@ -12984,7 +13606,7 @@ Begin the complete report now:"""
             "leverage_analysis": None,
             "liquidity_analysis": None,
             "cash_flow_analysis": None,
-            "growth_analysis": None,
+
         }
     )
 
@@ -13071,91 +13693,71 @@ def generate_streamlined_credit_report(
     financial_section = "\n".join(metrics_text) if metrics_text else "Limited historical data available"
 
     # Build comprehensive prompt
-    prompt = f"""You are an expert fixed income credit analyst preparing a comprehensive credit report.
-
-**Company Overview:**
-- Name: {company_name}
-- S&P Rating: {rating}
-- Rating Band: {rating_band}
-- Classification: {classification}
-- Parent Sector: {parent_sector}
-- Composite Score: {composite_score:.1f}/100
-
-**Factor Scores (0-100 scale, higher is better):**
-- Credit Score: {factor_scores.get('credit_score', 50):.1f}/100
-- Leverage Score: {factor_scores.get('leverage_score', 50):.1f}/100
-- Profitability Score: {factor_scores.get('profitability_score', 50):.1f}/100
-- Liquidity Score: {factor_scores.get('liquidity_score', 50):.1f}/100
-
-- Cash Flow Score: {factor_scores.get('cash_flow_score', 50):.1f}/100
-
-**Model Weights Used ({parent_sector} sector):**
-- Credit: {weights_used.get('credit_score', 0.20)*100:.0f}%
-- Leverage: {weights_used.get('leverage_score', 0.20)*100:.0f}%
-- Profitability: {weights_used.get('profitability_score', 0.20)*100:.0f}%
-- Liquidity: {weights_used.get('liquidity_score', 0.10)*100:.0f}%
-
-- Cash Flow: {weights_used.get('cash_flow_score', 0.15)*100:.0f}%
-
-**Historical Financial Metrics:**
-{financial_section}
-
-**Instructions:**
-Please provide a comprehensive credit analysis report with the following structure:
-
-1. **Executive Summary** (3-4 sentences)
-   - Overall credit quality assessment based on composite score and factor scores
-   - Key rating drivers (identify which factors are strongest/weakest)
-   - Risk positioning (investment grade vs high yield characteristics)
-
-2. **Profitability Analysis** (Score: {factor_scores.get('profitability_score', 50):.1f}/100)
-   - EBITDA margin trends and interpretation
-   - ROE/ROA performance relative to sector
-   - Profitability sustainability assessment
-
-3. **Leverage Analysis** (Score: {factor_scores.get('leverage_score', 50):.1f}/100)
-   - Total Debt/EBITDA and Net Debt/EBITDA trends
-   - Leverage trajectory (improving vs deteriorating)
-   - Comparison to rating band norms
-
-4. **Liquidity & Coverage Analysis** (Score: {factor_scores.get('liquidity_score', 50):.1f}/100)
-   - Current ratio and cash position trends
-   - Interest coverage analysis
-   - Debt serviceability assessment
-
-5. **Cash Flow Analysis** (Score: {factor_scores.get('cash_flow_score', 50):.1f}/100)
-   - Operating cash flow quality and trends
-   - Free cash flow generation capacity
-   - Cash conversion efficiency
-
-6. **Growth Analysis** (Score: {factor_scores.get('growth_score', 50):.1f}/100)
-   - Revenue and EBITDA growth trends
-   - Growth momentum assessment
-   - Sustainability of growth trajectory
-
-7. **Credit Strengths**
-   - List 3-4 key positive credit factors based on factor scores
-   - Support each with specific data points and scores
-
-8. **Credit Risks & Concerns**
-   - List 3-4 key risk factors based on weak factor scores
-   - Support each with specific data points and scores
-
-9. **Rating Outlook & Investment Recommendation**
-   - Is the current {rating} rating appropriate given the {composite_score:.1f}/100 composite score?
-   - What could trigger an upgrade or downgrade?
-   - Investment recommendation from a credit perspective
-
-**Formatting Requirements:**
-- Use clear markdown formatting with headers (##, ###)
-- Bold key metrics and conclusions
-- Use bullet points for lists
-- Be specific and reference actual numbers from the factor scores and historical data
-- Keep tone professional and analytical
-- Total length: 800-1000 words
-- Focus on data-driven insights rather than generic statements
-
-Generate the complete report now:"""
+    prompt = (
+        f"You are an expert fixed income credit analyst preparing a comprehensive credit report.\n\n"
+        f"**Company Overview:**\n"
+        f"- Name: {company_name}\n"
+        f"- S&P Rating: {rating}\n"
+        f"- Rating Band: {rating_band}\n"
+        f"- Classification: {classification}\n"
+        f"- Parent Sector: {parent_sector}\n"
+        f"- Composite Score: {composite_score:.1f}/100\n\n"
+        f"**Factor Scores (0-100 scale, higher is better):**\n"
+        f"- Credit Score: {factor_scores.get('credit_score', 50):.1f}/100\n"
+        f"- Leverage Score: {factor_scores.get('leverage_score', 50):.1f}/100\n"
+        f"- Profitability Score: {factor_scores.get('profitability_score', 50):.1f}/100\n"
+        f"- Liquidity Score: {factor_scores.get('liquidity_score', 50):.1f}/100\n\n"
+        f"- Cash Flow Score: {factor_scores.get('cash_flow_score', 50):.1f}/100\n\n"
+        f"**Model Weights Used ({parent_sector} sector):**\n"
+        f"- Credit: {weights_used.get('credit_score', 0.20)*100:.0f}%\n"
+        f"- Leverage: {weights_used.get('leverage_score', 0.20)*100:.0f}%\n"
+        f"- Profitability: {weights_used.get('profitability_score', 0.20)*100:.0f}%\n"
+        f"- Liquidity: {weights_used.get('liquidity_score', 0.10)*100:.0f}%\n\n"
+        f"- Cash Flow: {weights_used.get('cash_flow_score', 0.15)*100:.0f}%\n\n"
+        f"**Historical Financial Metrics:**\n"
+        f"{financial_section}\n\n"
+        f"**Instructions:**\n"
+        f"Please provide a comprehensive credit analysis report with the following structure:\n\n"
+        f"1. **Executive Summary** (3-4 sentences)\n"
+        f"   - Overall credit quality assessment based on composite score and factor scores\n"
+        f"   - Key rating drivers (identify which factors are strongest/weakest)\n"
+        f"   - Risk positioning (investment grade vs high yield characteristics)\n\n"
+        f"2. **Profitability Analysis** (Score: {factor_scores.get('profitability_score', 50):.1f}/100)\n"
+        f"   - EBITDA margin trends and interpretation\n"
+        f"   - ROE/ROA performance relative to sector\n"
+        f"   - Profitability sustainability assessment\n\n"
+        f"3. **Leverage Analysis** (Score: {factor_scores.get('leverage_score', 50):.1f}/100)\n"
+        f"   - Total Debt/EBITDA and Net Debt/EBITDA trends\n"
+        f"   - Leverage trajectory (improving vs deteriorating)\n"
+        f"   - Comparison to rating band norms\n\n"
+        f"4. **Liquidity & Coverage Analysis** (Score: {factor_scores.get('liquidity_score', 50):.1f}/100)\n"
+        f"   - Current ratio and cash position trends\n"
+        f"   - Interest coverage analysis\n"
+        f"   - Debt serviceability assessment\n\n"
+        f"5. **Cash Flow Analysis** (Score: {factor_scores.get('cash_flow_score', 50):.1f}/100)\n"
+        f"   - Operating cash flow quality and trends\n"
+        f"   - Free cash flow generation capacity\n"
+        f"   - Cash conversion efficiency\n\n"
+        f"6. **Credit Strengths**\n"
+        f"   - List 3-4 key positive credit factors based on factor scores\n"
+        f"   - Support each with specific data points and scores\n\n"
+        f"7. **Credit Risks & Concerns**\n"
+        f"   - List 3-4 key risk factors based on weak factor scores\n"
+        f"   - Support each with specific data points and scores\n\n"
+        f"8. **Rating Outlook & Investment Recommendation**\n"
+        f"   - Is the current {rating} rating appropriate given the {composite_score:.1f}/100 composite score?\n"
+        f"   - What could trigger an upgrade or downgrade?\n"
+        f"   - Investment recommendation from a credit perspective\n\n"
+        f"**Formatting Requirements:**\n"
+        f"- Use clear markdown formatting with headers (##, ###)\n"
+        f"- Bold key metrics and conclusions\n"
+        f"- Use bullet points for lists\n"
+        f"- Be specific and reference actual numbers from the factor scores and historical data\n"
+        f"- Keep tone professional and analytical\n"
+        f"- Total length: 800-1000 words\n"
+        f"- Focus on data-driven insights rather than generic statements\n\n"
+        f"Generate the complete report now:"
+    )
 
     # Make single LLM call
     try:
@@ -13262,13 +13864,22 @@ if HAS_DATA:
     # ========================================================================
 
     # Clear cached calibrated weights from session state when calibration is off
+    # Only clear cache when calibration state CHANGES, not every rerun
+    previous_calibration_state = st.session_state.get('_previous_calibration_state')
+    calibration_changed = previous_calibration_state is not None and previous_calibration_state != use_dynamic_calibration
+    
     if not use_dynamic_calibration:
         if '_calibrated_weights' in st.session_state:
             del st.session_state['_calibrated_weights']
         if 'last_calibration_state' in st.session_state:
             del st.session_state['last_calibration_state']
-        # Force Streamlit to clear the cache when calibration toggle changes
-        st.cache_data.clear()
+        # Only clear cache when calibration toggle CHANGES (not every rerun)
+        if calibration_changed:
+            st.cache_data.clear()
+            st.toast("🔄 Calibration disabled - cache cleared", icon="ℹ️")
+    
+    # Track calibration state for next rerun
+    st.session_state['_previous_calibration_state'] = use_dynamic_calibration
 
     # [FIX] Force cache clear on first run after calibration logic fix
     # This ensures old cached results with broken sector mappings/calibration are invalidated
@@ -13284,7 +13895,7 @@ if HAS_DATA:
     with st.spinner("Loading and processing data..."):
         # [V2.3] Create cache buster from unified period selection parameters
         reference_date_str = str(reference_date_override) if reference_date_override else 'none'
-        cache_key = f"{period_mode.value}_{reference_date_str}_{use_dynamic_calibration}_{calibration_rating_band}_v5.0"
+        cache_key = f"{period_mode.value}_{reference_date_str}_{use_dynamic_calibration}_{calibration_rating_band}_{CACHE_VERSION}"
 
         # ====================================================================
         # DIAGNOSTIC: Capture and validate configuration
@@ -13488,12 +14099,12 @@ if HAS_DATA:
                 st.dataframe(bottom10, use_container_width=True, hide_index=True)
 
             # Ranking methodology explanation
-            st.info("""
-            **Ranking Methodology:** Results are ranked by actionability - recommendations are prioritized
-            (Strong Buy > Buy > Hold > Avoid), with quality score breaking ties within each recommendation tier.
-            This ensures "top opportunities" are issuers you'd actually act on, not just high-quality credits
-            with deteriorating trends.
-            """)
+            st.info(
+                "**Ranking Methodology:** Results are ranked by actionability - recommendations are prioritized "
+                "(Strong Buy > Buy > Hold > Avoid), with quality score breaking ties within each recommendation tier. "
+                "This ensures \"top opportunities\" are issuers you'd actually act on, not just high-quality credits "
+                "with deteriorating trends."
+            )
 
             # Four Quadrant Analysis
             st.subheader("Four Quadrant Analysis: Quality vs. Momentum")
@@ -13678,17 +14289,17 @@ if HAS_DATA:
             st.markdown("---")
             st.subheader("Principal Component Analysis")
 
-            st.markdown("""
-            **Principal Component Analysis** reveals the underlying structure of the 5 credit factors
-            and shows how they contribute to overall variation across issuers. The radar charts display
-            each factor's loading (contribution) on the principal components.
-            """)
+            st.markdown(
+                "**Principal Component Analysis** reveals the underlying structure of the 6 factors (5 quality + trend) "
+                "and shows how they contribute to overall variation across issuers. The radar charts display "
+                "each factor's loading (contribution) on the principal components."
+            )
 
             try:
                 from plotly.subplots import make_subplots
 
                 # Get factor score columns and filter by coverage (min 50%)
-                all_factor_cols = [c for c in results_final.columns if c.endswith("_Score") and c != "Composite_Score"]
+                all_factor_cols = [c for c in results_final.columns if c.endswith("_Score") and c not in ("Composite_Score", "Quality_Score")]
 
                 # Filter out factors with <50% coverage
                 score_cols = []
@@ -14024,19 +14635,19 @@ if HAS_DATA:
 
                 with col_guide1:
                     st.markdown("**How to Read**")
-                    st.markdown("""
-                    - **Distance from center**: Strength of factor's contribution
-                    - **Positive values** (outward): Factor increases with PC
-                    - **Negative values** (opposite): Factor decreases with PC
-                    """)
+                    st.markdown(
+                        "- **Distance from center**: Strength of factor's contribution\n"
+                        "- **Positive values** (outward): Factor increases with PC\n"
+                        "- **Negative values** (opposite): Factor decreases with PC"
+                    )
 
                 with col_guide2:
                     st.markdown("**Interpretation**")
-                    st.markdown("""
-                    - **Near ±1.0**: Very strong influence
-                    - **Near ±0.5**: Moderate influence
-                    - **Near 0.0**: Weak influence
-                    """)
+                    st.markdown(
+                        "- **Near ±1.0**: Very strong influence\n"
+                        "- **Near ±0.5**: Moderate influence\n"
+                        "- **Near 0.0**: Weak influence"
+                    )
 
                 # ========================================================================
                 # SECTION 4: DETAILED INSIGHTS (EXPANDABLE)
@@ -14095,7 +14706,7 @@ if HAS_DATA:
             except Exception as e:
                 # Get diagnostic info
                 try:
-                    all_factor_cols = [c for c in results_final.columns if c.endswith("_Score") and c != "Composite_Score"]
+                    all_factor_cols = [c for c in results_final.columns if c not in ("Composite_Score", "Quality_Score") and c.endswith("_Score")]
                     X_check = results_final[all_factor_cols].apply(pd.to_numeric, errors='coerce')
                     valid_per_col = X_check.notna().sum()
                     complete_rows = X_check.dropna().shape[0]
@@ -14116,7 +14727,7 @@ if HAS_DATA:
                         elif valid_per_col.min() < len(results_final) * 0.5:
                             st.warning("Some factors have >50% missing values")
                             st.info("**Suggestion**: Review your factor calculation logic or data quality")
-                except:
+                except Exception:
                     st.warning(f"PCA analysis unavailable: {e}")
                     st.caption("This may occur with insufficient data or if factor scores are missing.")
 
@@ -14129,21 +14740,56 @@ if HAS_DATA:
             st.subheader("Score Distribution by Rating Group")
 
             fig = go.Figure()
+            
+            # Color scheme matching app theme
+            colors = {
+                'Investment Grade': '#2C5697',  # Dark blue
+                'High Yield': '#7FBFFF'         # Light blue
+            }
+            fill_colors = {
+                'Investment Grade': 'rgba(44, 86, 151, 0.4)',
+                'High Yield': 'rgba(127, 191, 255, 0.4)'
+            }
+            
             for group in ['Investment Grade', 'High Yield']:
-                group_data = results_final[results_final['Rating_Group'] == group]['Composite_Score']
-                fig.add_trace(go.Histogram(
-                    x=group_data,
-                    name=group,
-                    opacity=0.7,
-                    nbinsx=20
-                ))
+                group_data = results_final[results_final['Rating_Group'] == group]['Composite_Score'].dropna()
+                
+                if len(group_data) > 1:
+                    # Calculate KDE for smooth curve
+                    kde = gaussian_kde(group_data, bw_method=0.3)
+                    
+                    # Create smooth x range
+                    x_min = max(0, group_data.min() - 5)
+                    x_max = min(100, group_data.max() + 5)
+                    x_range = np.linspace(x_min, x_max, 200)
+                    y_density = kde(x_range)
+                    
+                    # Scale density to approximate counts
+                    bin_width = (group_data.max() - group_data.min()) / 20
+                    y_scaled = y_density * len(group_data) * bin_width
+                    
+                    fig.add_trace(go.Scatter(
+                        x=x_range,
+                        y=y_scaled,
+                        name=group,
+                        fill='tozeroy',
+                        mode='lines',
+                        line=dict(width=2, color=colors[group]),
+                        fillcolor=fill_colors[group]
+                    ))
 
             fig.update_layout(
-                barmode='overlay',
                 xaxis_title='Composite Score',
                 yaxis_title='Count',
                 title='Composite Score Distribution',
-                height=400
+                height=400,
+                hovermode='x unified',
+                legend=dict(
+                    yanchor="top",
+                    y=0.99,
+                    xanchor="right",
+                    x=0.99
+                )
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -14493,12 +15139,12 @@ if HAS_DATA:
                             compare_df = pd.DataFrame(compare_data)
                             st.dataframe(compare_df, use_container_width=True, hide_index=True)
 
-                            st.markdown("""
-                            **Interpreting weight changes:**
-                            - **Decreased weights** → Sector deviates from market on this factor, so we reduce its influence
-                            - **Increased weights** → Sector is neutral on this factor, so we emphasize it for differentiation
-                            - **Large changes (>50%)** → Factor shows significant structural difference in this sector
-                            """)
+                            st.markdown(
+                                "**Interpreting weight changes:**\n"
+                                "- **Decreased weights** -> Sector deviates from market on this factor, so we reduce its influence\n"
+                                "- **Increased weights** -> Sector is neutral on this factor, so we emphasize it for differentiation\n"
+                                "- **Large changes (>50%)** -> Factor shows significant structural difference in this sector"
+                            )
                     else:
                         st.info("Weight comparison unavailable (calibration may have failed or not yet calculated).")
 
@@ -14693,7 +15339,7 @@ if HAS_DATA:
                 export_cols = [
                     "Company_ID", "Company_Name", "Credit_Rating_Clean", "Rating_Band", "Rating_Group",
                     "Composite_Score", "Composite_Percentile_in_Band",
-                    "Credit_Score", "Leverage_Score", "Profitability_Score", "Liquidity_Score", "Growth_Score", "Cash_Flow_Score",
+                    "Credit_Score", "Leverage_Score", "Profitability_Score", "Liquidity_Score", "Cash_Flow_Score",
                     "Cycle_Position_Score", "Band_Rank", "Overall_Rank", "Recommendation", "Combined_Signal",
                     "Financial_Last_Period_Date", "Financial_Data_Freshness_Days", "Financial_Data_Freshness_Flag",
                     "SP_Last_Review_Date", "Rating_Review_Freshness_Days", "Rating_Review_Freshness_Flag"
@@ -14785,74 +15431,7 @@ if HAS_DATA:
                 top_band.columns = ['Band Rank', 'Company', 'Rating', 'Classification', 'Score', 'Cycle', 'Signal', 'Rec']
                 st.dataframe(top_band, use_container_width=True, hide_index=True)
 
-                # ========================================================================
-                # HISTOGRAM with Quality Split Line (from df_band only)
-                # ========================================================================
-                st.subheader(f" Score Distribution - {selected_band} Band")
 
-                # Get quality split value using the same logic as the quadrant chart
-                _, x_split_for_hist, split_label, _ = resolve_quality_metric_and_split(
-                    df_band, split_basis, split_threshold
-                )
-
-                # Build histogram from df_band only
-                hist_data = df_band['Composite_Score'].dropna()
-
-                fig = go.Figure(data=[go.Histogram(
-                    x=hist_data,
-                    nbinsx=15,
-                    marker_color='#2C5697',
-                    name='Composite Score'
-                )])
-
-                # Add vertical line for quality split
-                if pd.notna(x_split_for_hist):
-                    fig.add_vline(
-                        x=x_split_for_hist,
-                        line_width=2,
-                        line_dash="dash",
-                        line_color="red",
-                        annotation_text=f"Quality Split: {x_split_for_hist:.1f}",
-                        annotation_position="top"
-                    )
-
-                # Determine annotation based on split basis
-                if split_basis == "Global Percentile":
-                    subtitle = f"Quality split at p{split_threshold:.0f} (Global Percentile mode)"
-                elif split_basis == "Percentile within Band (recommended)":
-                    subtitle = f"Quality split at p{split_threshold:.0f} within band (Recommended mode)"
-                else:
-                    subtitle = f"Quality split at p{split_threshold:.0f} of Composite Score (Absolute mode)"
-
-                fig.update_layout(
-                    xaxis_title='Composite Score',
-                    yaxis_title='Count',
-                    height=350,
-                    showlegend=False,
-                    title_text=subtitle,
-                    title_font_size=12
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-                # ========================================================================
-                # DEBUG SECTION (hidden by default)
-                # ========================================================================
-                _ENABLE_DEBUG = False  # Set to True to show debug info
-                if _ENABLE_DEBUG:
-                    with st.expander("🔍 Debug Info", expanded=False):
-                        st.write(f"**df_band size:** {len(df_band)} rows")
-                        st.write(f"**Valid Composite_Score count:** {issuers_count}")
-                        st.write(f"**Strong Buy count:** {strong_buy_count}")
-                        st.write(f"**Strong Buy %:** {strong_buy_pct:.2f}%")
-                        st.write(f"**Histogram data points:** {len(hist_data)}")
-                        st.write(f"**Quality split value:** {x_split_for_hist:.2f}")
-                        st.write(f"**Split basis:** {split_basis}")
-                        st.write(f"**Split threshold:** {split_threshold}")
-
-                        # Verify histogram count matches df_band
-                        assert len(hist_data) == df_band['Composite_Score'].notna().sum(), \
-                            "Histogram data count mismatch!"
-                        st.success("✓ Histogram count matches df_band non-NaN Composite_Score count")
             
             
         # ============================================================================
@@ -14925,11 +15504,12 @@ if HAS_DATA:
             st.dataframe(top_classification, use_container_width=True, hide_index=True)
             
         # ============================================================================
+        # ============================================================================
         # TAB 5: TREND ANALYSIS
         # ============================================================================
 
         with tab5:
-            st.header(" Cyclicality & Trend Analysis")
+            st.header("Cyclicality & Trend Analysis")
 
             # --- Normalize trend score column for this tab (idempotent) ---
             if 'Cycle_Position_Score' not in results_final.columns:
@@ -14942,13 +15522,9 @@ if HAS_DATA:
                 results_final['Cycle_Position_Score'] = pd.to_numeric(results_final['Cycle_Position_Score'], errors='coerce')
 
             # ========================================================================
-            # QUALITY/TREND CONFIGURATION (read-only, set via sidebar)
+            # CONFIGURATION - Use SSOT constants
             # ========================================================================
-            # [V2.3] quality_basis is now hard-coded
-            qs_basis = "Percentile within Band (recommended)"
-            q_thresh = 60  # Fixed threshold
-            t_thresh = 55  # Fixed threshold
-            st.caption(f"Quality split basis: {qs_basis} · Quality threshold: {q_thresh} · Trend threshold: {t_thresh}")
+            st.caption(f"Trend threshold: {TREND_THRESHOLD} · Issuers with Cycle Position Score ≥ {TREND_THRESHOLD} are classified as Improving")
 
             st.markdown("---")
 
@@ -14978,184 +15554,198 @@ if HAS_DATA:
             if trend_rating != 'All':
                 trend_data = trend_data[trend_data['Rating_Band'] == trend_rating]
 
-            # Period Calendar Debug Display
-            if period_calendar is not None and not period_calendar.empty:
-                if st.toggle("Show period calendar (debug)", value=False, key="show_period_calendar"):
-                    st.markdown("### Period Calendar (FY/CQ Overlap Resolution)")
-                    st.caption(f"**Overlaps removed:** {sum(1 for c in df_original.columns if 'Period Ended' in str(c)) * len(df_original) - len(period_calendar)} | **Prefer quarterly:** {use_quarterly_beta}")
-
-                    # Show summary pivot
-                    period_pivot = latest_periods(period_calendar, max_k_fy=4, max_k_cq=7)
-                    st.dataframe(period_pivot, use_container_width=True, hide_index=True)
-
-                    # Show raw period calendar
-                    with st.expander("Show full period calendar (all periods)"):
-                        st.dataframe(period_calendar, use_container_width=True, hide_index=True)
-
-            # Cycle Position Analysis
-            st.subheader("Business Cycle Position by Sector/Classification")
-            st.caption("Shows which sectors are improving (green) vs deteriorating (red). Cycle Position Score (0-100) is a composite of trend, volatility, and momentum across Debt/EBITDA, EBITDA Margin, Interest Coverage, and LFCF Margin.")
-
-            # Build sector/classification heatmap using the new helper
-            heatmap_data, agg_data = compute_trend_heatmap(
-                results_final,
-                selected_band=trend_rating,
-                trend_threshold=t_thresh,
-                min_count=5
-            )
-
-            if not heatmap_data.empty:
-                # Create color scale: red (bad) -> yellow (neutral) -> green (good)
-                fig = go.Figure(data=go.Heatmap(
-                    z=heatmap_data.values,
-                    x=heatmap_data.columns,
-                    y=heatmap_data.index,
-                    colorscale='RdYlGn',  # Red-Yellow-Green
-                    text=[[f'{val:.1f}' if pd.notna(val) else 'N/A' for val in row] for row in heatmap_data.values],
-                    texttemplate='%{text}',
-                    textfont={"size": 10},
-                    hoverongaps=False,
-                    colorbar=dict(title="Score")
-                ))
-
-                fig.update_layout(
-                    title='Sector/Classification Trend Heatmap',
-                    xaxis_title='',
-                    yaxis_title='Metric',
-                    height=400,
-                    xaxis={'side': 'bottom'},
-                    margin=dict(l=150, r=50, t=80, b=150)
-                )
-
-                # Rotate x-axis labels for readability
-                fig.update_xaxes(tickangle=-45)
-
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.caption("**Notes:** % Improving uses the Trend threshold only. The Quality threshold affects the quadrant split, not this heatmap. Classifications with <5 issuers in the selected band are hidden (NaN).")
-
-                # Debug expander to verify counts and % Improving calculations
-                with st.expander("Debug: heatmap inputs"):
-                    st.text(f"Trend threshold used: {t_thresh} · Rating Band: {trend_rating} · Classification: {trend_classification}")
-
-                    # Show period calendar info if available
-                    if period_calendar is not None and not period_calendar.empty:
-                        st.markdown("**Period Calendar Summary:**")
-                        period_summary = period_calendar.groupby(['period_type', 'k'], as_index=False)['period_end_date'].agg(['count', 'min', 'max'])
-                        st.dataframe(period_summary, use_container_width=True)
-
-                    st.markdown("**Aggregation Data:**")
-                    st.dataframe(agg_data, use_container_width=True)
-
-                # Summary metrics (using non-NaN data only)
-                if not agg_data.empty:
-                    # Filter out NaN rows for summary metrics
-                    valid_agg = agg_data[agg_data['Avg_Cycle_Position'].notna()].copy()
-
-                    if not valid_agg.empty:
-                        col1, col2, col3 = st.columns(3)
-
-                        # Sort by Avg_Cycle_Position for best/worst
-                        valid_agg = valid_agg.sort_values('Avg_Cycle_Position', ascending=False)
-
-                        with col1:
-                            best_sector = valid_agg.iloc[0]['Classification']
-                            best_score = valid_agg.iloc[0]['Avg_Cycle_Position']
-                            st.metric("🟢 Most Improving Sector", best_sector, f"{best_score:.1f}")
-                        with col2:
-                            worst_sector = valid_agg.iloc[-1]['Classification']
-                            worst_score = valid_agg.iloc[-1]['Avg_Cycle_Position']
-                            st.metric("🔴 Most Deteriorating Sector", worst_sector, f"{worst_score:.1f}")
-                        with col3:
-                            # Overall % Improving from the filtered data
-                            overall_pct = valid_agg['Pct_Improving'].mean()
-                            st.metric("Overall % Improving", f"{overall_pct:.1f}%" if pd.notna(overall_pct) else "n/a")
-            else:
-                st.info("Classification data not available or insufficient data for the selected band")
+            # ========================================================================
+            # UNIVERSE TREND SUMMARY - SSOT: Use Combined_Signal directly
+            # ========================================================================
+            st.subheader("Universe Trend Summary")
+            
+            if 'Combined_Signal' in trend_data.columns:
+                # SSOT: Count from already-calculated Combined_Signal
+                signal_counts = trend_data['Combined_Signal'].value_counts()
+                total_issuers = len(trend_data)
                 
-            # Improving vs. Deteriorating
-            st.subheader("Trend Classification")
+                # Group signals by trend direction (from Combined_Signal, not recalculated)
+                # Improving: "Strong & Improving", "Weak but Improving"
+                # Deteriorating: "Strong but Deteriorating", "Weak & Deteriorating", "Strong & Normalizing", "Strong & Moderating"
+                improving_signals = ['Strong & Improving', 'Weak but Improving']
+                not_improving_signals = ['Strong but Deteriorating', 'Weak & Deteriorating', 
+                                        'Strong & Normalizing', 'Strong & Moderating']
                 
-            # Calculate trend signal for leverage (most important)
-            if 'Total Debt / EBITDA (x)_trend' in trend_data.columns:
-                trend_data['Trend_Signal'] = trend_data['Total Debt / EBITDA (x)_trend'].apply(
-                    lambda x: 'Improving (Deleveraging)' if x < -0.2 else ('Deteriorating (Leveraging)' if x > 0.2 else 'Stable')
-                )
-                    
-                trend_counts = trend_data['Trend_Signal'].value_counts()
-                    
-                col1, col2, col3 = st.columns(3)
+                improving_count = sum(signal_counts.get(s, 0) for s in improving_signals)
+                not_improving_count = sum(signal_counts.get(s, 0) for s in not_improving_signals)
+                
+                # Show breakdown by actual signal (SSOT: display what was calculated)
+                col1, col2 = st.columns(2)
+                
                 with col1:
-                    improving = trend_counts.get('Improving (Deleveraging)', 0)
-                    st.metric(" Improving", f"{improving}", f"{improving/len(trend_data)*100:.1f}%")
-                with col2:
-                    stable = trend_counts.get('Stable', 0)
-                    st.metric(" Stable", f"{stable}", f"{stable/len(trend_data)*100:.1f}%")
-                with col3:
-                    deteriorating = trend_counts.get('Deteriorating (Leveraging)', 0)
-                    st.metric(" Deteriorating", f"{deteriorating}", f"{deteriorating/len(trend_data)*100:.1f}%")
+                    st.markdown("#### 🟢 Improving Trend")
+                    pct = (improving_count / total_issuers * 100) if total_issuers > 0 else 0
+                    st.metric("Total Improving", f"{improving_count:,}", f"{pct:.1f}%", delta_color="off")
+                    
+                    # Breakdown
+                    for sig in improving_signals:
+                        count = signal_counts.get(sig, 0)
+                        if count > 0:
+                            st.caption(f"  • {sig}: {count:,}")
                 
-            # ========================================================================
-            # TOP 10 IMPROVING/DETERIORATING (ranked by Cycle Position Score)
-            # ========================================================================
-
-            # Guard: ensure column exists
-            if 'Cycle_Position_Score' not in trend_data.columns:
-                st.warning("Cycle_Position_Score not found; cannot rank Top 10 trend issuers.")
+                with col2:
+                    st.markdown("#### 🔴 Not Improving")
+                    pct = (not_improving_count / total_issuers * 100) if total_issuers > 0 else 0
+                    st.metric("Total Not Improving", f"{not_improving_count:,}", f"{pct:.1f}%", delta_color="off")
+                    
+                    # Breakdown
+                    for sig in not_improving_signals:
+                        count = signal_counts.get(sig, 0)
+                        if count > 0:
+                            st.caption(f"  • {sig}: {count:,}")
             else:
-                # Top 10 Improving: highest cycle position scores
-                st.subheader("Top 10 Improving Trend Issuers")
-                st.caption("Ranked by Cycle Position Score (highest = most improving)")
+                st.warning("Combined_Signal column not found - cannot display trend summary")
 
+            st.markdown("---")
+
+            # ========================================================================
+            # SECTOR TREND RANKINGS - SSOT: Aggregate from Combined_Signal
+            # ========================================================================
+            st.subheader("Sector Trend Rankings")
+            st.caption("Sectors ranked by average Cycle Position Score. % Improving calculated from Combined_Signal classifications.")
+
+            if 'Rubrics_Custom_Classification' in trend_data.columns and 'Cycle_Position_Score' in trend_data.columns:
+                
+                # SSOT: Helper to calculate % improving from Combined_Signal
+                def pct_improving_from_signal(signals: pd.Series) -> float:
+                    """Calculate % with 'Improving' in signal name - uses pre-calculated signals"""
+                    if len(signals) == 0:
+                        return np.nan
+                    improving = signals.str.contains('Improving', na=False).sum()
+                    return (improving / len(signals)) * 100
+                
+                sector_agg = trend_data.groupby('Rubrics_Custom_Classification', as_index=False).agg(
+                    Avg_Trend_Score=('Cycle_Position_Score', 'mean'),
+                    Issuer_Count=('Cycle_Position_Score', 'count'),
+                    Pct_Improving=('Combined_Signal', pct_improving_from_signal)  # SSOT: from signal, not recalculated
+                )
+                
+                # Filter to sectors with at least 5 issuers
+                sector_agg = sector_agg[sector_agg['Issuer_Count'] >= 5].copy()
+                sector_agg = sector_agg.sort_values('Avg_Trend_Score', ascending=False)
+                
+                if len(sector_agg) > 0:
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.markdown("#### 🟢 Top 10 Improving Sectors")
+                        top_sectors = sector_agg.head(10).copy()
+                        top_sectors['Rank'] = range(1, len(top_sectors) + 1)
+                        display_df = top_sectors[['Rank', 'Rubrics_Custom_Classification', 'Avg_Trend_Score', 'Pct_Improving', 'Issuer_Count']].copy()
+                        display_df.columns = ['Rank', 'Sector', 'Avg Trend Score', '% Improving', 'Issuers']
+                        display_df['Avg Trend Score'] = display_df['Avg Trend Score'].round(1)
+                        display_df['% Improving'] = display_df['% Improving'].round(1)
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    
+                    with col2:
+                        st.markdown("#### 🔴 Bottom 10 Sectors")
+                        bottom_sectors = sector_agg.tail(10).sort_values('Avg_Trend_Score', ascending=True).copy()
+                        bottom_sectors['Rank'] = range(1, len(bottom_sectors) + 1)
+                        display_df = bottom_sectors[['Rank', 'Rubrics_Custom_Classification', 'Avg_Trend_Score', 'Pct_Improving', 'Issuer_Count']].copy()
+                        display_df.columns = ['Rank', 'Sector', 'Avg Trend Score', '% Improving', 'Issuers']
+                        display_df['Avg Trend Score'] = display_df['Avg Trend Score'].round(1)
+                        display_df['% Improving'] = display_df['% Improving'].round(1)
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    
+                    # Summary row
+                    st.markdown("---")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        best = sector_agg.iloc[0]
+                        st.metric("🟢 Highest Avg Trend Score", 
+                                  best['Rubrics_Custom_Classification'], 
+                                  f"Score: {best['Avg_Trend_Score']:.1f}", delta_color="off")
+                    with col2:
+                        worst = sector_agg.iloc[-1]
+                        st.metric("🔴 Lowest Avg Trend Score", 
+                                  worst['Rubrics_Custom_Classification'], 
+                                  f"Score: {worst['Avg_Trend_Score']:.1f}", delta_color="off")
+                    with col3:
+                        # SSOT: Use the Pct_Improving we calculated from Combined_Signal
+                        overall_pct = sector_agg['Pct_Improving'].mean()
+                        st.metric("Avg % Improving", f"{overall_pct:.1f}%" if pd.notna(overall_pct) else "N/A")
+                else:
+                    st.info("Insufficient data - need sectors with at least 5 issuers")
+            else:
+                st.warning("Required columns not available for sector analysis")
+
+            st.markdown("---")
+
+            # ========================================================================
+            # TOP 10 IMPROVING/DETERIORATING ISSUERS - SSOT: Filter by Combined_Signal
+            # ========================================================================
+
+            if 'Cycle_Position_Score' not in trend_data.columns:
+                st.warning("Cycle_Position_Score not found; cannot rank issuers.")
+            elif 'Combined_Signal' not in trend_data.columns:
+                st.warning("Combined_Signal not found; cannot filter issuers.")
+            else:
+                # Top 10 Improving: filter by Combined_Signal containing 'Improving'
+                st.subheader("Top 10 Improving Issuers")
+                st.caption("Filtered by Combined_Signal containing 'Improving', ranked by Cycle Position Score")
+
+                # SSOT: Use Combined_Signal to filter (already calculated in pipeline)
                 improving_mask = trend_data['Combined_Signal'].str.contains('Improving', na=False)
                 top_improving = (trend_data[improving_mask]
                                 .sort_values('Cycle_Position_Score', ascending=False)
                                 .head(10))
 
-                # Select columns (raw-only: no Composite_Score or Cycle_Position_Score)
-                cols = ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification',
-                        'Combined_Signal', 'Recommendation']
-                # Add raw scores if available
-                if 'Raw_Quality_Score' in top_improving.columns:
-                    cols.insert(3, 'Raw_Quality_Score')
-                if 'Raw_Trend_Score' in top_improving.columns:
-                    cols.insert(4, 'Raw_Trend_Score')
-                cols_present = [c for c in cols if c in top_improving.columns]
+                # Include Cycle_Position_Score in display
+                display_cols = ['Company_Name', 'Credit_Rating_Clean', 'Rubrics_Custom_Classification',
+                               'Cycle_Position_Score', 'Combined_Signal', 'Recommendation']
+                cols_present = [c for c in display_cols if c in top_improving.columns]
 
-                st.dataframe(
-                    top_improving[cols_present].rename(columns={
-                        'Company_Name': 'Company',
-                        'Credit_Rating_Clean': 'Rating',
-                        'Rubrics_Custom_Classification': 'Classification',
-                        'Raw_Quality_Score': 'Quality (raw)',
-                        'Raw_Trend_Score': 'Trend (raw)',
-                        'Combined_Signal': 'Signal',
-                        'Recommendation': 'Rec'
-                    }),
-                    use_container_width=True, hide_index=True
-                )
+                if len(top_improving) > 0:
+                    display_df = top_improving[cols_present].copy()
+                    if 'Cycle_Position_Score' in display_df.columns:
+                        display_df['Cycle_Position_Score'] = display_df['Cycle_Position_Score'].round(1)
+                    st.dataframe(
+                        display_df.rename(columns={
+                            'Company_Name': 'Company',
+                            'Credit_Rating_Clean': 'Rating',
+                            'Rubrics_Custom_Classification': 'Classification',
+                            'Cycle_Position_Score': 'Trend Score',
+                            'Combined_Signal': 'Signal',
+                            'Recommendation': 'Rec'
+                        }),
+                        use_container_width=True, hide_index=True
+                    )
+                else:
+                    st.info("No improving issuers found with current filters")
 
-                # Top 10 Deteriorating: lowest cycle position scores
-                st.subheader("Top 10 Deteriorating Trend Issuers")
-                st.caption("Ranked by Cycle Position Score (lowest = most deteriorating)")
+                # Top 10 Deteriorating: filter by Combined_Signal containing 'Deteriorating'
+                st.subheader("Top 10 Deteriorating Issuers")
+                st.caption("Filtered by Combined_Signal containing 'Deteriorating', ranked by Cycle Position Score (lowest first)")
 
+                # SSOT: Use Combined_Signal to filter
                 deteriorating_mask = trend_data['Combined_Signal'].str.contains('Deteriorating', na=False)
                 top_deteriorating = (trend_data[deteriorating_mask]
                                     .sort_values('Cycle_Position_Score', ascending=True)
                                     .head(10))
 
-                st.dataframe(
-                    top_deteriorating[cols_present].rename(columns={
-                        'Company_Name': 'Company',
-                        'Credit_Rating_Clean': 'Rating',
-                        'Rubrics_Custom_Classification': 'Classification',
-                        'Raw_Quality_Score': 'Quality (raw)',
-                        'Raw_Trend_Score': 'Trend (raw)',
-                        'Combined_Signal': 'Signal',
-                        'Recommendation': 'Rec'
-                    }),
-                    use_container_width=True, hide_index=True
-                )
+                if len(top_deteriorating) > 0:
+                    display_df = top_deteriorating[cols_present].copy()
+                    if 'Cycle_Position_Score' in display_df.columns:
+                        display_df['Cycle_Position_Score'] = display_df['Cycle_Position_Score'].round(1)
+                    st.dataframe(
+                        display_df.rename(columns={
+                            'Company_Name': 'Company',
+                            'Credit_Rating_Clean': 'Rating',
+                            'Rubrics_Custom_Classification': 'Classification',
+                            'Cycle_Position_Score': 'Trend Score',
+                            'Combined_Signal': 'Signal',
+                            'Recommendation': 'Rec'
+                        }),
+                        use_container_width=True, hide_index=True
+                    )
+                else:
+                    st.info("No deteriorating issuers found with current filters")
             
         # ============================================================================
         # TAB 6: GENAI CREDIT REPORT (V5.0 - REDESIGNED DUAL-PIPELINE)
@@ -15164,10 +15754,7 @@ if HAS_DATA:
         with tab6:
             st.header("AI Credit Report")
 
-            st.info("""
-            **New in V5.0:** Reports now analyze actual financial metrics from the input spreadsheet,
-            compare to sector and rating peers, and provide proper context for model scores.
-            """)
+
 
             if results_final is not None and len(results_final) > 0 and df_original is not None:
 
@@ -15214,7 +15801,7 @@ if HAS_DATA:
                             calibrated_weights = st.session_state.get('_calibrated_weights')
 
                             # STEP 1: Gather complete data from both sources
-                            st.write("Extracting financial data from input spreadsheet...")
+                            st.write("Preparing financial data...")
                             complete_data = prepare_genai_credit_report_data(
                                 df_original=df_original,  # Raw input spreadsheet
                                 results_df=results_final,  # Model outputs
@@ -15222,6 +15809,13 @@ if HAS_DATA:
                                 use_sector_adjusted=use_sector_adjusted,
                                 calibrated_weights=calibrated_weights
                             )
+
+                            if "error" not in complete_data:
+                                # Show which path was used
+                                if complete_data.get('from_diagnostics'):
+                                    st.caption("✅ Using pre-computed diagnostic data (fast)")
+                                else:
+                                    st.caption("📊 Extracted from input spreadsheet")
 
                             if "error" in complete_data:
                                 st.error(f"Error: {complete_data['error']}")
@@ -15238,21 +15832,29 @@ if HAS_DATA:
                                 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
                                 response = client.chat.completions.create(
-                                    model="gpt-4-turbo-preview",
+                                    model="gpt-5",
                                     messages=[
                                         {"role": "system", "content": "You are a professional credit analyst generating comprehensive credit reports."},
                                         {"role": "user", "content": prompt}
                                     ],
-                                    max_tokens=4000,
-                                    temperature=0.3
+                                    max_completion_tokens=8000,
                                 )
 
                                 report = response.choices[0].message.content
+                                
+                                # [Phase 2] Validation: Check for recommendation consistency
+                                model_rec = complete_data['model_outputs']['overall_metrics']['recommendation']
+                                if model_rec == "Avoid" and any(x in report.lower() for x in ["strong buy", "outperform", "overweight"]):
+                                    st.warning("⚠️ POTENTIAL INCONSISTENCY: Model recommends 'Avoid' but report may contain positive language. Please verify.")
+                                elif model_rec in ["Buy", "Strong Buy"] and "avoid" in report.lower() and "recommend" in report.lower():
+                                    st.warning("⚠️ POTENTIAL INCONSISTENCY: Model recommends 'Buy' but report may contain negative language. Please verify.")
 
                                 st.markdown("---")
 
                                 # STEP 4: Display report
-                                st.markdown(report)
+                                # Escape dollar signs to prevent LaTeX rendering
+                                report_display = report.replace('$', '\\$')
+                                st.markdown(report_display)
 
                                 # Download button
                                 st.download_button(
@@ -15418,7 +16020,7 @@ if HAS_DATA:
                     "Calibration Band"
                 ],
                 "Current Setting": [
-                    scoring_method,
+                    "Universal Weights" if not use_dynamic_calibration else "Dynamic Calibration (Classification-Adjusted)",
                     period_mode.value if hasattr(period_mode, 'value') else str(period_mode),
                     reference_date_override.strftime('%Y-%m-%d') if reference_date_override else "N/A",
                     "FY > CQ" if prefer_annual_reports else "Most Recent",
@@ -15654,8 +16256,8 @@ if HAS_DATA:
                     'Signal': accessor.results.get('Signal', 'N/A'),
                     'Signal_Base': accessor.results.get('Signal_Base', 'N/A'),
                     'Combined_Signal': accessor.results.get('Combined_Signal', 'N/A'),
-                    'Is_Strong_Quality': accessor.get_composite_score() >= 50 if accessor.get_composite_score() else False,
-                    'Is_Improving_Trend': accessor.get_trend_score() >= 55 if accessor.get_trend_score() else False,
+                    'Is_Strong_Quality': accessor.get_composite_score() >= QUALITY_THRESHOLD if accessor.get_composite_score() else False,
+                    'Is_Improving_Trend': accessor.get_trend_score() >= TREND_THRESHOLD if accessor.get_trend_score() else False,
                     'Exceptional_Quality': accessor.results.get('ExceptionalQuality', False),
                     'Volatile_Series': accessor.results.get('VolatileSeries', False),
                     'Outlier_Quarter': accessor.results.get('OutlierQuarter', False)
@@ -16043,11 +16645,11 @@ if HAS_DATA:
                     # 1. CYCLE POSITION SCORE (TOP)
                     # ====================================================================
                     
-                    # Classify the score
-                    if cycle_score >= 70:
+                    # Classify the score (thresholds from MODEL_THRESHOLDS for SSOT)
+                    if cycle_score >= MODEL_THRESHOLDS['display_cycle_favorable']:
                         classification = "🟢 FAVORABLE POSITION"
                         desc = "Strong improving trends with low volatility"
-                    elif cycle_score >= 40:
+                    elif cycle_score >= MODEL_THRESHOLDS['display_cycle_neutral']:
                         classification = "🟡 NEUTRAL/STABLE"
                         desc = "Stable trends with moderate volatility"
                     else:
@@ -16135,9 +16737,9 @@ if HAS_DATA:
                         class_data = get_classification_data(accessor, metric_name)
                         
                         # Determine icon and color
-                        icon = "🟡"
-                        if classification_str == 'IMPROVING': icon = "✅"
-                        elif classification_str == 'DETERIORATING': icon = "🔴"
+                        icon = "[STABLE]"
+                        if classification_str == 'IMPROVING': icon = "[IMPROVING]"
+                        elif classification_str == 'DETERIORATING': icon = "[DETERIORATING]"
                         
                         # Calculate start/end values
                         start_val = values[0] if values else 0
@@ -16147,31 +16749,58 @@ if HAS_DATA:
                         try:
                             start_year = parser.parse(dates[0]).year if isinstance(dates[0], str) else dates[0].year
                             end_year = parser.parse(dates[-1]).year if isinstance(dates[-1], str) else dates[-1].year
-                        except:
+                        except Exception:
                             start_year = "Start"
                             end_year = "End"
                         
-                        # Generate Explanation (Mock logic - in real app this would be more dynamic)
+                        # Generate Explanation - use volatility score to qualify language
+                        # Volatility score: 0 = highly volatile, 100 = very stable
+                        # Thresholds from MODEL_THRESHOLDS (SSOT)
                         explanation = ""
+                        
                         if classification_str == 'IMPROVING':
-                            explanation = "Metric is showing consistent improvement over the period."
+                            if volatility >= VOLATILITY_CONSISTENT:
+                                explanation = "Metric is showing consistent improvement over the period."
+                            elif volatility >= VOLATILITY_MODERATE:
+                                explanation = "Metric is showing overall improvement over the period."
+                            else:
+                                explanation = "Metric shows net improvement despite significant volatility."
                         elif classification_str == 'DETERIORATING':
-                            explanation = "Metric is showing consistent deterioration. Monitor closely."
+                            if volatility >= VOLATILITY_CONSISTENT:
+                                explanation = "Metric is showing consistent deterioration. Monitor closely."
+                            elif volatility >= VOLATILITY_MODERATE:
+                                explanation = "Metric is showing overall deterioration over the period. Monitor closely."
+                            else:
+                                explanation = "Metric shows net deterioration despite significant volatility. Monitor closely."
                         elif classification_str == 'NORMALIZING':
                             explanation = "Recent decline is from a peak, indicating stabilization rather than weakness."
                         elif classification_str == 'MODERATING':
-                            explanation = "High volatility detected. Swings are likely cyclical."
+                            explanation = "High volatility detected. Swings are likely cyclical rather than directional."
                         else:
-                            explanation = "Metric is stable with no significant trend."
+                            # STABLE
+                            if volatility >= VOLATILITY_CONSISTENT:
+                                explanation = "Metric is stable with no significant trend."
+                            elif volatility >= VOLATILITY_MODERATE:
+                                explanation = "Metric is relatively stable over the period."
+                            else:
+                                explanation = "Metric fluctuates but shows no clear directional trend."
                             
                         # Container for the card
                         with st.container():
-                            st.markdown(f"#### {icon} {metric_name.upper()}: {classification_str}")
+                            # Check for bounding
+                            is_bounded = metric_data.get('fallback_bounded', False)
+                            bound_warning = " [BOUNDED]" if is_bounded else ""
+                            
+                            st.markdown(f"#### {icon} {metric_name.upper()}{bound_warning}")
+                            
+                            if is_bounded:
+                                bounds = metric_data.get('bound_limits', {})
+                                st.warning(f"**Note:** Some values for this metric were calculated from components and capped to the CIQ-observed range [{bounds.get('min', 0)}, {bounds.get('max', 'N/A')}] to prevent extreme outliers from distorting the trend.")
                             
                             c1, c2 = st.columns([1, 2])
                             
                             with c1:
-                                st.markdown(f"**{start_val:.2f}** ({start_year}) ➜ **{end_val:.2f}** ({end_year})")
+                                st.markdown(f"**{start_val:.2f}** ({start_year}) -> **{end_val:.2f}** ({end_year})")
                                 st.caption(f"Annual Change: {trend_direction:+.1f}% per year")
                                 st.markdown(explanation)
                                 
@@ -16188,7 +16817,7 @@ if HAS_DATA:
                                     if isinstance(d, str):
                                         try:
                                             plot_dates.append(parser.parse(d))
-                                        except:
+                                        except Exception:
                                             plot_dates.append(datetime.now()) # Fallback
                                     else:
                                         plot_dates.append(d)
@@ -16254,7 +16883,7 @@ if HAS_DATA:
                         if abs(avg_all - cycle_score) < 0.5:
                             st.caption(f"✓ Verified: Component average ({avg_all:.1f}) matches reported score ({cycle_score:.1f})")
                         else:
-                            st.caption(f"⚠ Difference: Component average ({avg_all:.1f}) vs reported score ({cycle_score:.1f})")
+                            st.caption(f"[WARN] Difference: Component average ({avg_all:.1f}) vs reported score ({cycle_score:.1f})")
 
                             # Add compact but comprehensive classification reference
                             st.markdown("---")
@@ -16267,6 +16896,15 @@ if HAS_DATA:
                                 
                                 with tab1:
                                     st.markdown("### How Trend Direction is Calculated")
+
+                                    st.markdown("""
+                                    **Outlier Handling & Ratio Bounding:**
+                                    When Capital IQ reports "NM" (Not Meaningful) for a ratio, the model attempts to calculate it from underlying components (e.g., Net Debt / EBITDA). 
+                                    To prevent extreme outliers (e.g., from near-zero denominators) from distorting the trend, calculated values are **bounded** to the observed min/max range of valid Capital IQ data for that metric.
+                                    - If a calculated value exceeds the max observed CIQ value, it is capped at the max.
+                                    - If it falls below the min observed CIQ value, it is floored at the min.
+                                    - This ensures trends reflect genuine directionality rather than mathematical artifacts.
+                                    """)
                                     
                                     st.info("""
                                     **What is Trend Direction?**
@@ -16282,31 +16920,31 @@ if HAS_DATA:
                                     
                                     st.code("""
 Step 1: Gather Time Series Data
-• Extract 3+ historical periods with dates
-• Example: (2021-12-31: 4.5x), (2022-12-31: 4.2x), ...
+- Extract 3+ historical periods with dates
+- Example: (2021-12-31: 4.5x), (2022-12-31: 4.2x), ...
 
 Step 2: Calculate Annual Rate of Change
-• Convert dates to years from start: time_years = (dates - first_date) / 365.25
-• Linear regression: slope_per_year = polyfit(time_years, values, 1)[0]
-• Example: Debt ratio 4.5x → 3.2x over 4 years = -0.325x per year
+- Convert dates to years from start: time_years = (dates - first_date) / 365.25
+- Linear regression: slope_per_year = polyfit(time_years, values, 1)[0]
+- Example: Debt ratio 4.5x -> 3.2x over 4 years = -0.325x per year
 
 Step 3: Normalize by Mean (Scale-Independent)
-• slope_pct_per_year = slope_per_year / mean(values)
-• Example: -0.325 / 3.84 = -0.085 (-8.5% per year)
+- slope_pct_per_year = slope_per_year / mean(values)
+- Example: -0.325 / 3.84 = -0.085 (-8.5% per year)
 
 Step 4: Scale and Clip
-• normalized_trend = clip(slope_pct_per_year × 10, -1, +1)
-• Scale by 10x so 1% annual change → 0.10, 10% → 1.0
-• Example: -0.085 × 10 = -0.85
+- normalized_trend = clip(slope_pct_per_year * 10, -1, +1)
+- Scale by 10x so 1% annual change -> 0.10, 10% -> 1.0
+- Example: -0.085 * 10 = -0.85
 
 Step 5: Classify
-if normalized_trend > +0.2:    → IMPROVING (>+20% annually)
-elif -0.2 ≤ trend ≤ +0.2:      → STABLE (±20% annually)
-else:                           → DETERIORATING (<-20% annually)
+if normalized_trend > +0.2:    -> IMPROVING (>+20% annually)
+elif -0.2 <= trend <= +0.2:    -> STABLE (+/-20% annually)
+else:                          -> DETERIORATING (<-20% annually)
 
 Step 6: Convert to 0-100 Score
-trend_score = ((normalized_trend) + 1) × 50
-• Range: -1.0 → 0 (worst), 0.0 → 50 (neutral), +1.0 → 100 (best)
+trend_score = ((normalized_trend) + 1) * 50
+- Range: -1.0 -> 0 (worst), 0.0 -> 50 (neutral), +1.0 -> 100 (best)
                                     """, language="python")
                                     
                                     st.markdown("**Complete Formula:**")
@@ -16317,7 +16955,7 @@ time_years = (dates - dates[0]) / 365.25
 slope_per_year = polyfit(time_years, values, degree=1)[0]
 mean_value = abs(mean(values))
 slope_pct_per_year = slope_per_year / mean_value
-normalized_trend = clip(slope_pct_per_year × 10, -1, +1)
+normalized_trend = clip(slope_pct_per_year * 10, -1, +1)
 
 if normalized_trend > +0.2:
     classification = "IMPROVING"
@@ -16326,8 +16964,59 @@ elif normalized_trend < -0.2:
 else:
     classification = "STABLE"
 
-trend_score = ((normalized_trend) + 1) × 50
+trend_score = ((normalized_trend) + 1) * 50
                                     """, language="python")
+                                    
+                                    st.markdown("---")
+                                    st.markdown("### Fallback Calculations & CIQ-Aligned Bounding")
+                                    
+                                    st.warning("""
+                                    **⚠️ What does the [BOUNDED] indicator mean?**
+                                    
+                                    When you see [BOUNDED] next to a trend metric, it indicates that one or more data points 
+                                    were calculated using **fallback logic** because Capital IQ returned "NM" (Not Meaningful).
+                                    """)
+                                    
+                                    st.markdown("""
+                                    **Why does CIQ return "NM"?**
+                                    
+                                    Capital IQ marks ratios as "NM" when:
+                                    - **Interest Coverage**: Very low or zero interest expense (company has minimal debt)
+                                    - **Net Debt/EBITDA**: Net cash position (cash exceeds debt) or negative EBITDA
+                                    
+                                    These are often **positive credit signals** (minimal debt burden), not missing data.
+                                    
+                                    **How Fallback Works:**
+                                    
+                                    When CIQ returns "NM", the app calculates the ratio from component metrics:
+                                    - Interest Coverage = EBITDA ÷ |Interest Expense|
+                                    - Net Debt/EBITDA = (Total Debt - Cash) ÷ EBITDA
+                                    
+                                    **CIQ-Aligned Bounding:**
+                                    
+                                    Fallback calculations can produce extreme values (e.g., 1000x coverage when 
+                                    interest expense is minimal). To maintain comparability with CIQ-provided values, 
+                                    extreme fallback values are bounded to CIQ's observed ranges:
+                                    """)
+                                    
+                                    bounds_df = pd.DataFrame({
+                                        'Metric': ['EBITDA / Interest Expense (x)', 'Net Debt / EBITDA'],
+                                        'Min Bound': [0.0, 0.0],
+                                        'Max Bound': [294.0, 274.0],
+                                        'CIQ Observed Range': ['0.002 - 293.65', '0.000 - 273.83'],
+                                        'Typical "Excellent" Level': ['> 10x', '< 2x']
+                                    })
+                                    st.dataframe(bounds_df, use_container_width=True, hide_index=True)
+                                    
+                                    st.info("""
+                                    **Interpretation Guidance:**
+                                    
+                                    When a metric shows [BOUNDED]:
+                                    1. The **direction** of change is still meaningful
+                                    2. The **magnitude** may be understated (actual ratios could be even more extreme)
+                                    3. Very high coverage ratios typically indicate **minimal debt burden** (credit positive)
+                                    4. Focus on whether the company is maintaining its strong position, not exact values
+                                    """)
                                 
                                 with tab2:
                                     st.markdown("### How Quality × Trend Generates Signals")
@@ -16342,7 +17031,7 @@ trend_score = ((normalized_trend) + 1) × 50
                                         
                                         High-quality company with positive momentum. Best investment opportunities.
                                         
-                                        **Formula:** Quality ≥ 60 AND Trend ≥ 55
+                                        **Formula:** Quality ≥ 55 AND Trend ≥ 55
                                         
                                         **Recommendation:** Strong Buy
                                         """)
@@ -16352,7 +17041,7 @@ trend_score = ((normalized_trend) + 1) × 50
                                         
                                         Lower-quality company with positive momentum. Potential turnaround play.
                                         
-                                        **Formula:** Quality < 60 AND Trend ≥ 55
+                                        **Formula:** Quality < 55 AND Trend ≥ 55
                                         
                                         **Recommendation:** Hold
                                         """)
@@ -16363,7 +17052,7 @@ trend_score = ((normalized_trend) + 1) × 50
                                         
                                         High-quality company facing headwinds. Quality justifies position despite weakness.
                                         
-                                        **Formula:** Quality ≥ 60 AND Trend < 55
+                                        **Formula:** Quality ≥ 55 AND Trend < 55
                                         
                                         **Recommendation:** Buy or Hold
                                         """)
@@ -16373,7 +17062,7 @@ trend_score = ((normalized_trend) + 1) × 50
                                         
                                         Low-quality company with negative momentum. Increasing risk.
                                         
-                                        **Formula:** Quality < 60 AND Trend < 55
+                                        **Formula:** Quality < 55 AND Trend < 55
                                         
                                         **Recommendation:** Avoid
                                         """)
@@ -16433,7 +17122,7 @@ trend_score = ((normalized_trend) + 1) × 50
                                     
                                     st.markdown("""
                                     **Signal Flow:**
-                                    1. Calculate base signal from Quality and Trend thresholds (60 and 55)
+                                    1. Calculate base signal from Quality and Trend thresholds (55 and 55)
                                     2. For "Strong but Deteriorating" only: check if quality ≥ 90th percentile
                                     3. If yes, apply Normalizing override (if peak/outlier) or Moderating override (if volatile)
                                     4. Map final signal to recommendation (Strong Buy / Buy / Hold / Avoid)
@@ -16452,12 +17141,12 @@ trend_score = ((normalized_trend) + 1) × 50
                                             'Weak & Deteriorating'
                                         ],
                                         'Formula': [
-                                            'Q≥60 AND T≥55',
+                                            'Q≥55 AND T≥55',
                                             'Q≥90th + Peak',
                                             'Q≥90th + CV≥0.30',
-                                            'Q≥60 AND T<55',
-                                            'Q<60 AND T≥55',
-                                            'Q<60 AND T<55'
+                                            'Q≥55 AND T<55',
+                                            'Q<55 AND T≥55',
+                                            'Q<55 AND T<55'
                                         ],
                                         'Recommendation': [
                                             'Strong Buy',
@@ -16573,7 +17262,7 @@ trend_score = ((normalized_trend) + 1) × 50
                         st.success("""
                         **Strong & Improving**
                         
-                        - Quality ≥ 60 AND Trend ≥ 55
+                        - Quality ≥ 55 AND Trend ≥ 55
                         - High quality + positive momentum
                         - Recommendation: **Strong Buy**
                         - Best investment opportunities
@@ -16582,7 +17271,7 @@ trend_score = ((normalized_trend) + 1) × 50
                         st.info("""
                         **Weak but Improving**
                         
-                        - Quality < 60 AND Trend ≥ 55
+                        - Quality < 55 AND Trend ≥ 55
                         - Lower quality + positive momentum
                         - Recommendation: **Hold**
                         - Potential turnaround plays
@@ -16592,7 +17281,7 @@ trend_score = ((normalized_trend) + 1) × 50
                         st.warning("""
                         **Strong but Deteriorating**
                         
-                        - Quality ≥ 60 AND Trend < 55
+                        - Quality ≥ 55 AND Trend < 55
                         - High quality + negative/flat trend
                         - Recommendation: **Buy** or **Hold**
                         - Quality justifies position
@@ -16601,7 +17290,7 @@ trend_score = ((normalized_trend) + 1) × 50
                         st.error("""
                         **Weak & Deteriorating**
                         
-                        - Quality < 60 AND Trend < 55
+                        - Quality < 55 AND Trend < 55
                         - Low quality + negative momentum
                         - Recommendation: **Avoid**
                         - Avoid fundamentally weak credits
@@ -16642,7 +17331,7 @@ trend_score = ((normalized_trend) + 1) × 50
 
                     st.markdown("""
                     **Signal Flow:**
-                    1. Calculate base signal from Quality and Trend thresholds (60 and 55)
+                    1. Calculate base signal from Quality and Trend thresholds (55 and 55)
                     2. Apply context-aware overrides for exceptional quality cases
                     3. Map final signal to recommendation (Strong Buy / Buy / Hold / Avoid)
                     
@@ -16654,7 +17343,7 @@ trend_score = ((normalized_trend) + 1) × 50
                 st.markdown("### Quality Factors")
                 st.caption("Each factor scored 0-100 based on thresholds and input metrics")
 
-                # Define the 6 quality factors
+                # Define the 5 quality factors
                 factors = [
                     ("Credit", "Credit_Score", "Fundamental Credit Score"),
                     ("Leverage", "Leverage_Score", "Debt ratios and leverage metrics"),
@@ -16732,19 +17421,19 @@ trend_score = ((normalized_trend) + 1) × 50
                                             value_str = f"{numeric_value:.2f}"
                                     else:
                                         value_str = str(value)
-                                except:
+                                except Exception:
                                     value_str = str(value)
                                 
                                 # Format score
                                 try:
                                     score_str = f"{float(score):.1f}" if score not in ['N/A', None] else 'N/A'
-                                except:
+                                except Exception:
                                     score_str = str(score)
                                 
                                 # Safe weight formatting
                                 try:
                                     weight_str = f"{weight:.0%}" if isinstance(weight, (int, float)) else str(weight)
-                                except:
+                                except Exception:
                                     weight_str = str(weight)
 
                                 st.markdown(f"- **{metric['name']}**: {value_str} → Score: {score_str} (Weight: {weight_str})")
@@ -16819,7 +17508,7 @@ trend_score = ((normalized_trend) + 1) × 50
                 with col_sum1:
                     # Count factors with data
                     factors_with_data = sum(1 for _, score_col, _ in factors if pd.notna(accessor.results.get(score_col)))
-                    st.metric("Factors Scored", f"{factors_with_data}/6")
+                    st.metric("Factors Scored", f"{factors_with_data}/5")
 
                 with col_sum2:
                     # Count high quality factors
@@ -16842,7 +17531,7 @@ trend_score = ((normalized_trend) + 1) × 50
                 """)
 
             # STAGE 6: WEIGHT APPLICATION
-            with st.expander("STAGE 6: WEIGHT APPLICATION", expanded=False):
+            with st.expander("WEIGHT APPLICATION", expanded=False):
                 st.markdown("### Factor Weights Used")
 
                 # Determine weight source
@@ -16864,7 +17553,7 @@ to remove sector bias and improve cross-sector comparability.
                     st.info("""
 **Using Universal Weights**
 
-All factors weighted equally (approximately 1/6 each, with minor adjustments).
+Factors weighted by financial importance: Credit 20%, Leverage 25%, Profitability 20%, Liquidity 10%, Cash Flow 25%.
 """)
                     weight_source = "Universal Weights"
 
@@ -16938,15 +17627,14 @@ Step 3: Weighted Contribution = {score:.1f} × {weight:.3f} = {contribution:.2f}
                     st.markdown("### Comparison to Universal Weights")
                     st.caption("See how dynamic calibration adjusted the weights for this sector")
 
-                    # Universal weights (approximately equal)
+                    # Universal weights (5-factor model)
                     universal_weights = {
                         "Credit": 0.20,
-                        "Leverage": 0.20,
+                        "Leverage": 0.25,
                         "Profitability": 0.20,
                         "Liquidity": 0.10,
-                        "Growth": 0.15,
-                        "Cash Flow": 0.15,
-                        "Cash_Flow": 0.15,  # Handle underscore variant
+                        "Cash Flow": 0.25,
+                        "Cash_Flow": 0.25,  # Handle underscore variant
                     }
 
                     comparison_data = []
@@ -17022,7 +17710,7 @@ to produce the final Composite Score.
 """)
 
             # STAGE 7: COMPOSITE SCORE CALCULATION
-            with st.expander("STAGE 7: COMPOSITE SCORE CALCULATION", expanded=False):
+            with st.expander("COMPOSITE SCORE CALCULATION", expanded=False):
                 st.markdown("### Score Combination Method")
 
                 # Get the composite score
@@ -17038,7 +17726,6 @@ to produce the final Composite Score.
                     st.caption(f"**Calculation Method:** {scoring_method}")
 
                     st.markdown("---")
-
                     # STEP-BY-STEP CALCULATION
                     st.markdown("### Step-by-Step Calculation")
 
@@ -17061,7 +17748,6 @@ to produce the final Composite Score.
                             "Leverage": accessor.results.get('Leverage_Score', 0),
                             "Profitability": accessor.results.get('Profitability_Score', 0),
                             "Liquidity": accessor.results.get('Liquidity_Score', 0),
-                            "Growth": accessor.results.get('Growth_Score', 0),
                             "Cash Flow": accessor.results.get('Cash_Flow_Score', 0)
                         }
 
@@ -17190,10 +17876,11 @@ Final Composite Score: {composite:.2f} / 100
                     col_int1, col_int2, col_int3 = st.columns(3)
 
                     with col_int1:
-                        if composite >= 70:
+                        # Thresholds from MODEL_THRESHOLDS for SSOT compliance
+                        if composite >= MODEL_THRESHOLDS['display_composite_high']:
                             interpretation = "High Quality"
                             color = "🟢"
-                        elif composite >= 50:
+                        elif composite >= MODEL_THRESHOLDS['display_composite_moderate']:
                             interpretation = "Moderate Quality"
                             color = "🟡"
                         else:
@@ -17219,7 +17906,7 @@ Final Composite Score: {composite:.2f} / 100
                     with col_int3:
                         # Determine if improving/stable/deteriorating
                         if has_trend:
-                            if trend_score >= 55:
+                            if trend_score >= TREND_THRESHOLD:
                                 trend_label = "🟢 Improving"
                             elif trend_score >= 45:
                                 trend_label = "🟡 Stable"
@@ -17233,9 +17920,13 @@ Final Composite Score: {composite:.2f} / 100
 
                     # UNIVERSE CONTEXT (existing code, enhanced)
                     st.markdown("### Universe Context")
-
+                    # Read stored percentile instead of recalculating (single source of truth)
+                    percentile = accessor.results.get('Composite_Percentile_Global', None)
                     all_composites = results_final['Composite_Score'].dropna()
-                    percentile = (all_composites < composite).sum() / len(all_composites) * 100
+                    
+                    if pd.isna(percentile):
+                        # Fallback calculation only if not stored
+                        percentile = (all_composites < composite).sum() / len(all_composites) * 100
 
                     col_u1, col_u2, col_u3, col_u4 = st.columns(4)
 
@@ -17322,7 +18013,7 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
 """)
 
             # STAGE 8: RELATIVE RANKING
-            with st.expander("STAGE 8: RELATIVE RANKING & PERCENTILES", expanded=False):
+            with st.expander("RELATIVE RANKING & PERCENTILES", expanded=False):
                 st.markdown("### Sector Ranking")
 
                 sector_data = results_final[results_final['Rubrics_Custom_Classification'] == accessor.results['Rubrics_Custom_Classification']]
@@ -17358,16 +18049,17 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                 """)
 
             # STAGE 9: CLASSIFICATION & RECOMMENDATION
-            with st.expander("STAGE 9: CLASSIFICATION & RECOMMENDATION", expanded=False):
+            with st.expander("CLASSIFICATION & RECOMMENDATION", expanded=False):
                 st.markdown("### How Your Recommendation Was Determined")
 
                 recommendation = accessor.results['Recommendation']
+                # [FIX] Use Composite_Score for classification display to match actual signal logic
+                quality_score = accessor.results.get('Composite_Score', 0)
 
                 # Define thresholds
-                QUALITY_HIGH_THRESHOLD = 60
-                QUALITY_LOW_THRESHOLD = 40
-                TREND_IMPROVING_THRESHOLD = 55
-                TREND_DETERIORATING_THRESHOLD = 45
+                # Match actual signal classification thresholds (lines 11511, 7343)
+                # Use centralized thresholds (defined at module level)
+                # QUALITY_THRESHOLD and TREND_THRESHOLD are already available
 
                 # Step 1: Threshold Checks
                 st.markdown("#### Step 1: Threshold Checks")
@@ -17377,18 +18069,14 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                 with col_t1:
                     st.markdown("**Quality Assessment:**")
 
-                    if quality_score >= QUALITY_HIGH_THRESHOLD:
-                        quality_class = "HIGH QUALITY"
+                    if quality_score >= QUALITY_THRESHOLD:
+                        quality_class = "STRONG"
                         quality_color = "🟢"
-                        quality_desc = f"Quality Score ({quality_score:.1f}) ≥ {QUALITY_HIGH_THRESHOLD}"
-                    elif quality_score >= QUALITY_LOW_THRESHOLD:
-                        quality_class = "MODERATE QUALITY"
-                        quality_color = "🟡"
-                        quality_desc = f"{QUALITY_LOW_THRESHOLD} ≤ Quality Score ({quality_score:.1f}) < {QUALITY_HIGH_THRESHOLD}"
+                        quality_desc = f"Quality Score ({quality_score:.1f}) ≥ {QUALITY_THRESHOLD}"
                     else:
-                        quality_class = "LOW QUALITY"
+                        quality_class = "WEAK"
                         quality_color = "🔴"
-                        quality_desc = f"Quality Score ({quality_score:.1f}) < {QUALITY_LOW_THRESHOLD}"
+                        quality_desc = f"Quality Score ({quality_score:.1f}) < {QUALITY_THRESHOLD}"
 
                     st.markdown(f"""
                     - **Your Quality Score:** {quality_score:.1f} / 100
@@ -17400,18 +18088,14 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                     if has_trend:
                         st.markdown("**Trend Assessment:**")
 
-                        if trend_score >= TREND_IMPROVING_THRESHOLD:
+                        if trend_score >= TREND_THRESHOLD:
                             trend_class = "IMPROVING"
                             trend_color = "🟢"
-                            trend_desc = f"Trend Score ({trend_score:.1f}) ≥ {TREND_IMPROVING_THRESHOLD}"
-                        elif trend_score >= TREND_DETERIORATING_THRESHOLD:
-                            trend_class = "STABLE"
-                            trend_color = "🟡"
-                            trend_desc = f"{TREND_DETERIORATING_THRESHOLD} ≤ Trend Score ({trend_score:.1f}) < {TREND_IMPROVING_THRESHOLD}"
+                            trend_desc = f"Trend Score ({trend_score:.1f}) ≥ {TREND_THRESHOLD}"
                         else:
                             trend_class = "DETERIORATING"
                             trend_color = "🔴"
-                            trend_desc = f"Trend Score ({trend_score:.1f}) < {TREND_DETERIORATING_THRESHOLD}"
+                            trend_desc = f"Trend Score ({trend_score:.1f}) < {TREND_THRESHOLD}"
 
                         st.markdown(f"""
                         - **Your Trend Score:** {trend_score:.1f} / 100
@@ -17432,43 +18116,24 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                     # Create decision matrix
                     matrix_data = {
                         "Quality Level": [
-                            "🟢 HIGH (≥60)",
-                            "🟡 MODERATE (40-59)",
-                            "🔴 LOW (<40)"
+                            "🟢 STRONG (≥50)",
+                            "🔴 WEAK (<50)"
                         ],
                         "🟢 IMPROVING (≥55)": [
-                            "Strong Buy",
-                            "Buy",
-                            "Hold"
+                            "Strong & Improving → Strong Buy/Buy",
+                            "Weak but Improving → Buy/Hold"
                         ],
-                        "🟡 STABLE (45-54)": [
-                            "Buy",
-                            "Hold",
-                            "Hold"
-                        ],
-                        "🔴 DETERIORATING (<45)": [
-                            "Hold",
-                            "Hold",
-                            "Avoid"
+                        "🔴 DETERIORATING (<55)": [
+                            "Strong but Deteriorating → Buy/Hold*",
+                            "Weak & Deteriorating → Avoid"
                         ]
                     }
 
                     matrix_df = pd.DataFrame(matrix_data)
 
                     # Determine user's position in matrix
-                    if quality_score >= QUALITY_HIGH_THRESHOLD:
-                        quality_row = 0
-                    elif quality_score >= QUALITY_LOW_THRESHOLD:
-                        quality_row = 1
-                    else:
-                        quality_row = 2
-
-                    if trend_score >= TREND_IMPROVING_THRESHOLD:
-                        trend_col = "🟢 IMPROVING (≥55)"
-                    elif trend_score >= TREND_DETERIORATING_THRESHOLD:
-                        trend_col = "🟡 STABLE (45-54)"
-                    else:
-                        trend_col = "🔴 DETERIORATING (<45)"
+                    quality_row = 0 if quality_score >= QUALITY_THRESHOLD else 1
+                    trend_col = "🟢 IMPROVING (≥55)" if trend_score >= TREND_THRESHOLD else "🔴 DETERIORATING (<55)"
 
                     # Define recommendation colors
                     rec_colors = {
@@ -17493,6 +18158,7 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                     )
 
                     st.success(f"**Your Position:** {quality_class} × {trend_class} → **{recommendation}**")
+                    st.caption("*May override to 'Strong & Normalizing' or 'Strong & Moderating' for exceptional quality issuers")
 
                 else:
                     st.markdown("**Simplified Matrix (Quality Only):**")
@@ -17500,13 +18166,11 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                     # Create simplified decision matrix
                     simple_matrix_data = {
                         "Quality Level": [
-                            "🟢 HIGH (≥60)",
-                            "🟡 MODERATE (40-59)",
-                            "🔴 LOW (<40)"
+                            "🟢 STRONG (≥50)",
+                            "🔴 WEAK (<50)"
                         ],
                         "Recommendation": [
                             "Buy",
-                            "Hold",
                             "Avoid"
                         ]
                     }
@@ -17514,12 +18178,7 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                     simple_matrix_df = pd.DataFrame(simple_matrix_data)
 
                     # Determine user's position
-                    if quality_score >= QUALITY_HIGH_THRESHOLD:
-                        quality_row = 0
-                    elif quality_score >= QUALITY_LOW_THRESHOLD:
-                        quality_row = 1
-                    else:
-                        quality_row = 2
+                    quality_row = 0 if quality_score >= QUALITY_THRESHOLD else 1
 
                     st.dataframe(
                         simple_matrix_df.style.apply(
@@ -17555,12 +18214,12 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                     Consider adding or increasing position. The issuer shows both strong current fundamentals and positive trajectory.
                     """
                 elif recommendation == "Buy":
-                    if has_trend and trend_score >= TREND_IMPROVING_THRESHOLD:
+                    if has_trend and trend_score >= TREND_THRESHOLD:
                         explanation = f"""
                         **Buy** means this issuer shows **solid quality with improving trends**.
 
                         **Key Factors:**
-                        - {"High" if quality_score >= QUALITY_HIGH_THRESHOLD else "Moderate"} quality score ({quality_score:.1f}/100) provides a stable foundation
+                        - {"Strong" if quality_score >= QUALITY_THRESHOLD else "Weak"} quality score ({quality_score:.1f}/100) provides a stable foundation
                         - Improving trend ({trend_score:.1f}/100) indicates positive momentum
                         - Good risk/reward profile for incremental exposure
 
@@ -17581,12 +18240,12 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                         """
                 elif recommendation == "Hold":
                     if has_trend:
-                        if trend_score < TREND_DETERIORATING_THRESHOLD:
+                        if trend_score < TREND_THRESHOLD:
                             explanation = f"""
                             **Hold** means this issuer shows **mixed signals** that warrant a cautious stance.
 
                             **Key Factors:**
-                            - {"High" if quality_score >= QUALITY_HIGH_THRESHOLD else "Moderate"} quality score ({quality_score:.1f}/100) provides some support
+                            - {"Strong" if quality_score >= QUALITY_THRESHOLD else "Weak"} quality score ({quality_score:.1f}/100) provides some support
                             - However, deteriorating trend ({trend_score:.1f}/100) raises concerns about future performance
                             - Risk/reward appears balanced at current levels
 
@@ -17599,7 +18258,7 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
 
                             **Key Factors:**
                             - Moderate quality score ({quality_score:.1f}/100) suggests average fundamentals
-                            - {"Stable" if trend_score >= TREND_DETERIORATING_THRESHOLD else "Improving"} trend ({trend_score:.1f}/100)
+                            - {"Stable" if trend_score >= TREND_THRESHOLD else "Improving"} trend ({trend_score:.1f}/100)
                             - Risk/reward appears balanced
 
                             **Investment Thesis:**
@@ -17622,7 +18281,7 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
 
                     **Key Factors:**
                     - Low quality score ({quality_score:.1f}/100) indicates weak fundamentals
-                    - {"Deteriorating trends exacerbate concerns" if has_trend and trend_score < TREND_DETERIORATING_THRESHOLD else "Weak performance across key metrics"}
+                    - {"Deteriorating trends exacerbate concerns" if has_trend and trend_score < TREND_THRESHOLD else "Weak performance across key metrics"}
                     - Risk/reward profile unfavorable
 
                     **Investment Thesis:**
@@ -17643,7 +18302,6 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                     "Leverage": accessor.results.get('Leverage_Score'),
                     "Profitability": accessor.results.get('Profitability_Score'),
                     "Liquidity": accessor.results.get('Liquidity_Score'),
-                    "Growth": accessor.results.get('Growth_Score'),
                     "Cash Flow": accessor.results.get('Cash_Flow_Score')
                 }
 
@@ -17700,7 +18358,7 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
                 """)
 
             # STAGE 10: OUTPUT SUMMARY
-            with st.expander("STAGE 10: FINAL OUTPUT SUMMARY", expanded=False):
+            with st.expander("FINAL OUTPUT SUMMARY", expanded=False):
                 st.markdown("### Complete Issuer Profile")
 
                 col1, col2 = st.columns(2)
@@ -17889,8 +18547,8 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
         st.markdown("---")
         st.markdown("""
     <div style='text-align: center; color: #4c566a; padding: 20px;'>
-        <p><strong>Issuer Credit Screening Model V3.0</strong></p>
-        <p>© 2025 Rubrics Asset Management | Annual-Only Default + Minimal Identifiers</p>
+        <p><strong>Issuer Credit Screening Model V5.0</strong></p>
+        <p>© 2025 Rubrics Asset Management</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -17898,7 +18556,7 @@ is assigned (Strong Buy / Buy / Hold / Avoid)
     # [V2.2] SELF-TESTS (Run with RG_TESTS=1 environment variable)
     # ============================================================================
         
-if False and os.environ.get("RG_TESTS") == "1":  # Tests temporarily disabled - contains outdated function calls
+if os.environ.get("RG_TESTS") == "1":  # Tests enabled
     import sys
     print("\n" + "="*60)
     print("Running RG_TESTS for V3.0...")
@@ -17944,7 +18602,7 @@ if False and os.environ.get("RG_TESTS") == "1":  # Tests temporarily disabled - 
         f"Expected [14,15,16,17,18], got {list(fy.values)}"
     print(f"  OK FY series values correct: {list(fy.values)}")
 
-    assert list(fy.index)[-1].startswith("2024"), \
+    assert str(list(fy.index)[-1]).startswith("2024"), \
         f"Expected last date to be 2024, got {list(fy.index)[-1]}"
     print(f"  OK FY series indexed by actual dates: {list(fy.index)}")
 
@@ -18165,10 +18823,10 @@ if False and os.environ.get("RG_TESTS") == "1":  # Tests temporarily disabled - 
     test_metrics = ["EBITDA Margin", "Total Debt / EBITDA (x)", "Return on Equity", "Current Ratio (x)"]
 
     # Test 9a: FY-mode (use_quarterly=False) - should use only base + .1-.4
-    trend_fy = calculate_trend_indicators(trend_test, test_metrics, use_quarterly=False, reference_date=None)
+    trend_fy, _ = calculate_trend_indicators(trend_test, test_metrics, use_quarterly=False, reference_date=None)
 
     # Test 9b: Quarterly-mode (use_quarterly=True) - should use base + .1-.12 (available up to .8 here)
-    trend_cq = calculate_trend_indicators(trend_test, test_metrics, use_quarterly=True, reference_date=None)
+    trend_cq, _ = calculate_trend_indicators(trend_test, test_metrics, use_quarterly=True, reference_date=None)
 
     # Verify that momentum differs between the two modes
     # Momentum compares recent vs prior periods, so including .5-.8 should change the result
@@ -18179,7 +18837,7 @@ if False and os.environ.get("RG_TESTS") == "1":  # Tests temporarily disabled - 
     # With 9 periods (base, .1-.8), momentum compares last 4 (.5-.8) vs prior 4 (.1-.4)
     assert margin_momentum_fy != margin_momentum_cq, \
         f"Expected different momentum scores between FY and CQ modes, got FY={margin_momentum_fy:.1f}, CQ={margin_momentum_cq:.1f}"
-    print(f"  OK FY-mode momentum: {margin_momentum_fy:.1f}, LTM-mode momentum: {margin_momentum_ltm:.1f} (differ)")
+    print(f"  OK FY-mode momentum: {margin_momentum_fy:.1f}, LTM-mode momentum: {margin_momentum_cq:.1f} (differ)")
 
     # Verify volatility also differs (more data points = different coefficient of variation)
     margin_vol_fy = trend_fy["EBITDA Margin_volatility"].iloc[0]
@@ -18212,8 +18870,8 @@ if False and os.environ.get("RG_TESTS") == "1":  # Tests temporarily disabled - 
 
     # B. Trend window affects momentum/volatility but NOT the period selector
     try:
-        m_annual = calculate_trend_indicators(_df, test_metrics, use_quarterly=False, reference_date=None)
-        m_quarterly = calculate_trend_indicators(_df, test_metrics, use_quarterly=True, reference_date=None)
+        m_annual, _ = calculate_trend_indicators(_df, test_metrics, use_quarterly=False, reference_date=None)
+        m_quarterly, _ = calculate_trend_indicators(_df, test_metrics, use_quarterly=True, reference_date=None)
 
         # Check if momentum differs between annual and quarterly windows
         if (m_annual["EBITDA Margin_momentum"] != m_quarterly["EBITDA Margin_momentum"]).any():
