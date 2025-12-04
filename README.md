@@ -102,16 +102,6 @@ streamlit run app.py
 - OpenPyXL
 - Anthropic (for GenAI features)
 
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | System design and data flow |
-| [SCORING_METHODOLOGY.md](SCORING_METHODOLOGY.md) | Detailed scoring algorithms |
-| [SIGNAL_CLASSIFICATION.md](SIGNAL_CLASSIFICATION.md) | Signal logic and thresholds |
-| [MODEL_THRESHOLDS.md](MODEL_THRESHOLDS.md) | All configurable thresholds |
-| [DATA_DICTIONARY.md](DATA_DICTIONARY.md) | Input/output field definitions |
-| [METHODOLOGY_DERIVATION.md](METHODOLOGY_DERIVATION.md) | Rationale for methodology choices |
 
 ## Architecture Principles
 
