@@ -7262,6 +7262,10 @@ CLASSIFICATION_TO_SECTOR = {
     
     # Utilities (1 classification)
     'Utilities': 'Utilities',
+    
+    # Financials (2 classifications) - Non-fin financial services
+    'Consumer Finance': 'Financials',
+    'Financial Services': 'Financials',
 }
 
 # Optional: Classification-specific weight overrides
